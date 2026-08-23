@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import { agentPlatform } from "../services/agent-platform";
 import type { AgentMode } from "../services/skill-registry";
-import { dockerExecutor } from "../services/docker-executor";
+import { daytonaExecutor } from "../services/daytona-executor";
 
 const router: IRouter = Router();
 
@@ -342,7 +342,7 @@ router.post("/projects/:projectId/containers/:kind/stop", async (req, res, next)
       res.status(400).json({ error: "valid projectId and kind (frontend|backend) are required" });
       return;
     }
-    await dockerExecutor.stopContainer(projectId, kind);
+    await daytonaExecutor.stopContainer(projectId, kind);
     res.status(204).send();
   } catch (error) {
     next(error);
@@ -359,7 +359,7 @@ router.get("/projects/:projectId/containers/:kind/logs", async (req, res, next) 
       res.status(400).json({ error: "valid projectId and kind (frontend|backend) are required" });
       return;
     }
-    const logs = await dockerExecutor.getLogs(projectId, kind);
+    const logs = await daytonaExecutor.getLogs(projectId, kind);
     res.json({ logs });
   } catch (error) {
     next(error);
@@ -381,7 +381,7 @@ router.post("/projects/:projectId/containers/:kind/exec", async (req, res, next)
       res.status(400).json({ error: "command string is required in request body" });
       return;
     }
-    const output = await dockerExecutor.execCommand(projectId, kind, command);
+    const output = await daytonaExecutor.execCommand(projectId, kind, command);
     res.json({ output });
   } catch (error) {
     next(error);

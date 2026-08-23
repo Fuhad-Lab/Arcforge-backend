@@ -1,6 +1,6 @@
 import { logger } from "../lib/logger";
 import type { ProjectState } from "./agent-platform";
-import { dockerExecutor, type ContainerKind } from "./docker-executor";
+import { daytonaExecutor, type ContainerKind } from "./daytona-executor";
 
 type ServiceKind = "frontend" | "backend";
 
@@ -14,13 +14,13 @@ export type RunningService = {
 export class ServiceRunner {
   constructor(
     // WorkspaceManager is kept for API compatibility but no longer used
-    // directly — Docker containers are self-contained.
+    // directly — Daytona sandboxes are self-contained.
     private readonly _workspace?: unknown,
   ) {}
 
   /**
-   * Start a service for the given project in a Docker container.
-   * Uses the project's generated files to build and launch the container.
+   * Start a service for the given project in a Daytona sandbox.
+   * Uses the project's generated files to build and launch the sandbox.
    */
   async start(
     project: ProjectState,
@@ -53,10 +53,10 @@ export class ServiceRunner {
 
     logger.info(
       { projectId: project.id, kind, port, fileCount: files.length, entryPoint },
-      "Starting Docker container for generated service",
+      "Starting Daytona sandbox for generated service",
     );
 
-    const info = await dockerExecutor.startContainer(
+    const info = await daytonaExecutor.startContainer(
       project.id,
       files,
       entryPoint,
@@ -73,9 +73,9 @@ export class ServiceRunner {
   }
 
   /**
-   * Stop the Docker container for the given project + kind.
+   * Stop the Daytona sandbox for the given project + kind.
    */
   async stop(projectId: string, kind: ContainerKind): Promise<void> {
-    await dockerExecutor.stopContainer(projectId, kind);
+    await daytonaExecutor.stopContainer(projectId, kind);
   }
 }
