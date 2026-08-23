@@ -69,13 +69,17 @@ class DaytonaWorkspaceManager:
     async def create_and_scaffold_workspace(
         self,
         project_id: str,
-        language: str = "typescript",
+        language: str = "python",
         user_id: str | None = None,
     ) -> dict[str, Any]:
         """Spawn a Daytona MicroVM and enforce the strict directory blueprint.
 
         Every sandbox is labeled with BOTH identifiers (snake_case keys):
           {user_id: <owner uuid>, project_id: <project uuid>, type: "workspace"}
+
+        NOTE: language must be "python" for workspace sandboxes — the python
+        snapshot ships a working shell (zsh/bash) for process.exec(), while
+        the typescript snapshot image is missing /usr/bin/zsh entirely.
 
         Returns sandbox metadata dict with the new sandbox ID.
         """
@@ -102,7 +106,9 @@ class DaytonaWorkspaceManager:
 
         params = build_create_params(
             method="snapshot",
-            language=language,
+            # Force the python snapshot — it is the only image with a working
+            # shell for process.exec() (validated empirically 2026-08-23).
+            language="python",
             name=name,
             cpu=settings.default_cpu,
             memory=_parse_resource_size(settings.default_memory),
@@ -141,20 +147,27 @@ class DaytonaWorkspaceManager:
     async def _scaffold_workspace(self, sandbox_id: str) -> None:
         """Create /workspace/git, /workspace/frontend, /workspace/backend inside the VM.
 
-        Uses sandbox.process.exec() to mkdir -p all directories in one shot,
-        then touches a placeholder logo.png so the tree is complete from birth.
+        The /workspace root is not present on stock images and / is root-owned,
+        so we sudo-create it and chown it to the sandbox user first (passwordless
+        sudo is available on the python snapshot), then mkdir -p the mandatory
+        dirs and touch a placeholder logo.png so the tree is complete from birth.
         """
         dirs = " ".join(f"{WORKSPACE_ROOT}/{d}" for d in MANDATORY_DIRS)
-        scaffold_cmd = f"mkdir -p {dirs} && touch {WORKSPACE_ROOT}/logo.png"
+        scaffold_cmd = (
+            f"sudo mkdir -p {WORKSPACE_ROOT} 2>/dev/null && "
+            f"sudo chown daytona:daytona {WORKSPACE_ROOT} 2>/dev/null; "
+            f"mkdir -p {dirs} && touch {WORKSPACE_ROOT}/logo.png"
+        )
 
         daytona = self._get_client()
         sandbox = await asyncio.to_thread(daytona.get, sandbox_id)
 
         result = await asyncio.to_thread(
-            sandbox.process.exec, scaffold_cmd, WORKSPACE_ROOT, None, 30,
+            sandbox.process.exec, scaffold_cmd, "/home/daytona", None, 60,
         )
 
-        exit_code = getattr(result, "exit_code", -1) or -1
+        exit_code = getattr(result, "exit_code", None)
+        exit_code = -1 if exit_code is None else int(exit_code)
         if exit_code != 0:
             logger.error(
                 "Scaffold failed (exit %d) in sandbox %s",
@@ -323,9 +336,13 @@ class DaytonaWorkspaceManager:
         vm_path = self._normalize_vm_path(filepath)
         sandbox = await self._resolve_sandbox(sandbox_id)
 
-        # Ensure parent directory exists
+        # Ensure parent directory exists (mkdir -p semantics; exec is reliable
+        # on the python snapshot and idempotent for existing dirs)
         parent = vm_path.rsplit("/", 1)[0]
-        await asyncio.to_thread(sandbox.fs.create_folder, parent, "0755")
+        await asyncio.to_thread(
+            sandbox.process.exec,
+            f"mkdir -p {parent}", "/home/daytona", None, 15,
+        )
 
         # Write the file directly into the VM
         await asyncio.to_thread(
@@ -403,7 +420,8 @@ class DaytonaWorkspaceManager:
             )
 
         elapsed = int((time.monotonic() - t0) * 1000)
-        exit_code = getattr(result, "exit_code", -1) or -1
+        raw_exit = getattr(result, "exit_code", None)
+        exit_code = -1 if raw_exit is None else int(raw_exit)
         stdout = getattr(result, "result", "") or ""
 
         return CodeRunResult(
