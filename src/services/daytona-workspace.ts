@@ -104,6 +104,15 @@ export async function isSandboxAlive(sandboxId: string): Promise<boolean> {
 
 // ─── WORKSPACE LIFECYCLE ───────────────────────────────────────────────────
 
+/** Daytona accepts only python|typescript|javascript — normalize legacy names. */
+function normalizeLanguage(language?: string): "typescript" | "python" | "javascript" {
+  const raw = (language ?? "typescript").toLowerCase();
+  if (raw === "python" || raw === "py") return "python";
+  if (raw === "javascript" || raw === "js") return "javascript";
+  // nodejs, typescript, ts, nextjs, and anything else → typescript
+  return "typescript";
+}
+
 export type DaytonaWorkspaceInitResult = {
   sandbox_id: string;
   project_id: string;
@@ -129,7 +138,7 @@ export async function initWorkspace(params: {
     body: {
       project_id: params.project_id,
       user_id: params.user_id ?? null,
-      language: params.language ?? "nodejs",
+      language: normalizeLanguage(params.language),
     },
     timeoutMs: TIMEOUTS.init,
   });
@@ -305,7 +314,7 @@ export async function ensureProjectSandbox(
   const init = await initWorkspace({
     project_id: row.id,
     user_id: row.user_id,
-    language: options.language ?? "nodejs",
+    language: options.language,
   });
   const sandboxId = init.sandbox_id;
 

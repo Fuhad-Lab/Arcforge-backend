@@ -69,7 +69,7 @@ class DaytonaWorkspaceManager:
     async def create_and_scaffold_workspace(
         self,
         project_id: str,
-        language: str = "nodejs",
+        language: str = "typescript",
         user_id: str | None = None,
     ) -> dict[str, Any]:
         """Spawn a Daytona MicroVM and enforce the strict directory blueprint.
