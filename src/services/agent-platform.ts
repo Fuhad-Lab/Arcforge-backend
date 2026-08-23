@@ -110,13 +110,14 @@ export type ProjectState = {
 // Defaults validated against the NVIDIA API model catalog (2026-08-23).
 // The previous defaults (deepseek-r1, qwen2.5-72b, glm4.7, qwen3-coder-480b)
 // are not served by integrate.api.nvidia.com for this account → HTTP 404.
+// Defaults validated against the NVIDIA API model catalog (2026-08-23).
+// minimax-m3 measured ~118 tok/s with strong code output; deepseek-v4-flash
+// and llama-3.3-70b are too slow on this account for a multi-call pipeline.
 const DEFAULT_MODELS: Record<Role, string> = {
-  leader: process.env.NVIDIA_LEADER_MODEL ?? "deepseek-ai/deepseek-v4-flash-0731",
-  backend:
-    process.env.NVIDIA_BACKEND_MODEL ?? "deepseek-ai/deepseek-v4-flash-0731",
-  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "deepseek-ai/deepseek-v4-flash-0731",
-  debugger:
-    process.env.NVIDIA_DEBUGGER_MODEL ?? "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+  leader: process.env.NVIDIA_LEADER_MODEL ?? "minimaxai/minimax-m3",
+  backend: process.env.NVIDIA_BACKEND_MODEL ?? "minimaxai/minimax-m3",
+  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "minimaxai/minimax-m3",
+  debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "minimaxai/minimax-m3",
 };
 
 const MAX_CODE_BYTES = 1_000_000;
