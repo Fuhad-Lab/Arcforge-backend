@@ -93,12 +93,15 @@ class DaytonaWorkspaceManager:
             "type": "workspace",
         }
 
-        # Unique-ish, human-greppable sandbox name.
+        # Unique, human-greppable sandbox name. Timestamp suffix guarantees
+        # uniqueness even when a previous sandbox for the same user+project
+        # lingers in an error state (Daytona enforces unique names).
         name_parts = [p for p in (user_id, project_id) if p]
         if name_parts:
             name = "arcforge-" + "-".join(p[:8] for p in name_parts)
         else:
             name = f"arcforge-ws-{project_id[:12]}"
+        name += f"-{int(time.time()) % 1000000:06d}"
 
         env_vars: dict[str, str] = {"PROJECT_ID": project_id}
         if user_id:
