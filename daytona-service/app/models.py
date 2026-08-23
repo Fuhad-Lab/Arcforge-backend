@@ -221,3 +221,58 @@ class BulkActionResponse(BaseModel):
     """Result of a bulk operation on sandboxes."""
     succeeded: list[str] = Field(default_factory=list)
     failed: dict[str, str] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Workspace models
+# ---------------------------------------------------------------------------
+
+
+class CreateWorkspaceRequest(BaseModel):
+    """Create a new project workspace with the mandatory directory blueprint."""
+    project_id: str = Field(min_length=1, max_length=128, description="Project UUID")
+    language: str = Field(default="nodejs", description="Sandbox language runtime")
+
+
+class AgentCodeWriteRequest(BaseModel):
+    """Write a single file directly into the VM."""
+    path: str = Field(min_length=1, description="File path inside workspace (e.g. frontend/index.html)")
+    content: str = Field(min_length=0, description="File content")
+
+
+class AgentBulkWriteRequest(BaseModel):
+    """Write multiple files into the VM in one batch."""
+    files: list[dict[str, str]] = Field(
+        min_length=1,
+        description="List of {path: str, content: str} objects",
+    )
+
+
+class TerminalCommandRequest(BaseModel):
+    """Execute a bash command in the VM terminal."""
+    command: str = Field(min_length=1, description="Bash command to execute")
+    cwd: str | None = Field(default=None, description="Working directory (defaults to /workspace)")
+    timeout_ms: int = Field(default=30000, ge=1000, le=300000)
+
+
+class FileTreeResponse(BaseModel):
+    """Nested file tree structure for the frontend sidebar."""
+    name: str
+    path: str
+    type: str = Field(description="'directory' or 'file'")
+    size: int = 0
+    modified_at: str | None = None
+    children: list["FileTreeResponse"] = Field(default_factory=list)
+
+
+class WorkspaceInitResponse(BaseModel):
+    """Response after workspace creation + scaffold."""
+    sandbox_id: str
+    project_id: str
+    state: str
+    provision_time_ms: int
+    workspace_root: str = "/workspace"
+    structure: list[str] = Field(
+        default_factory=lambda: ["git/", "frontend/", "backend/", "logo.png"],
+        description="Mandatory workspace directories",
+    )
