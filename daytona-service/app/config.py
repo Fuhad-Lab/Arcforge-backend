@@ -1,0 +1,46 @@
+"""Application configuration via pydantic-settings.
+
+All settings are read from environment variables with sensible defaults.
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Service configuration."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
+    # --- Service ---
+    service_name: str = "arcforge-daytona-service"
+    service_version: str = "0.1.0"
+    debug: bool = False
+    log_level: str = "info"
+    host: str = "0.0.0.0"
+    port: int = 8000
+
+    # --- Daytona ---
+    daytona_api_key: str = ""
+    daytona_default_timeout: int = 300  # seconds for sandbox provisioning
+    daytona_max_concurrent_sandboxes: int = 50
+
+    # --- Sandbox defaults ---
+    default_sandbox_language: str = "python"
+    default_sandbox_image: str = "daytonaio/workspace-python:latest"
+    default_cpu: float = 2.0
+    default_memory: str = "4Gi"
+    default_disk: str = "10Gi"
+    sandbox_idle_timeout_seconds: int = 1800  # 30 minutes
+
+    @property
+    def daytona_config_dict(self) -> dict:
+        return {
+            "api_key": self.daytona_api_key,
+        }
+
+
+settings = Settings()
