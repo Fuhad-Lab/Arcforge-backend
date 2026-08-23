@@ -15,6 +15,19 @@ router = APIRouter(tags=["health"])
 
 
 @router.get(
+    "/",
+    summary="Root — service heartbeat",
+)
+async def root():
+    """Return a simple JSON heartbeat so the root URL doesn't 404."""
+    return {
+        "service": "Arcforge Daytona Service",
+        "version": settings.service_version,
+        "status": "operational",
+    }
+
+
+@router.get(
     "/health",
     response_model=HealthResponse,
     summary="Liveness probe",
