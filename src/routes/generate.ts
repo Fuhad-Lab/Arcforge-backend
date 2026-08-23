@@ -202,11 +202,24 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         }
 
         const files = project.codebase.files || [];
-        const mainCode = files.find((f) => f.path.includes("page.tsx"));
-        const code = mainCode ? mainCode.content : (files.length > 0 ? files[files.length - 1].content : "");
+        // Single-mode pipeline returns backend/frontend STRINGS instead of a
+        // files array — map them into the mandatory workspace structure:
+        //   backend  → /workspace/backend/app.py
+        //   frontend → /workspace/frontend/App.tsx
+        const synthFiles = [...files];
+        if (synthFiles.length === 0) {
+          if (project.codebase.backend) {
+            synthFiles.push({ path: "backend/app.py", content: project.codebase.backend, action: "create" as const });
+          }
+          if (project.codebase.frontend) {
+            synthFiles.push({ path: "frontend/App.tsx", content: project.codebase.frontend, action: "create" as const });
+          }
+        }
+        const mainCode = synthFiles.find((f) => f.path.includes("page.tsx"));
+        const code = mainCode ? mainCode.content : (synthFiles.length > 0 ? synthFiles[synthFiles.length - 1].content : "");
 
-        const thinking = `God Mode ${mode} pipeline completed in ${duration}ms. Files: ${files.map((f) => f.path).join(", ")}`;
-        const message = `Built with ${files.length} file${files.length !== 1 ? "s" : ""} using ${mode} mode.`;
+        const thinking = `God Mode ${mode} pipeline completed in ${duration}ms. Files: ${synthFiles.map((f) => f.path).join(", ")}`;
+        const message = `Built with ${synthFiles.length} file${synthFiles.length !== 1 ? "s" : ""} using ${mode} mode.`;
 
         // ── 5. VM ORCHESTRATION — write files into the Daytona sandbox ──
         // Failures here must NEVER fail the generation.
@@ -239,14 +252,23 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
             sandboxId = ensured.sandbox_id;
             let logoUploaded = ensured.logo_uploaded;
 
-            // 5b. Write every generated file into /workspace/frontend/.
-            if (files.length > 0) {
+            // 5b. Write every generated file into the VM, routing by path:
+            //   backend/**  → /workspace/backend/**
+            //   frontend/** → /workspace/frontend/**
+            //   anything else (swarm-mode raw paths) → /workspace/frontend/**
+            if (synthFiles.length > 0) {
               await writeWorkspaceFilesBulk(
                 sandboxId,
-                files.map((f) => ({
-                  path: `/workspace/frontend/${f.path.replace(/^\/+/, "")}`,
-                  content: f.content,
-                })),
+                synthFiles.map((f) => {
+                  const rel = f.path.replace(/^\/+/, "");
+                  if (rel.startsWith("backend/")) {
+                    return { path: `/workspace/${rel}`, content: f.content };
+                  }
+                  if (rel.startsWith("frontend/")) {
+                    return { path: `/workspace/${rel}`, content: f.content };
+                  }
+                  return { path: `/workspace/frontend/${rel}`, content: f.content };
+                }),
               );
             }
 
@@ -295,7 +317,7 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
 
         // ── 6. Persist the assistant reply (fire-and-forget) ────────────
         if (dbProject) {
-          const filePaths = files.map((f) => f.path).join(", ");
+          const filePaths = synthFiles.map((f) => f.path).join(", ");
           dbSaveChatMessage(
             dbProject.id,
             userId,
@@ -312,8 +334,8 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
           thinking,
           message,
           code,
-          actions: files.map((f) => ({ label: `Creating ${f.path}`, type: "create", path: f.path })),
-          files: files.map((f) => ({ path: f.path, action: "create", content: f.content })),
+          actions: synthFiles.map((f) => ({ label: `Creating ${f.path}`, type: "create", path: f.path })),
+          files: synthFiles.map((f) => ({ path: f.path, action: "create", content: f.content })),
           model: result.model || "god-mode",
           skillsUsed: result.skillsUsed || [],
           duration_ms: duration,
