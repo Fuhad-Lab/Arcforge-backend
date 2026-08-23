@@ -1411,41 +1411,68 @@ export class AgentPlatform {
     const apiKey = process.env.NVIDIA_API_KEY;
     if (!apiKey) throw new Error("NVIDIA_API_KEY is not configured.");
 
-    const response = await fetch(
+    const url =
       process.env.NVIDIA_API_URL ??
-        "https://integrate.api.nvidia.com/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userContent },
-          ],
-          temperature: 0,
-          max_tokens: 16384,
-          ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
-        }),
-      },
-    );
-    if (!response.ok) {
+      "https://integrate.api.nvidia.com/v1/chat/completions";
+
+    // Retry with exponential backoff on transient upstream failures
+    // (529 overloaded, 429 rate-limited, 502/503/504 gateway errors).
+    const RETRYABLE = new Set([429, 502, 503, 504, 529]);
+    const MAX_ATTEMPTS = 4;
+    const BASE_DELAY_MS = 4000;
+
+    let lastError = "";
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userContent },
+            ],
+            temperature: 0,
+            max_tokens: 16384,
+            ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+          }),
+        });
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err.message : String(err);
+        logger.warn({ model, attempt, err: lastError }, "NVIDIA fetch error");
+        if (attempt < MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, BASE_DELAY_MS * attempt));
+          continue;
+        }
+        break;
+      }
+
+      if (response.ok) {
+        const payload = (await response.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        return payload.choices?.[0]?.message?.content ?? "";
+      }
+
       const detail = await response.text();
-      logger.error(
-        { model, status: response.status },
-        "NVIDIA model request failed",
-      );
-      throw new Error(
-        `NVIDIA model request failed (${response.status}): ${detail.slice(0, 500)}`,
-      );
+      lastError = `NVIDIA model request failed (${response.status}): ${detail.slice(0, 300)}`;
+      if (RETRYABLE.has(response.status) && attempt < MAX_ATTEMPTS) {
+        logger.warn(
+          { model, attempt, status: response.status },
+          "NVIDIA transient failure — retrying with backoff",
+        );
+        await new Promise((r) => setTimeout(r, BASE_DELAY_MS * attempt));
+        continue;
+      }
+      logger.error({ model, status: response.status }, "NVIDIA model request failed");
+      break;
     }
-    const payload = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    return payload.choices?.[0]?.message?.content ?? "";
+    throw new Error(lastError);
   }
 
   /**
