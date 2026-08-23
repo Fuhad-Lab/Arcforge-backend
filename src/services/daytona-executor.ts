@@ -74,6 +74,7 @@ export class DaytonaExecutor {
     entryPoint: string,
     port: number,
     kind: ContainerKind,
+    userId?: string,
   ): Promise<ContainerInfo> {
     const key = `${projectId}:${kind}`;
     const name = sandboxName(projectId, kind);
@@ -102,7 +103,7 @@ export class DaytonaExecutor {
           language: "nodejs",
           resources: { cpu: 2, memory: "4Gi", disk: "10Gi" },
           env_vars: { PORT: String(port), NODE_ENV: "production" },
-          labels: { projectId, kind },
+          labels: { user_id: userId || 'unknown', project_id: projectId, kind },
         }),
       },
     );

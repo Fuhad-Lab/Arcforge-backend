@@ -26,6 +26,7 @@ export class ServiceRunner {
     project: ProjectState,
     kind: ContainerKind,
     port: number,
+    userId?: string,
   ): Promise<RunningService> {
     const files = project.codebase.files;
     if (files.length === 0) {
@@ -62,6 +63,7 @@ export class ServiceRunner {
       entryPoint,
       port,
       kind,
+      userId,
     );
 
     return {
