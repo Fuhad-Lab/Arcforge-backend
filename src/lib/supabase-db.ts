@@ -15,11 +15,30 @@ export type DbProject = {
   agreed_contract: unknown | null;
   preview_html: string | null;
   session_id: string | null;
+  logo_url: string | null;
+  platforms: string | string[] | null;
+  sandbox_id: string | null;
   skills_used: string[];
   phases_completed: string[];
   negotiation_rounds: number;
   created_at: string;
   updated_at: string;
+};
+
+export type DbUser = {
+  id: string;
+  email: string | null;
+  name: string | null;
+  avatar_url: string | null;
+  plan: string | null;
+  display_name: string | null;
+  ai_model: string | null;
+  theme: string | null;
+  default_platforms: string | string[] | null;
+  email_build_notifications: boolean | null;
+  weekly_digest: boolean | null;
+  nvidia_api_key: string | null;
+  daytona_api_key: string | null;
 };
 
 export type DbAgentMessage = {
@@ -119,6 +138,15 @@ function getSupabaseClient(): SupabaseClient {
  */
 export function isSupabaseConfigured(): boolean {
   return !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
+/**
+ * Public accessor for the service-role Supabase client.
+ * Throws when SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are missing —
+ * callers should guard with isSupabaseConfigured() first.
+ */
+export function getServiceSupabase(): SupabaseClient {
+  return getSupabaseClient();
 }
 
 // ─── PROJECT OPERATIONS ──────────────────────────────────────────────────

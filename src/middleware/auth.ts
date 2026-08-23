@@ -1,41 +1,80 @@
 import type { Request, Response, NextFunction } from "express";
 import { logger } from "../lib/logger";
+import { getServiceSupabase, isSupabaseConfigured } from "../lib/supabase-db";
 
-/**
- * Auth middleware: Extracts user context from headers set by Supabase Edge Functions.
- *
- * Expected headers:
- *   X-User-Id     — the Supabase auth user UUID
- *   X-Project-Id  — (optional) the project UUID for scoped operations
- *
- * These are attached by the edge-function middleware layer.
- */
-export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
-  const userId = req.headers["x-user-id"] as string | undefined;
-
-  if (!userId) {
-    // In dev/testing mode, allow anonymous access
-    if (process.env.NODE_ENV !== "production") {
-      (req as any).userId = req.body?.userId || "dev-anonymous";
-      return next();
+// ─── EXPRESS REQUEST AUGMENTATION ─────────────────────────────────────────
+// Attach authenticated user context to every Request instance (typed, no `any`).
+declare global {
+  namespace Express {
+    interface Request {
+      /** Supabase auth user UUID (set by requireAuth). */
+      userId?: string;
+      /** Email of the authenticated user, if available. */
+      userEmail?: string | null;
+      /** Optional project UUID for scoped operations. */
+      projectId?: string;
     }
-    res.status(401).json({ error: "Missing X-User-Id header" });
-    return;
   }
-
-  (req as any).userId = userId;
-  const projectId = req.headers["x-project-id"] as string | undefined;
-  if (projectId) (req as any).projectId = projectId;
-
-  next();
 }
 
 /**
- * Optional auth: sets userId if present, doesn't block if missing.
+ * JWT-based authentication middleware.
+ *
+ * Reads `Authorization: Bearer <jwt>` (forwarded by the Supabase Edge
+ * Functions) and verifies the token against Supabase Auth using the
+ * service-role client. On success attaches `req.userId` / `req.userEmail`.
+ *
+ * If Supabase env vars are missing (local dev), requests are allowed
+ * through as "dev-anonymous" so the API remains testable offline.
+ *
+ * NOTE: the legacy header-based `authMiddleware` / `optionalAuth` (which
+ * blindly trusted X-User-Id) have been REMOVED — every route now goes
+ * through requireAuth.
  */
-export function optionalAuth(req: Request, _res: Response, next: NextFunction): void {
-  const userId = req.headers["x-user-id"] as string | undefined;
-  if (userId) (req as any).userId = userId;
-  else (req as any).userId = req.body?.userId || "anonymous";
-  next();
+export async function requireAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  if (!isSupabaseConfigured()) {
+    // Dev mode: no Supabase configured — allow anonymous access.
+    req.userId = "dev-anonymous";
+    req.userEmail = null;
+    next();
+    return;
+  }
+
+  const header = req.headers.authorization;
+  const token =
+    typeof header === "string" && header.toLowerCase().startsWith("bearer ")
+      ? header.slice(7).trim()
+      : "";
+
+  if (!token) {
+    res
+      .status(401)
+      .json({ error: "Missing Authorization: Bearer <token> header" });
+    return;
+  }
+
+  try {
+    const { data, error } = await getServiceSupabase().auth.getUser(token);
+
+    if (error || !data?.user?.id) {
+      logger.warn(
+        { err: error?.message ?? "no user" },
+        "requireAuth: invalid or expired token",
+      );
+      res.status(401).json({ error: "Invalid or expired token" });
+      return;
+    }
+
+    req.userId = data.user.id;
+    req.userEmail = data.user.email ?? null;
+    next();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Token verification failed";
+    logger.error({ err: message }, "requireAuth: verification error");
+    res.status(401).json({ error: "Token verification failed" });
+  }
 }

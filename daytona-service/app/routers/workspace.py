@@ -39,11 +39,16 @@ async def create_workspace(req: CreateWorkspaceRequest) -> WorkspaceInitResponse
     """Spawn a Daytona MicroVM and create the mandatory directory blueprint.
 
     Creates: /workspace/git/, /workspace/frontend/, /workspace/backend/, /workspace/logo.png
+
+    Every sandbox is labeled with BOTH user_id and project_id so VMs can be
+    attributed to their owner (user_id is constant per user; project_id is
+    per project).
     """
     try:
         data = await workspace_manager.create_and_scaffold_workspace(
             project_id=req.project_id,
             language=req.language,
+            user_id=req.user_id,
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -51,6 +56,7 @@ async def create_workspace(req: CreateWorkspaceRequest) -> WorkspaceInitResponse
     return WorkspaceInitResponse(
         sandbox_id=data["id"],
         project_id=req.project_id,
+        user_id=req.user_id,
         state=str(data.get("state", "Unknown")),
         provision_time_ms=data.get("provision_time_ms", 0),
     )

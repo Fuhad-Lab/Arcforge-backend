@@ -9,9 +9,13 @@ import { agentPlatform } from "../services/agent-platform";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { logger } from "../lib/logger";
+import { requireAuth } from "../middleware/auth";
 
 const execFileAsync = promisify(execFile);
 const router: IRouter = Router();
+
+// JWT auth at the router level — these routes were previously fully public.
+router.use(requireAuth);
 
 // ─── RESOURCES ────────────────────────────────────────────────────────
 

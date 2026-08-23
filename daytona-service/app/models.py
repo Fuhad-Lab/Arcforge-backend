@@ -231,6 +231,11 @@ class BulkActionResponse(BaseModel):
 class CreateWorkspaceRequest(BaseModel):
     """Create a new project workspace with the mandatory directory blueprint."""
     project_id: str = Field(min_length=1, max_length=128, description="Project UUID")
+    user_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Owner user UUID — every sandbox must carry BOTH user_id and project_id labels",
+    )
     language: str = Field(default="nodejs", description="Sandbox language runtime")
 
 
@@ -269,6 +274,7 @@ class WorkspaceInitResponse(BaseModel):
     """Response after workspace creation + scaffold."""
     sandbox_id: str
     project_id: str
+    user_id: str | None = None
     state: str
     provision_time_ms: int
     workspace_root: str = "/workspace"

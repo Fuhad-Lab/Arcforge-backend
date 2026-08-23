@@ -1,62 +1,364 @@
-import { Router, type IRouter } from "express";
+/**
+ * /api/workspace — Daytona VM orchestration routes.
+ *
+ * Two families of routes:
+ *   1. Project-scoped (preferred): resolve sandbox_id from the projects
+ *      table and enforce ownership (project.user_id === req.userId).
+ *   2. Legacy sandboxId-based proxies (kept for the AI agent tooling).
+ *
+ * Auth: requireAuth (JWT) on every route — the sandbox VMs are the user's
+ * workspaces; nobody may touch another user's VM.
+ */
+import express, { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import { logger } from "../lib/logger";
+import { requireAuth } from "../middleware/auth";
+import { getServiceSupabase, isSupabaseConfigured } from "../lib/supabase-db";
+import {
+  destroyWorkspace,
+  ensureProjectSandbox,
+  getWorkspaceFileTree,
+  parseDataUrl,
+  proxyToDaytona,
+  uploadWorkspaceLogo,
+} from "../services/daytona-workspace";
 
 const router: IRouter = Router();
 
-const DAYTONA_URL = process.env.DAYTONA_SERVICE_URL || "https://arcforge-daytona.onrender.com";
+// JWT auth on every /api/workspace route.
+router.use(requireAuth);
 
-/** Proxy a request to the Daytona workspace service. */
-async function proxyToDaytona(
-  reqPath: string,
-  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
-) {
-  const url = `${DAYTONA_URL}/api/v1/workspace${reqPath}`;
-  const res = await fetch(url, {
-    method: options.method || "GET",
-    headers: {
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
+// ─── OWNERSHIP RESOLUTION ─────────────────────────────────────────────────
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Daytona workspace ${res.status}: ${text || res.statusText}`);
-  }
+type ProjectRow = {
+  id: string;
+  user_id: string;
+  name: string;
+  logo_url: string | null;
+  session_id: string | null;
+  sandbox_id: string | null;
+};
 
-  if (res.status === 204) return null;
-  return res.json();
+/**
+ * Fetch a project row by id. Returns null when not found (or DB down).
+ * Callers MUST compare `row.user_id === req.userId` before acting.
+ */
+async function getProjectRow(projectId: string): Promise<ProjectRow | null> {
+  if (!isSupabaseConfigured()) return null;
+  const supabase = getServiceSupabase();
+  const { data, error } = await supabase
+    .from("projects")
+    .select("id,user_id,name,logo_url,session_id,sandbox_id")
+    .eq("id", projectId)
+    .maybeSingle();
+  if (error) throw new Error(`project lookup: ${error.message}`);
+  return (data as ProjectRow) ?? null;
 }
 
-// ─── POST /api/workspace/init ───────────────────────────────────────
-// Create project workspace with scaffolded /workspace/{git,frontend,backend,logo.png}
+/**
+ * Ownership guard: responds 404 (missing) or 403 (foreign project) and
+ * returns false when the request must stop. On true, `row` is narrowed to a
+ * ProjectRow owned by the caller.
+ */
+function isOwnedBy(
+  res: Response,
+  row: ProjectRow | null,
+  userId?: string,
+): row is ProjectRow {
+  if (!row) {
+    res.status(404).json({ error: "Project not found" });
+    return false;
+  }
+  if (!userId || row.user_id !== userId) {
+    res.status(403).json({ error: "Forbidden — project belongs to another user" });
+    return false;
+  }
+  return true;
+}
 
-router.post("/init", async (req, res, next) => {
+async function saveSandboxId(projectId: string, sandboxId: string): Promise<void> {
+  const supabase = getServiceSupabase();
+  const { error } = await supabase
+    .from("projects")
+    .update({ sandbox_id: sandboxId, updated_at: new Date().toISOString() })
+    .eq("id", projectId);
+  if (error) throw new Error(`sandbox_id save: ${error.message}`);
+}
+
+// ─── POST /api/workspace/init — project-scoped workspace bootstrap ─────────
+// Create (or reuse) the project's Daytona VM with the scaffold
+// /workspace/{git,frontend,backend} + /workspace/logo.png, then upload the
+// project logo when present.
+
+router.post("/init", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { project_id, language } = req.body;
-    if (!project_id) {
+    const body = req.body ?? {};
+    const projectId: string =
+      (typeof body.project_id === "string" && body.project_id) ||
+      (typeof body.projectId === "string" && body.projectId) ||
+      "";
+    const language = typeof body.language === "string" ? body.language : "nodejs";
+
+    if (!projectId) {
       res.status(400).json({ error: "project_id is required" });
       return;
     }
-    const result = await proxyToDaytona("/init", {
-      method: "POST",
-      body: { project_id, language: language || "nodejs" },
+
+    // Dev fallback: no DB configured → legacy direct proxy (already behind auth).
+    if (!isSupabaseConfigured()) {
+      const result = await proxyToDaytona("/init", {
+        method: "POST",
+        body: { project_id: projectId, user_id: req.userId ?? null, language },
+      });
+      res.status(201).json(result);
+      return;
+    }
+
+    // 1. Ownership check.
+    const row = await getProjectRow(projectId);
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    // 2-6. Reuse live sandbox or provision + scaffold + logo, then fetch tree.
+    const ensured = await ensureProjectSandbox(row, {
+      language,
+      saveSandboxId: (sandboxId) => saveSandboxId(row.id, sandboxId),
     });
-    res.status(201).json(result);
+
+    res.status(ensured.reused ? 200 : 201).json({
+      sandbox_id: ensured.sandbox_id,
+      tree: ensured.tree,
+      logo_uploaded: ensured.logo_uploaded,
+      reused: ensured.reused,
+    });
   } catch (error) {
     next(error);
   }
 });
 
-// ─── GET /api/workspace/:sandboxId/file-tree ────────────────────────
-// Live file tree from the VM for the Studio Files Tab sidebar
+// ─── GET /api/workspace/project/:projectId/file-tree ──────────────────────
+// Live file tree for the project's VM (Studio Files Tab sidebar).
 
-router.get("/:sandboxId/file-tree", async (req, res, next) => {
+router.get("/project/:projectId/file-tree", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sandboxId } = req.params;
-    const maxDepth = parseInt(req.query.max_depth as string, 10) || 4;
-    const tree = await proxyToDaytona(`/${sandboxId}/file-tree?max_depth=${maxDepth}`);
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      // No VM yet — frontend renders the scaffold-empty state.
+      res.json({ tree: null, sandbox_id: null });
+      return;
+    }
+
+    const maxDepth = parseInt(String(req.query.max_depth ?? "4"), 10) || 4;
+    const tree = await getWorkspaceFileTree(row.sandbox_id, maxDepth);
+    res.json({ tree, sandbox_id: row.sandbox_id });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── GET /api/workspace/project/:projectId/read ───────────────────────────
+// Read a file from the project's VM.
+
+router.get("/project/:projectId/read", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      res.status(404).json({ error: "No sandbox for this project yet" });
+      return;
+    }
+
+    const path = req.query.path as string | undefined;
+    if (!path) {
+      res.status(400).json({ error: "path query param is required" });
+      return;
+    }
+
+    const result = await proxyToDaytona(
+      `/${encodeURIComponent(row.sandbox_id)}/read?path=${encodeURIComponent(path)}`,
+    );
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── POST /api/workspace/project/:projectId/write ─────────────────────────
+// Write a single file into the project's VM.
+
+router.post("/project/:projectId/write", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      res.status(404).json({ error: "No sandbox for this project yet" });
+      return;
+    }
+
+    const path = typeof req.body?.path === "string" ? req.body.path : "";
+    if (!path) {
+      res.status(400).json({ error: "path is required" });
+      return;
+    }
+    const content = typeof req.body?.content === "string" ? req.body.content : "";
+
+    await proxyToDaytona(`/${encodeURIComponent(row.sandbox_id)}/write`, {
+      method: "POST",
+      body: { path, content },
+    });
+    res.status(204).send();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── POST /api/workspace/project/:projectId/write-bulk ────────────────────
+// Write multiple files into the project's VM in one batch.
+
+router.post("/project/:projectId/write-bulk", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      res.status(404).json({ error: "No sandbox for this project yet" });
+      return;
+    }
+
+    const files = Array.isArray(req.body?.files) ? req.body.files : [];
+    if (files.length === 0) {
+      res.status(400).json({ error: "files array is required" });
+      return;
+    }
+
+    await proxyToDaytona(`/${encodeURIComponent(row.sandbox_id)}/write-bulk`, {
+      method: "POST",
+      body: { files },
+    });
+    res.status(204).send();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── POST /api/workspace/project/:projectId/terminal ──────────────────────
+// Execute a bash command in the project's VM (live terminal).
+
+router.post("/project/:projectId/terminal", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      res.status(404).json({ error: "No sandbox for this project yet" });
+      return;
+    }
+
+    const command = typeof req.body?.command === "string" ? req.body.command.trim() : "";
+    if (!command) {
+      res.status(400).json({ error: "command is required" });
+      return;
+    }
+    const cwd = typeof req.body?.cwd === "string" && req.body.cwd ? req.body.cwd : "/workspace";
+
+    const result = await proxyToDaytona(`/${encodeURIComponent(row.sandbox_id)}/terminal`, {
+      method: "POST",
+      body: { command, cwd },
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── POST /api/workspace/project/:projectId/logo ──────────────────────────
+// Upload the project logo into the VM at /workspace/logo.png.
+
+// Binary logo bodies (image/*) bypass express.json — parse them as raw buffers.
+const logoRawBody = express.raw({ type: ["image/*", "application/octet-stream"], limit: "5mb" });
+
+router.post("/project/:projectId/logo", logoRawBody, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      res.status(404).json({ error: "No sandbox for this project yet" });
+      return;
+    }
+
+    // Accept either a raw binary body or { dataUrl: "data:image/png;base64,..." }.
+    let bytes: Buffer | null = null;
+    let mime = "image/png";
+    const contentType = String(req.headers["content-type"] ?? "");
+    if (contentType.includes("application/json") && typeof req.body?.dataUrl === "string") {
+      const parsed = parseDataUrl(req.body.dataUrl);
+      if (parsed) {
+        bytes = parsed.bytes;
+        mime = parsed.mime;
+      }
+    } else if (Buffer.isBuffer(req.body)) {
+      bytes = req.body;
+      if (contentType.startsWith("image/")) mime = contentType;
+    }
+
+    if (!bytes || bytes.length === 0) {
+      res.status(400).json({ error: "logo binary body or {dataUrl} required" });
+      return;
+    }
+
+    await uploadWorkspaceLogo(row.sandbox_id, bytes, mime);
+    res.status(204).send();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── DELETE /api/workspace/project/:projectId ─────────────────────────────
+// Destroy the project's VM and clear projects.sandbox_id.
+
+router.delete("/project/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (row.sandbox_id) {
+      try {
+        await destroyWorkspace(row.sandbox_id);
+      } catch (err: unknown) {
+        // Sandbox may already be gone — clearing the pointer is still correct.
+        logger.warn(
+          { sandboxId: row.sandbox_id, err: err instanceof Error ? err.message : err },
+          "Sandbox destroy failed (continuing to clear sandbox_id)",
+        );
+      }
+      const supabase = getServiceSupabase();
+      const { error } = await supabase
+        .from("projects")
+        .update({ sandbox_id: null, updated_at: new Date().toISOString() })
+        .eq("id", row.id);
+      if (error) throw new Error(`sandbox_id clear: ${error.message}`);
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LEGACY SANDBOX-ID PROXIES (authenticated) — kept for AI agent tooling
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── GET /api/workspace/:sandboxId/file-tree ────────────────────────
+
+router.get("/:sandboxId/file-tree", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const sandboxId = String(req.params.sandboxId);
+    const maxDepth = parseInt(String(req.query.max_depth ?? "4"), 10) || 4;
+    const tree = await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/file-tree?max_depth=${maxDepth}`);
     res.json(tree);
   } catch (error) {
     next(error);
@@ -64,12 +366,11 @@ router.get("/:sandboxId/file-tree", async (req, res, next) => {
 });
 
 // ─── POST /api/workspace/:sandboxId/write ───────────────────────────
-// AI agent writes a single file directly into the VM
 
-router.post("/:sandboxId/write", async (req, res, next) => {
+router.post("/:sandboxId/write", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sandboxId } = req.params;
-    await proxyToDaytona(`/${sandboxId}/write`, {
+    const sandboxId = String(req.params.sandboxId);
+    await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/write`, {
       method: "POST",
       body: req.body,
     });
@@ -80,12 +381,11 @@ router.post("/:sandboxId/write", async (req, res, next) => {
 });
 
 // ─── POST /api/workspace/:sandboxId/write-bulk ──────────────────────
-// AI agent writes multiple files into the VM in one batch
 
-router.post("/:sandboxId/write-bulk", async (req, res, next) => {
+router.post("/:sandboxId/write-bulk", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sandboxId } = req.params;
-    await proxyToDaytona(`/${sandboxId}/write-bulk`, {
+    const sandboxId = String(req.params.sandboxId);
+    await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/write-bulk`, {
       method: "POST",
       body: req.body,
     });
@@ -96,17 +396,16 @@ router.post("/:sandboxId/write-bulk", async (req, res, next) => {
 });
 
 // ─── GET /api/workspace/:sandboxId/read ─────────────────────────────
-// Read a file from the VM filesystem
 
-router.get("/:sandboxId/read", async (req, res, next) => {
+router.get("/:sandboxId/read", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sandboxId } = req.params;
+    const sandboxId = String(req.params.sandboxId);
     const path = req.query.path as string;
     if (!path) {
       res.status(400).json({ error: "path query param is required" });
       return;
     }
-    const result = await proxyToDaytona(`/${sandboxId}/read?path=${encodeURIComponent(path)}`);
+    const result = await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/read?path=${encodeURIComponent(path)}`);
     res.json(result);
   } catch (error) {
     next(error);
@@ -114,31 +413,35 @@ router.get("/:sandboxId/read", async (req, res, next) => {
 });
 
 // ─── POST /api/workspace/:sandboxId/logo ────────────────────────────
-// Pre-studio logo upload → writes directly to /workspace/logo.png in the VM
+// Pre-studio logo upload → writes directly to /workspace/logo.png in the VM.
+// The daytona-service expects multipart/form-data with a `file` field
+// (see daytona-service/app/routers/workspace.py → upload_logo).
 
-router.post("/:sandboxId/logo", async (req, res, next) => {
+router.post("/:sandboxId/logo", logoRawBody, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sandboxId } = req.params;
-    const url = `${DAYTONA_URL}/api/v1/workspace/${sandboxId}/logo`;
+    const sandboxId = String(req.params.sandboxId);
 
-    // Forward the raw body as binary (image buffer)
-    const contentType = req.headers["content-type"] || "application/octet-stream";
-    const buffer = Buffer.from(req.body);
-
-    const fetchRes = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": contentType,
-        "Content-Length": String(buffer.length),
-      },
-      body: buffer as unknown as BodyInit,
-    });
-
-    if (!fetchRes.ok) {
-      const text = await fetchRes.text().catch(() => "");
-      throw new Error(`Logo upload failed (${fetchRes.status}): ${text}`);
+    // Accept either a raw binary body or { dataUrl: "data:image/png;base64,..." }.
+    let bytes: Buffer | null = null;
+    let mime = "image/png";
+    const contentType = String(req.headers["content-type"] ?? "");
+    if (contentType.includes("application/json") && typeof req.body?.dataUrl === "string") {
+      const parsed = parseDataUrl(req.body.dataUrl);
+      if (parsed) {
+        bytes = parsed.bytes;
+        mime = parsed.mime;
+      }
+    } else if (Buffer.isBuffer(req.body)) {
+      bytes = req.body;
+      if (contentType.startsWith("image/")) mime = contentType;
     }
 
+    if (!bytes || bytes.length === 0) {
+      res.status(400).json({ error: "logo binary body or {dataUrl} required" });
+      return;
+    }
+
+    await uploadWorkspaceLogo(sandboxId, bytes, mime);
     res.status(204).send();
   } catch (error) {
     next(error);
@@ -146,12 +449,11 @@ router.post("/:sandboxId/logo", async (req, res, next) => {
 });
 
 // ─── POST /api/workspace/:sandboxId/terminal ────────────────────────
-// Live bash terminal — returns exit_code + stdout for feedback loop
 
-router.post("/:sandboxId/terminal", async (req, res, next) => {
+router.post("/:sandboxId/terminal", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sandboxId } = req.params;
-    const result = await proxyToDaytona(`/${sandboxId}/terminal`, {
+    const sandboxId = String(req.params.sandboxId);
+    const result = await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/terminal`, {
       method: "POST",
       body: req.body,
     });
@@ -162,12 +464,11 @@ router.post("/:sandboxId/terminal", async (req, res, next) => {
 });
 
 // ─── DELETE /api/workspace/:sandboxId ───────────────────────────────
-// Destroy the workspace sandbox
 
-router.delete("/:sandboxId", async (req, res, next) => {
+router.delete("/:sandboxId", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { sandboxId } = req.params;
-    await proxyToDaytona(`/${sandboxId}`, { method: "DELETE" });
+    const sandboxId = String(req.params.sandboxId);
+    await proxyToDaytona(`/${encodeURIComponent(sandboxId)}`, { method: "DELETE" });
     res.status(204).send();
   } catch (error) {
     next(error);

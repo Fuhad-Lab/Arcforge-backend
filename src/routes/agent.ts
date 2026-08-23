@@ -2,8 +2,12 @@ import { Router, type IRouter } from "express";
 import { agentPlatform } from "../services/agent-platform";
 import type { AgentMode } from "../services/skill-registry";
 import { daytonaExecutor } from "../services/daytona-executor";
+import { requireAuth } from "../middleware/auth";
 
 const router: IRouter = Router();
+
+// JWT auth at the router level — these routes were previously fully public.
+router.use(requireAuth);
 
 function validUuid(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
@@ -29,8 +33,8 @@ router.post("/projects", async (req, res, next) => {
       res.status(400).json({ error: "prompt must be between 10 and 20,000 characters" });
       return;
     }
-    // TODO: extract userId from auth token when auth is implemented
-    const userId = typeof req.body?.userId === "string" ? req.body.userId : undefined;
+    // Authenticated user (JWT-verified by requireAuth at the router level).
+    const userId = req.userId || (typeof req.body?.userId === "string" ? req.body.userId : undefined);
     res.status(201).json(await agentPlatform.createProject(prompt, mode, undefined, userId));
   } catch (error) {
     next(error);

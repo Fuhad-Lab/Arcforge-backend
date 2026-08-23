@@ -126,6 +126,8 @@ type PipelineResult = {
   skillsUsed: string[];
   phasesCompleted: PipelinePhase[];
   negotiationRounds: number;
+  /** Model identifier used for the run (optional — callers fall back to "god-mode"). */
+  model?: string;
 };
 
 function emptySpec(): ProjectSpec {

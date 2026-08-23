@@ -70,26 +70,52 @@ class DaytonaWorkspaceManager:
         self,
         project_id: str,
         language: str = "nodejs",
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         """Spawn a Daytona MicroVM and enforce the strict directory blueprint.
+
+        Every sandbox is labeled with BOTH identifiers (snake_case keys):
+          {user_id: <owner uuid>, project_id: <project uuid>, type: "workspace"}
 
         Returns sandbox metadata dict with the new sandbox ID.
         """
         daytona = self._get_client()
 
+        # Labels: user_id is constant per user, project_id per project —
+        # both are REQUIRED for VM attribution across the platform.
+        labels: dict[str, str] = {
+            "user_id": user_id or "unknown",
+            "project_id": project_id,
+            "type": "workspace",
+        }
+
+        # Unique-ish, human-greppable sandbox name.
+        name_parts = [p for p in (user_id, project_id) if p]
+        if name_parts:
+            name = "arcforge-" + "-".join(p[:8] for p in name_parts)
+        else:
+            name = f"arcforge-ws-{project_id[:12]}"
+
+        env_vars: dict[str, str] = {"PROJECT_ID": project_id}
+        if user_id:
+            env_vars["USER_ID"] = user_id
+
         params = build_create_params(
             method="snapshot",
             language=language,
-            name=f"arcforge-ws-{project_id[:12]}",
+            name=name,
             cpu=settings.default_cpu,
             memory=_parse_resource_size(settings.default_memory),
             disk=_parse_resource_size(settings.default_disk),
-            labels={"projectId": project_id, "type": "workspace"},
-            env_vars={"PROJECT_ID": project_id},
+            labels=labels,
+            env_vars=env_vars,
             auto_stop_interval=settings.sandbox_idle_timeout_seconds,
         )
 
-        logger.info("Creating workspace sandbox for project %s …", project_id)
+        logger.info(
+            "Creating workspace sandbox for project %s (user %s) …",
+            project_id, user_id or "unattributed",
+        )
         t0 = time.monotonic()
 
         sandbox = await asyncio.to_thread(
@@ -108,6 +134,7 @@ class DaytonaWorkspaceManager:
 
         data = extract_sandbox_data(sandbox)
         data["project_id"] = project_id
+        data["user_id"] = user_id
         data["provision_time_ms"] = elapsed
         return data
 
