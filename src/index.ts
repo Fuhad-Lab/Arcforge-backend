@@ -1,4 +1,4 @@
-import app from "./app";
+import { server } from "./app";
 import { logger } from "./lib/logger";
 
 const rawPort = process.env["PORT"];
@@ -15,11 +15,16 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-app.listen(port, (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
-  }
+server.listen(port, () => {
+  logger.info({ port }, "Server listening (HTTP + WebSocket)");
+});
 
-  logger.info({ port }, "Server listening");
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  logger.info("SIGTERM received, shutting down");
+  server.close(() => process.exit(0));
+});
+process.on("SIGINT", () => {
+  logger.info("SIGINT received, shutting down");
+  server.close(() => process.exit(0));
 });

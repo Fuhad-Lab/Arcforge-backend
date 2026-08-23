@@ -1,10 +1,18 @@
 import express, { type Express } from "express";
+import { createServer } from "http";
 import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
+import { wsSync } from "./services/websocket-sync";
 
 const app: Express = express();
+
+// Create HTTP server for Express + WebSocket
+export const server = createServer(app);
+
+// Attach WebSocket sync on /ws
+wsSync.attach(server);
 
 app.use(
   pinoHttp({
