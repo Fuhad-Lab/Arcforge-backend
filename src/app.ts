@@ -46,6 +46,21 @@ app.use((req, res, next) => {
 
 app.use("/api", router);
 
+// Root route — service heartbeat
+app.get("/", (_req, res) => {
+  res.json({
+    service: "Arcforge Backend",
+    version: "1.0.0",
+    status: "operational",
+    endpoints: {
+      api: "/api",
+      websocket: "/ws",
+      health: "/api/health",
+      docs: "https://github.com/Fuhad-Lab/Arcforge-backend#readme",
+    },
+  });
+});
+
 app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const message = error instanceof Error ? error.message : "Unexpected server error";
   res.status(500).json({ error: message });
