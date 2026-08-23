@@ -171,7 +171,9 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
     const supabase = requireSupabase(res);
     if (!supabase) return;
 
-    const { data: project, error } = await supabase
+    // Primary lookup by session_id; fallback to the project UUID for rows
+    // created by direct backend generations (session_id may be null there).
+    let { data: project, error } = await supabase
       .from("projects")
       .select("id,user_id,name,logo_url,platforms,session_id,sandbox_id")
       .eq("session_id", req.params.sessionId)
@@ -179,6 +181,17 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
       .maybeSingle();
 
     if (error) throw new Error(`session lookup: ${error.message}`);
+
+    if (!project) {
+      const fallback = await supabase
+        .from("projects")
+        .select("id,user_id,name,logo_url,platforms,session_id,sandbox_id")
+        .eq("id", req.params.sessionId)
+        .eq("user_id", req.userId)
+        .maybeSingle();
+      if (fallback.error) throw new Error(`session lookup: ${fallback.error.message}`);
+      project = fallback.data;
+    }
 
     if (!project) {
       res.status(404).json({ error: "Session not found" });
@@ -236,7 +249,7 @@ router.delete("/sessions/:sessionId", async (req: Request, res: Response, next: 
     const { error } = await supabase
       .from("projects")
       .delete()
-      .eq("session_id", req.params.sessionId)
+      .or(`session_id.eq.${req.params.sessionId},id.eq.${req.params.sessionId}`)
       .eq("user_id", req.userId);
 
     if (error) throw new Error(`delete session: ${error.message}`);
