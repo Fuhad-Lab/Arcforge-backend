@@ -9,6 +9,26 @@ function validUuid(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+// ─── GENERATE (called by Edge Function) ─────────────────────────────
+
+router.post("/generate", async (req, res, next) => {
+  try {
+    const prompt = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    const mode = req.body?.mode === "single" || req.body?.mode === "swarm"
+      ? (req.body.mode as AgentMode)
+      : "single";
+    if (prompt.length < 3) {
+      res.status(400).json({ error: "message must be at least 3 characters" });
+      return;
+    }
+    const userId = req.headers["x-user-id"] as string || req.body?.userId || "anonymous";
+    const project = await agentPlatform.createProject(prompt, mode, undefined, userId);
+    res.status(201).json({ projectId: project.id, status: "created", prompt });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ─── PROJECT CRUD ─────────────────────────────────────────────────────
 
 router.get("/projects", async (_req, res, next) => {
