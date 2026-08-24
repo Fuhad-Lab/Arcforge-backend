@@ -246,6 +246,101 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
   }
 });
 
+// ─── GET /api/db/messages/:projectId — full chat history (with meta) ───────
+// Served directly to the frontend as a FALLBACK when the (stale) db-ops
+// edge function rejects the get-messages action. Returns full rows
+// including meta so the studio can rebuild UIMessages verbatim.
+
+router.get("/messages/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const { data: project, error: pErr } = await supabase
+      .from("projects")
+      .select("id,user_id")
+      .eq("id", req.params.projectId)
+      .eq("user_id", req.userId)
+      .maybeSingle();
+    if (pErr) throw new Error(`project lookup: ${pErr.message}`);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const { data: rows, error } = await supabase
+      .from("chat_messages")
+      .select("role,content,meta,created_at")
+      .eq("project_id", project.id)
+      .order("created_at", { ascending: true })
+      .limit(1000);
+
+    if (error) throw new Error(`messages lookup: ${error.message}`);
+    res.json({ messages: rows ?? [] });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── PUT /api/db/messages/:projectId — replace-all chat persistence ────────
+// Fallback for the stale db-ops edge function's missing save-messages
+// action. Mirrors the edge function semantics: delete-then-insert with
+// ownership enforced, fire-and-forget safe.
+
+router.put("/messages/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const { data: project, error: pErr } = await supabase
+      .from("projects")
+      .select("id,user_id")
+      .eq("id", req.params.projectId)
+      .eq("user_id", req.userId)
+      .maybeSingle();
+    if (pErr) throw new Error(`project lookup: ${pErr.message}`);
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const raw = Array.isArray(req.body?.messages) ? req.body.messages : null;
+    if (!raw) {
+      res.status(400).json({ error: "messages must be an array" });
+      return;
+    }
+
+    // Sanitize rows — only role/content/meta stored; project/user forced.
+    const rows = (raw as Array<Record<string, unknown>>)
+      .filter((m) => m && typeof m === "object")
+      .map((m) => ({
+        project_id: project.id,
+        user_id: req.userId as string,
+        role: typeof m.role === "string" ? m.role : "assistant",
+        content: typeof m.content === "string" ? m.content : "",
+        meta: m.meta && typeof m.meta === "object" ? m.meta : null,
+      }));
+
+    // Replace-all (the frontend always sends the full conversation).
+    const { error: delErr } = await supabase
+      .from("chat_messages")
+      .delete()
+      .eq("project_id", project.id);
+    if (delErr) throw new Error(`clear old messages: ${delErr.message}`);
+
+    if (rows.length > 0) {
+      const { error: insErr } = await supabase
+        .from("chat_messages")
+        .insert(rows);
+      if (insErr) throw new Error(`insert messages: ${insErr.message}`);
+    }
+
+    res.json({ ok: true, count: rows.length });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ─── DELETE /api/db/sessions/:sessionId — delete a project ─────────────────
 
 router.delete("/sessions/:sessionId", async (req: Request, res: Response, next: NextFunction) => {
