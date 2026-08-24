@@ -278,7 +278,112 @@ class WorkspaceInitResponse(BaseModel):
     state: str
     provision_time_ms: int
     workspace_root: str = "/workspace"
+    vfs_backend: str = Field(
+        default="disk",
+        description=(
+            "VFS backend for /workspace — 'tmpfs' (RAM disk, sub-ms HMR) "
+            "or 'disk' (fallback when tmpfs mount fails)"
+        ),
+    )
+    agent_installed: bool = Field(
+        default=False,
+        description=(
+            "True if the guest workspace-agent daemon was installed and "
+            "verified running inside the VM"
+        ),
+    )
     structure: list[str] = Field(
         default_factory=lambda: ["git/", "frontend/", "backend/", "logo.png"],
         description="Mandatory workspace directories",
     )
+
+
+# ---------------------------------------------------------------------------
+# Module 1 VFS: stream-write + VFS status
+# ---------------------------------------------------------------------------
+
+
+class StreamWriteRequest(BaseModel):
+    """Stream-write a file to the guest daemon (Module 1 VFS).
+
+    Either ``content_b64`` (base64-encoded bytes — preferred for binary
+    payloads and avoids any UTF-8 decoding issues) or ``content`` (raw
+    UTF-8 text) must be supplied. If both are present, ``content_b64`` wins.
+    """
+    path: str = Field(min_length=1, description="File path inside workspace")
+    content_b64: str | None = Field(
+        default=None,
+        description="Base64-encoded file bytes (preferred for binary)",
+    )
+    content: str | None = Field(
+        default=None,
+        description="Raw UTF-8 file content (alternative to content_b64)",
+    )
+
+
+class StreamWriteResponse(BaseModel):
+    """Result of a stream-write to the guest daemon."""
+    ok: bool
+    path: str
+    size: int = 0
+    vfs_backend: str = "disk"
+
+
+class VfsStatusResponse(BaseModel):
+    """Snapshot of VFS + daemon + persistence state (Module 1)."""
+    tmpfs_mounted: bool
+    daemon_running: bool
+    dirty_count: int
+    last_flush_at: str | None = None
+    persist_dir: str
+
+
+# ---------------------------------------------------------------------------
+# Module 3 Browser Engine: install + audit
+# ---------------------------------------------------------------------------
+
+
+class BrowserAuditRequest(BaseModel):
+    """Request shape for the in-VM Playwright audit endpoint (Module 3).
+
+    ``frontend_url`` is the local URL the headless browser navigates to --
+    almost always ``http://localhost:5173`` (Vite default) inside the VM.
+    ``backend_url`` is informational; the audit script surfaces it back
+    in the response so the host can correlate.
+    ``validation_blueprint`` is the OpenAPI / heuristic contract from the
+    Architect -- currently passed through to the response shape for
+    correlation; actual blueprint-aware assertions live in the host
+    backend's heuristic evaluator (Module 4).
+    """
+    frontend_url: str = Field(min_length=1)
+    backend_url: str | None = None
+    validation_blueprint: dict[str, Any] | None = None
+
+
+class BrowserAuditResult(BaseModel):
+    """Result of a single in-VM Playwright audit run (Module 3).
+
+    Always returned -- even on failure (``status="failed"`` with the
+    ``error`` field populated). The orchestration loop's evaluator
+    (Module 4) heuristically decides pass / replan from ``status`` +
+    ``error_logs`` + ``http_status``.
+    """
+    status: str = "failed"
+    title: str | None = None
+    url: str | None = None
+    backend_url: str | None = None
+    http_status: int | None = None
+    error_logs: list[str] = Field(default_factory=list)
+    console_errors: list[str] = Field(default_factory=list)
+    dom_snapshot: str | None = None
+    screenshot_b64: str | None = None
+    duration_ms: int | None = None
+    error: str | None = None
+
+
+class BrowserInstallResult(BaseModel):
+    """Result of an idempotent Chromium install in the VM (Module 3)."""
+    installed: bool = False
+    browser_path: str | None = None
+    install_log: str = ""
+    duration_ms: int | None = None

@@ -25,8 +25,10 @@ SDK calls used:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import shlex
 import time
 from typing import Any
 
@@ -138,32 +140,89 @@ class DaytonaWorkspaceManager:
             sandbox.id, elapsed, project_id,
         )
 
-        # --- Scaffold the mandatory directory structure ---
-        await self._scaffold_workspace(sandbox.id)
+        # --- Scaffold the mandatory directory structure (with best-effort tmpfs) ---
+        scaffold_info = await self._scaffold_workspace(sandbox.id)
+
+        # --- Install guest workspace-agent daemon (best-effort, never fatal) ---
+        # If this fails, stream-write falls back to sandbox.fs.upload_file.
+        agent_installed = False
+        try:
+            await self.install_guest_agent(sandbox.id)
+            agent_installed = True
+        except Exception as exc:
+            logger.warning(
+                "Failed to install guest agent in sandbox %s: %s "
+                "(continuing without agent — stream-write will fall back "
+                "to upload_file)",
+                sandbox.id, exc,
+            )
 
         data = extract_sandbox_data(sandbox)
         data["project_id"] = project_id
         data["user_id"] = user_id
         data["provision_time_ms"] = elapsed
+        data["vfs_backend"] = scaffold_info.get("vfs_backend", "disk")
+        data["agent_installed"] = agent_installed
         return data
 
-    async def _scaffold_workspace(self, sandbox_id: str) -> None:
+    async def _scaffold_workspace(self, sandbox_id: str) -> dict[str, Any]:
         """Create /workspace/git, /workspace/frontend, /workspace/backend inside the VM.
 
         The /workspace root is not present on stock images and / is root-owned,
         so we sudo-create it and chown it to the sandbox user first (passwordless
         sudo is available on the python snapshot), then mkdir -p the mandatory
         dirs and touch a placeholder logo.png so the tree is complete from birth.
+
+        Module 1 VFS: Before scaffolding dirs, we attempt a best-effort
+        ``tmpfs`` mount on /workspace for sub-millisecond HMR (Vite/Next/Nodemon).
+        This is non-fatal -- if the mount fails (no privileges, /workspace
+        already mounted), we proceed with disk-backed /workspace. Returns
+        ``{"vfs_backend": "tmpfs" | "disk"}``.
         """
+        daytona = self._get_client()
+        sandbox = await asyncio.to_thread(daytona.get, sandbox_id)
+
+        # --- Best-effort tmpfs mount (Module 1 VFS) ---
+        # Falls back silently to disk-backed /workspace if mount fails (no
+        # privileges, /workspace already mounted, etc.). Workspace creation
+        # MUST still succeed regardless of this outcome.
+        tmpfs_cmd = (
+            f"sudo mount -t tmpfs -o size=512M,mode=0755 tmpfs {WORKSPACE_ROOT} 2>/dev/null && "
+            f"sudo chown daytona:daytona {WORKSPACE_ROOT} 2>/dev/null; "
+            f"mount | grep -q 'on {WORKSPACE_ROOT} type tmpfs' && "
+            f"echo 'TMPFS_OK' || echo 'TMPFS_FALLBACK_DISK'"
+        )
+        vfs_backend = "disk"
+        try:
+            tmpfs_result = await asyncio.to_thread(
+                sandbox.process.exec, tmpfs_cmd, "/home/daytona", None, 30,
+            )
+            tmpfs_out = (getattr(tmpfs_result, "result", "") or "").strip()
+            if "TMPFS_OK" in tmpfs_out:
+                vfs_backend = "tmpfs"
+                logger.info(
+                    "tmpfs mounted on %s in sandbox %s (sub-ms HMR ready)",
+                    WORKSPACE_ROOT, sandbox_id,
+                )
+            else:
+                logger.warning(
+                    "tmpfs mount fell back to disk for %s in sandbox %s (out=%s) — "
+                    "workspace still fully functional, just no RAM-disk HMR speedup",
+                    WORKSPACE_ROOT, sandbox_id, tmpfs_out or "(empty)",
+                )
+        except Exception as exc:
+            logger.warning(
+                "tmpfs mount attempt raised in sandbox %s: %s (continuing with disk)",
+                sandbox_id, exc,
+            )
+
+        # --- Mandatory directory scaffold (always runs, regardless of tmpfs) ---
         dirs = " ".join(f"{WORKSPACE_ROOT}/{d}" for d in MANDATORY_DIRS)
         scaffold_cmd = (
             f"sudo mkdir -p {WORKSPACE_ROOT} 2>/dev/null && "
             f"sudo chown daytona:daytona {WORKSPACE_ROOT} 2>/dev/null; "
             f"mkdir -p {dirs} && touch {WORKSPACE_ROOT}/logo.png"
         )
-
-        daytona = self._get_client()
-        sandbox = await asyncio.to_thread(daytona.get, sandbox_id)
 
         result = await asyncio.to_thread(
             sandbox.process.exec, scaffold_cmd, "/home/daytona", None, 60,
@@ -180,7 +239,11 @@ class DaytonaWorkspaceManager:
                 f"Workspace scaffold failed: {getattr(result, 'result', '')}"
             )
 
-        logger.info("Workspace scaffolded in sandbox %s", sandbox_id)
+        logger.info(
+            "Workspace scaffolded in sandbox %s (vfs_backend=%s)",
+            sandbox_id, vfs_backend,
+        )
+        return {"vfs_backend": vfs_backend}
 
     # ------------------------------------------------------------------
     # 2. Pre-Studio Logo Upload
@@ -458,6 +521,285 @@ class DaytonaWorkspaceManager:
         sandbox = await asyncio.to_thread(daytona.get, sandbox_id)
         await asyncio.to_thread(daytona.delete, sandbox, 60, False)
         logger.info("Workspace sandbox %s destroyed", sandbox_id)
+
+    # ------------------------------------------------------------------
+    # 8. Guest Workspace-Agent Daemon (Module 1 VFS)
+    # ------------------------------------------------------------------
+
+    async def install_guest_agent(self, sandbox_id: str) -> None:
+        """Install + launch the guest workspace-agent daemon in the VM.
+
+        Writes the daemon source to /workspace/.workspace-agent.py and the
+        WS client helper to /workspace/.ws_client.py (both stdlib-only --
+        no pip install needed), then launches the daemon in the background
+        via ``nohup python3 ... &`` with env vars configuring port, persist
+        dir, and flush interval.
+
+        Verifies the daemon is listening (best-effort -- non-fatal if curl
+        is missing). Best-effort overall: logs warnings on failure, never
+        raises (the caller in create_and_scaffold_workspace treats failure
+        as non-fatal -- stream-write then falls back to sandbox.fs.upload_file).
+        """
+        from app.services.workspace_agent import (
+            GUEST_DAEMON_SOURCE,
+            GUEST_WS_CLIENT_SOURCE,
+        )
+
+        sandbox = await self._resolve_sandbox(sandbox_id)
+
+        daemon_path = f"{WORKSPACE_ROOT}/.workspace-agent.py"
+        client_path = f"{WORKSPACE_ROOT}/.ws_client.py"
+        log_path = f"{WORKSPACE_ROOT}/.agent.log"
+        # IMPORTANT: persist_dir MUST live on a DISK-backed volume (NOT under
+        # /workspace, which would be tmpfs -- defeating the purpose of
+        # persistence).
+        persist_dir = "/home/daytona/.arcforge-persist"
+
+        # 1) Write the daemon + client source files
+        await asyncio.to_thread(
+            sandbox.fs.upload_file,
+            GUEST_DAEMON_SOURCE.encode("utf-8"), daemon_path,
+        )
+        await asyncio.to_thread(
+            sandbox.fs.upload_file,
+            GUEST_WS_CLIENT_SOURCE.encode("utf-8"), client_path,
+        )
+
+        # 2) Ensure persist dir exists on disk-backed /home/daytona +
+        #    mark scripts executable (for shebang invocation convenience)
+        prep_cmd = (
+            f"mkdir -p {persist_dir} && "
+            f"chown daytona:daytona {persist_dir} 2>/dev/null; "
+            f"chmod +x {daemon_path} {client_path} 2>/dev/null; "
+            f"echo OK"
+        )
+        await asyncio.to_thread(
+            sandbox.process.exec, prep_cmd, "/home/daytona", None, 15,
+        )
+
+        # 3) Kill any prior instance (idempotent install)
+        kill_cmd = "pkill -f workspace-agent 2>/dev/null; sleep 0.3; echo OK"
+        await asyncio.to_thread(
+            sandbox.process.exec, kill_cmd, "/home/daytona", None, 10,
+        )
+
+        # 4) Launch daemon in background via nohup (detached -- survives this exec)
+        #    stdin redirected from /dev/null so the process doesn't block.
+        launch_cmd = (
+            f"WORKSPACE_ROOT={WORKSPACE_ROOT} "
+            f"WORKSPACE_PERSIST_DIR={persist_dir} "
+            f"WORKSPACE_AGENT_PORT=3010 "
+            f"WORKSPACE_FLUSH_INTERVAL_S=4 "
+            f"nohup python3 {daemon_path} > {log_path} 2>&1 < /dev/null &"
+        )
+        await asyncio.to_thread(
+            sandbox.process.exec, launch_cmd, "/home/daytona", None, 10,
+        )
+
+        # 5) Verify (best-effort -- pgrep + optional curl)
+        verify_cmd = (
+            "sleep 1.5; "
+            "pgrep -f workspace-agent > /dev/null && echo 'AGENT_RUNNING' "
+            "|| echo 'AGENT_NOT_RUNNING'; "
+            "curl -s -o /dev/null -w 'HTTP_%{http_code}' "
+            "http://localhost:3010/ 2>/dev/null || echo 'NO_CURL'"
+        )
+        verify_result = await asyncio.to_thread(
+            sandbox.process.exec, verify_cmd, "/home/daytona", None, 15,
+        )
+        verify_out = (getattr(verify_result, "result", "") or "").strip()
+
+        if "AGENT_RUNNING" in verify_out:
+            logger.info(
+                "Guest workspace-agent installed and running in sandbox %s "
+                "(verify=%s)",
+                sandbox_id, verify_out.replace("\n", " | "),
+            )
+        else:
+            # Read the log to surface the failure
+            log_result = await asyncio.to_thread(
+                sandbox.process.exec,
+                f"tail -n 30 {log_path} 2>/dev/null",
+                "/home/daytona", None, 10,
+            )
+            log_tail = (getattr(log_result, "result", "") or "").strip()
+            logger.warning(
+                "Guest agent failed to start in sandbox %s (verify=%s, "
+                "log tail=%s) -- stream-write will fall back to upload_file",
+                sandbox_id, verify_out, log_tail[-500:],
+            )
+            # Do NOT raise -- install is best-effort per spec.
+
+    async def stream_write_file(
+        self, sandbox_id: str, path: str, content: bytes,
+    ) -> dict[str, Any]:
+        """Stream-write file bytes to the guest daemon via the in-VM WS client.
+
+        Module 1 VFS write path:
+          1. Host base64-encodes the bytes.
+          2. Host uploads the b64 payload to a temp file under /workspace
+             (avoids ARG_MAX limits on the command line).
+          3. Host runs ``python3 /workspace/.ws_client.py write <path> <b64_file>``
+             inside the VM via ``sandbox.process.exec``.
+          4. The WS client opens a TCP socket to 127.0.0.1:3010, performs the
+             RFC 6455 handshake, sends a masked text frame with the write
+             payload, reads the daemon's response, and prints it to stdout.
+          5. The daemon decodes the b64, writes the bytes directly to tmpfs
+             /workspace (RAM-to-RAM, inotify fires immediately for HMR),
+             marks the path dirty for the persistence worker, and returns
+             ok/path/size/sha256/vfs_backend.
+
+        Falls back to ``sandbox.fs.upload_file`` if the daemon is not running
+        or the WS path fails for any reason (best-effort contract per spec).
+
+        Returns a dict: ``{ok, path, size, vfs_backend, fallback?}``.
+        """
+        vm_path = self._normalize_vm_path(path)
+        b64 = base64.b64encode(content).decode("ascii")
+
+        sandbox = await self._resolve_sandbox(sandbox_id)
+
+        # Write b64 payload to a temp file the WS client reads (avoids ARG_MAX)
+        tmp_payload = f"{WORKSPACE_ROOT}/.stream_buf_{int(time.time() * 1000)}.b64"
+        try:
+            await asyncio.to_thread(
+                sandbox.fs.upload_file, b64.encode("ascii"), tmp_payload,
+            )
+
+            # Run the in-VM WS client
+            client_cmd = (
+                f"python3 {WORKSPACE_ROOT}/.ws_client.py write "
+                f"{shlex.quote(vm_path)} {shlex.quote(tmp_payload)}"
+            )
+            result = await asyncio.to_thread(
+                sandbox.process.exec, client_cmd, "/home/daytona", None, 30,
+            )
+            raw = (getattr(result, "result", "") or "").strip()
+            raw_exit = getattr(result, "exit_code", None)
+            exit_code = -1 if raw_exit is None else int(raw_exit)
+
+            resp: dict[str, Any] | None = None
+            if exit_code == 0 and raw:
+                # Parse the LAST non-empty line (in case python printed warnings)
+                last_line = raw.split("\n")[-1].strip()
+                try:
+                    resp = json.loads(last_line)
+                except Exception:
+                    resp = {
+                        "ok": False,
+                        "error": f"unparseable response: {last_line[:200]}",
+                    }
+            else:
+                resp = {
+                    "ok": False,
+                    "error": f"client exit={exit_code}, out={raw[:200]}",
+                }
+
+            if not resp.get("ok"):
+                # Fallback to direct upload_file
+                logger.warning(
+                    "Stream-write via WS daemon failed in sandbox %s (err=%s); "
+                    "falling back to direct upload_file",
+                    sandbox_id, resp.get("error"),
+                )
+                await asyncio.to_thread(
+                    sandbox.fs.upload_file, content, vm_path,
+                )
+                # Best-effort vfs_backend check (mount status is independent
+                # of which write path was used -- upload_file writes to the
+                # same /workspace, which IS tmpfs if mounted)
+                vfs = await self._check_tmpfs_mount(sandbox_id)
+                return {
+                    "ok": True,
+                    "path": vm_path,
+                    "size": len(content),
+                    "vfs_backend": "tmpfs" if vfs else "disk",
+                    "fallback": "upload_file",
+                }
+
+            # Daemon handled the write -- extract vfs_backend from response
+            resp["vfs_backend"] = resp.get("vfs_backend", "disk")
+            return resp
+        finally:
+            # Cleanup temp payload
+            try:
+                await asyncio.to_thread(
+                    sandbox.process.exec,
+                    f"rm -f {shlex.quote(tmp_payload)}",
+                    "/home/daytona", None, 5,
+                )
+            except Exception:
+                pass
+
+    async def get_persistence_status(self, sandbox_id: str) -> dict[str, Any]:
+        """Query the guest daemon for VFS + persistence status.
+
+        Returns a dict with tmpfs_mounted, daemon_running, dirty_count,
+        last_flush_at, persist_dir. Falls back to a direct /proc/mounts
+        check if the daemon is not running (so callers still learn the
+        mount state regardless of daemon liveness).
+        """
+        sandbox = await self._resolve_sandbox(sandbox_id)
+
+        # Try the daemon via the in-VM WS client
+        client_cmd = f"python3 {WORKSPACE_ROOT}/.ws_client.py status"
+        try:
+            result = await asyncio.to_thread(
+                sandbox.process.exec, client_cmd, "/home/daytona", None, 15,
+            )
+            raw = (getattr(result, "result", "") or "").strip()
+            raw_exit = getattr(result, "exit_code", None)
+            exit_code = -1 if raw_exit is None else int(raw_exit)
+            if exit_code == 0 and raw:
+                last_line = raw.split("\n")[-1].strip()
+                try:
+                    outer = json.loads(last_line)
+                    if outer.get("ok") and "status" in outer:
+                        s = outer["status"]
+                        return {
+                            "tmpfs_mounted": bool(s.get("tmpfs_mounted")),
+                            "daemon_running": True,
+                            "dirty_count": int(s.get("dirty_count", 0)),
+                            "last_flush_at": s.get("last_flush_at"),
+                            "persist_dir": s.get(
+                                "persist_dir",
+                                "/home/daytona/.arcforge-persist",
+                            ),
+                        }
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to parse daemon status response in sandbox %s: %s",
+                        sandbox_id, exc,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Failed to query daemon status in sandbox %s: %s",
+                sandbox_id, exc,
+            )
+
+        # Fallback: direct mount check (daemon may not be running)
+        tmpfs_mounted = await self._check_tmpfs_mount(sandbox_id)
+        return {
+            "tmpfs_mounted": tmpfs_mounted,
+            "daemon_running": False,
+            "dirty_count": 0,
+            "last_flush_at": None,
+            "persist_dir": "/home/daytona/.arcforge-persist",
+        }
+
+    async def _check_tmpfs_mount(self, sandbox_id: str) -> bool:
+        """Quick check if /workspace is mounted as tmpfs in the VM."""
+        try:
+            sandbox = await self._resolve_sandbox(sandbox_id)
+            result = await asyncio.to_thread(
+                sandbox.process.exec,
+                f"mount | grep -q 'on {WORKSPACE_ROOT} type tmpfs' && echo TMPFS || echo DISK",
+                "/home/daytona", None, 5,
+            )
+            out = (getattr(result, "result", "") or "").strip()
+            return "TMPFS" in out
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Helpers

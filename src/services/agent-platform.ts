@@ -436,7 +436,7 @@ export class AgentPlatform {
       ].join("\n"),
     );
 
-    const proposalRaw = await this.callModelRaw(
+    const proposalRaw = await this.nvidiaCallModelRaw(
       DEFAULT_MODELS.backend,
       backendSystemPrompt,
       `User Request:\n${userPrompt}\n\nOpenAPI Contract:\n${specContext}`,
@@ -487,7 +487,7 @@ export class AgentPlatform {
         ].join("\n"),
       );
 
-      const reviewRaw = await this.callModelRaw(
+      const reviewRaw = await this.nvidiaCallModelRaw(
         DEFAULT_MODELS.frontend,
         frontendReviewSystem,
         `User Request:\n${userPrompt}\n\nConversation History:\n${conversationDigest(project.messages)}`,
@@ -562,7 +562,7 @@ export class AgentPlatform {
         ].join("\n"),
       );
 
-      const revisionRaw = await this.callModelRaw(
+      const revisionRaw = await this.nvidiaCallModelRaw(
         DEFAULT_MODELS.backend,
         revisionSystem,
         `Conversation History:\n${conversationDigest(project.messages)}`,
@@ -662,7 +662,7 @@ export class AgentPlatform {
         ].join("\n"),
       );
 
-      const backendRaw = await this.callModelRaw(
+      const backendRaw = await this.nvidiaCallModelRaw(
         DEFAULT_MODELS.backend,
         backendSystem,
         `User Request:\n${project.initialPrompt}\n\nConversation History:\n${conversationDigest(project.messages)}`,
@@ -730,7 +730,7 @@ export class AgentPlatform {
         ].join("\n"),
       );
 
-      const frontendRaw = await this.callModelRaw(
+      const frontendRaw = await this.nvidiaCallModelRaw(
         DEFAULT_MODELS.frontend,
         frontendSystem,
         `User Request:\n${project.initialPrompt}\n\nConversation History:\n${conversationDigest(project.messages)}`,
@@ -848,6 +848,78 @@ export class AgentPlatform {
   }
 
   // ─── SINGLE MODE PIPELINE ────────────────────────────────────────
+
+  // ─── MODULE 4: ORCHESTRATION LOOP (POST-CODEGEN) ────────────────────
+
+  /**
+   * Drive the Architect → Developers → Serve → Debugger → Auto-correct
+   * state machine. Called by generate.ts AFTER the initial codegen has
+   * completed and the files have been written into the Daytona VM.
+   *
+   * Resilience contract: NEVER throws. Any VM/audit/Playwright failure
+   * is logged warn and the loop returns `status: "skipped"` so the
+   * surrounding generation pipeline can still ship the produced code.
+   * The caller (generate.ts) wraps this in its own try/catch as a second
+   * layer of defense.
+   *
+   * The returned `LoopResult` carries `iterations`, `final_audit`, and
+   * `production_ready` (derived from `status === "production_ready"`)
+   * which generate.ts merges into the `done` SSE payload.
+   */
+  async runPostCodegenLoop(
+    project: ProjectState,
+    sandboxId: string | null,
+    emit: (event: string, data: Record<string, unknown>) => void,
+  ): Promise<import("./orchestration-loop").LoopResult> {
+    // Lazy import to avoid a module-load-time cycle: orchestration-loop
+    // imports `agentPlatform` (this singleton), so importing it here
+    // keeps the dependency edge runtime-only and lets esbuild hoist
+    // the bundle without a circular-init hazard.
+    const { executeOrchestrationPipelineLoop } = await import("./orchestration-loop");
+
+    // Narrow the caller's broad emit into the ActivityEmit signature
+    // the loop expects (event="activity" + {label,status,kind}).
+    const activityEmit = (event: string, data: Record<string, unknown>): void => {
+      if (event !== "activity") return;
+      const rawStatus = (data.status as string | undefined) ?? "done";
+      const status: "active" | "done" | "error" =
+        rawStatus === "active" ? "active" : rawStatus === "error" ? "error" : "done";
+      const narrowed: {
+        label: string;
+        status: "active" | "done" | "error";
+        kind?: string;
+      } = {
+        label: String(data.label ?? ""),
+        status,
+      };
+      if (typeof data.kind === "string") narrowed.kind = data.kind;
+      // Reuse the caller's emit so writes are coalesced with the
+      // surrounding SSE stream (including client-disconnect guards).
+      emit("activity", narrowed as unknown as Record<string, unknown>);
+    };
+
+    try {
+      return await executeOrchestrationPipelineLoop(project, sandboxId, activityEmit);
+    } catch (err: unknown) {
+      logger.warn(
+        {
+          projectId: project.id,
+          sandboxId,
+          err: err instanceof Error ? err.message : err,
+        },
+        "runPostCodegenLoop: orchestration loop crashed — generation continues without audit",
+      );
+      // Best-effort partial result so the caller can still emit a "skipped"
+      // audit event and the user sees the loop was attempted.
+      return {
+        status: "skipped",
+        iterations: 0,
+        final_audit: null,
+        skills_used: project.skillsUsed,
+        phases_completed: project.phasesCompleted,
+      };
+    }
+  }
 
   private async runSinglePipeline(
     project: ProjectState,
@@ -1401,8 +1473,13 @@ export class AgentPlatform {
   /**
    * Core LLM call to the NVIDIA API with God Mode system prompt.
    * Returns the raw text response.
+   *
+   * Renamed from `callModelRaw` to avoid a name collision with the public
+   * role-aware wrapper below. This is the RAW NVIDIA fetch — the public
+   * `callModelRaw(role, system, user)` builds the God Mode system prompt
+   * and delegates here.
    */
-  private async callModelRaw(
+  private async nvidiaCallModelRaw(
     model: string,
     systemPrompt: string,
     userContent: string,
@@ -1483,10 +1560,31 @@ export class AgentPlatform {
   }
 
   /**
-   * Calls the NVIDIA model with phase-aware God Mode skill injection.
-   * (Used for single-mode and planning phase)
+   * Public role-aware wrapper around the raw NVIDIA fetch. Builds the God
+   * Mode system prompt for the role's phase and delegates to the private
+   * `nvidiaCallModelRaw` with the standard retry/backoff envelope.
+   *
+   * Used by Module 4 (orchestration-loop) so the Architect re-plan call
+   * gets the same planning-phase skills, header, and retry behavior as
+   * the initial codegen pass.
    */
-  private async callModel(
+  async callModelRaw(
+    role: Role,
+    systemPrompt: string,
+    userPrompt: string,
+    jsonMode = false,
+    project?: ProjectState,
+  ): Promise<string> {
+    return this.callModel(role, systemPrompt, userPrompt, jsonMode, project);
+  }
+
+  /**
+   * Calls the NVIDIA model with phase-aware God Mode skill injection.
+   * Public so the orchestration loop (Module 4) can drive planning-phase
+   * re-plans through the same retry/backoff path as the rest of the
+   * pipeline. Internally still used by single-mode + planning.
+   */
+  async callModel(
     role: Role,
     system: string,
     user: string,
@@ -1497,7 +1595,7 @@ export class AgentPlatform {
     const fullSystem = project
       ? this.buildSystemPrompt(role, phase, project, system)
       : system;
-    return this.callModelRaw(
+    return this.nvidiaCallModelRaw(
       DEFAULT_MODELS[role],
       fullSystem,
       user,

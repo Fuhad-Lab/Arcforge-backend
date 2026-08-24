@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     default_disk: str = "10Gi"
     sandbox_idle_timeout_seconds: int = 1800  # 30 minutes
 
+    # --- Module 3 Browser Engine (Playwright-in-VM) ---
+    browser_install_timeout_s: int = 300   # max time to install Chromium (~150MB download + deps)
+    browser_audit_timeout_s: int = 120     # max time for one audit run (launch + goto + screenshot)
+    browser_audit_script_path: str = "/workspace/.browser-audit.py"
+
     @property
     def daytona_config_dict(self) -> dict:
         return {

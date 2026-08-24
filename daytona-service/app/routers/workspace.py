@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 from typing import Any
@@ -7,13 +8,20 @@ from fastapi import APIRouter, HTTPException, UploadFile, status
 from app.models import (
     AgentBulkWriteRequest,
     AgentCodeWriteRequest,
+    BrowserAuditRequest,
+    BrowserAuditResult,
+    BrowserInstallResult,
     CodeRunResult,
     CreateWorkspaceRequest,
     FileContentResponse,
     FileTreeResponse,
+    StreamWriteRequest,
+    StreamWriteResponse,
     TerminalCommandRequest,
+    VfsStatusResponse,
     WorkspaceInitResponse,
 )
+from app.services.browser_engine import browser_engine
 from app.services.workspace_coordinator import workspace_manager
 
 logger = logging.getLogger(__name__)
@@ -59,6 +67,8 @@ async def create_workspace(req: CreateWorkspaceRequest) -> WorkspaceInitResponse
         user_id=req.user_id,
         state=str(data.get("state", "Unknown")),
         provision_time_ms=data.get("provision_time_ms", 0),
+        vfs_backend=data.get("vfs_backend", "disk"),
+        agent_installed=data.get("agent_installed", False),
     )
 
 
@@ -240,3 +250,221 @@ async def run_terminal(sandbox_id: str, req: TerminalCommandRequest) -> CodeRunR
         )
 
     return result
+
+
+# ======================================================================
+# Module 1 VFS: Stream-Write + VFS Status
+# ======================================================================
+
+
+@router.post(
+    "/{sandbox_id}/stream-write",
+    response_model=StreamWriteResponse,
+    summary="Stream-write a file to the guest daemon (RAM-disk tmpfs write)",
+    responses={
+        200: {"description": "File written via WS daemon OR fallback upload_file"},
+        400: {"description": "Neither content_b64 nor content provided, or invalid base64"},
+        502: {"description": "Daytona API unreachable"},
+    },
+)
+async def stream_write_file(
+    sandbox_id: str, req: StreamWriteRequest,
+) -> StreamWriteResponse:
+    """Stream-write a file to the guest workspace-agent daemon.
+
+    Module 1 VFS write path:
+      1. The host serializes the file change into a base64 binary buffer.
+      2. An in-VM WebSocket client (``/workspace/.ws_client.py``) is
+         invoked via ``sandbox.process.exec``.
+      3. The client opens a TCP socket to 127.0.0.1:3010, performs the
+         RFC 6455 handshake, and streams the buffer to the guest daemon.
+      4. The daemon writes the bytes directly to tmpfs /workspace
+         (RAM-to-RAM). The Linux kernel immediately fires an inotify
+         event for HMR (Vite/Next/Nodemon).
+
+    Falls back to ``sandbox.fs.upload_file`` if the daemon is not
+    running (best-effort contract).
+    """
+    if req.content_b64:
+        try:
+            content = base64.b64decode(req.content_b64)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid base64 content: {exc}",
+            ) from exc
+    elif req.content is not None:
+        content = req.content.encode("utf-8")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Either content_b64 or content must be provided",
+        )
+
+    try:
+        result = await workspace_manager.stream_write_file(
+            sandbox_id, req.path, content,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return StreamWriteResponse(
+        ok=bool(result.get("ok", False)),
+        path=result.get("path", req.path),
+        size=int(result.get("size", 0)),
+        vfs_backend=result.get("vfs_backend", "disk"),
+    )
+
+
+@router.get(
+    "/{sandbox_id}/vfs-status",
+    response_model=VfsStatusResponse,
+    summary="Get VFS + daemon + persistence status",
+    responses={
+        200: {"description": "tmpfs mount + daemon + dirty-file + last-flush info"},
+        502: {"description": "Daytona API unreachable"},
+    },
+)
+async def get_vfs_status(sandbox_id: str) -> VfsStatusResponse:
+    """Return tmpfs mount status, daemon liveness, and persistence worker state.
+
+    Module 1 VFS status snapshot:
+      - ``tmpfs_mounted``: True if /workspace is mounted as a tmpfs RAM disk.
+      - ``daemon_running``: True if the guest workspace-agent is alive.
+      - ``dirty_count``: Number of modified-but-not-yet-flushed files.
+      - ``last_flush_at``: Unix timestamp of the last persistence flush.
+      - ``persist_dir``: Disk-backed persist directory path.
+
+    Falls back to a direct /proc/mounts check if the daemon is not
+    running (callers still learn the mount state regardless).
+    """
+    try:
+        s = await workspace_manager.get_persistence_status(sandbox_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    last_flush = s.get("last_flush_at")
+    return VfsStatusResponse(
+        tmpfs_mounted=bool(s.get("tmpfs_mounted")),
+        daemon_running=bool(s.get("daemon_running")),
+        dirty_count=int(s.get("dirty_count", 0)),
+        last_flush_at=(str(last_flush) if last_flush is not None else None),
+        persist_dir=str(s.get("persist_dir", "/home/daytona/.arcforge-persist")),
+    )
+
+
+# ======================================================================
+# Module 3 Browser Engine: install + audit (Playwright in VM)
+# ======================================================================
+
+
+@router.post(
+    "/{sandbox_id}/browser-install",
+    response_model=BrowserInstallResult,
+    summary="Install Playwright + Chromium inside the VM (idempotent)",
+    responses={
+        200: {"description": "Install attempted; see `installed` flag for result"},
+        502: {"description": "Daytona API unreachable"},
+    },
+)
+async def browser_install(sandbox_id: str) -> BrowserInstallResult:
+    """Idempotent installer for the in-VM browser engine.
+
+    Probes ``~/.cache/ms-playwright/chromium-*/chrome-linux/chrome`` first.
+    If absent, runs ``pip3 install playwright``, then
+    ``python3 -m playwright install chromium``, then
+    ``sudo python3 -m playwright install-deps chromium`` (best-effort).
+
+    First-time install takes ~60-90s on a warm sandbox (the 150MB chromium
+    download dominates). Subsequent installs return instantly via the
+    in-process per-sandbox cache.
+    """
+    try:
+        result = await browser_engine.ensure_browser_installed(sandbox_id)
+    except Exception as exc:
+        # Contract: ensure_browser_installed never raises, but if a bug
+        # surfaces one, the operator still gets a structured 502.
+        raise HTTPException(
+            status_code=502,
+            detail=f"browser_install unexpected failure: {exc}",
+        ) from exc
+
+    return BrowserInstallResult(
+        installed=bool(result.get("installed", False)),
+        browser_path=result.get("browser_path"),
+        install_log=result.get("install_log", ""),
+        duration_ms=int(result.get("duration_ms", 0)),
+    )
+
+
+@router.post(
+    "/{sandbox_id}/browser-audit",
+    response_model=BrowserAuditResult,
+    summary="Run an in-VM Playwright audit against the live preview URL",
+    responses={
+        200: {"description": "Audit attempted; see `status` for success/failed"},
+        502: {"description": "Daytona API unreachable"},
+    },
+)
+async def browser_audit(
+    sandbox_id: str, req: BrowserAuditRequest,
+) -> BrowserAuditResult:
+    """Run a headless Chromium audit inside the sandbox VM.
+
+    This is the AI's "eyes" -- Module 3 of the ArcForge architecture.
+
+    Flow:
+      1. Lazy-install Playwright + Chromium if not already present
+         (idempotent; ~60-90s on first audit, instant on subsequent).
+      2. Write ``/workspace/.browser-audit.py`` into the VM.
+      3. ``sandbox.process.exec("python3 /workspace/.browser-audit.py "
+         "<frontend_url> <backend_url|->")``.
+      4. The audit script launches headless Chromium, navigates to
+         ``frontend_url`` (typically ``http://localhost:5173``), captures
+         ``console.error`` + ``pageerror`` events, captures the rendered
+         DOM (truncated to 50 000 chars), and captures a full-page PNG
+         screenshot (base64-encoded).
+      5. The script prints one JSON envelope on stdout -- the host parses
+         the last JSON line and returns it.
+
+    NEVER raises -- on any failure (install, write, exec, parse, timeout)
+    returns a ``BrowserAuditResult`` with ``status="failed"`` and the
+    ``error`` field populated. This is the contract Module 4's
+    orchestration loop depends on (the auto-correction loop's evaluator
+    can decide replan purely from the response shape, regardless of
+    failure mode).
+    """
+    try:
+        result = await browser_engine.execute_audit(
+            sandbox_id,
+            frontend_url=req.frontend_url,
+            backend_url=req.backend_url,
+            validation_blueprint=req.validation_blueprint,
+        )
+    except Exception as exc:
+        # Contract: execute_audit never raises, but defend in case.
+        logger.exception(
+            "browser_audit unexpected exception for sandbox %s", sandbox_id,
+        )
+        result = {
+            "status": "failed",
+            "error": f"browser_audit unexpected failure: {exc}",
+            "error_logs": [],
+            "console_errors": [],
+        }
+
+    return BrowserAuditResult(
+        status=str(result.get("status", "failed")),
+        title=result.get("title"),
+        url=result.get("url", req.frontend_url),
+        backend_url=result.get("backend_url", req.backend_url),
+        http_status=result.get("http_status"),
+        error_logs=list(result.get("error_logs", []) or []),
+        console_errors=list(result.get("console_errors", []) or []),
+        dom_snapshot=result.get("dom_snapshot"),
+        screenshot_b64=result.get("screenshot_b64"),
+        duration_ms=int(result.get("duration_ms", 0))
+        if result.get("duration_ms") is not None
+        else None,
+        error=result.get("error"),
+    )

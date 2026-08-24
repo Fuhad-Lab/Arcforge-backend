@@ -5,12 +5,29 @@
  * The edge function forwards the user's Authorization header; requireAuth
  * resolves req.userId (JWT-verified — never trust headers blindly).
  *
- * Emits: start, activity, project, sandbox, done, error
+ * Emits: start, activity, project, sandbox, test, audit, done, error
  *
  * After the pipeline succeeds, generated files are written DIRECTLY into the
  * project's Daytona VM (/workspace/frontend/...) — never to local disk —
  * and a `sandbox` event with {sandbox_id, project_id, tree, logo_uploaded}
  * is emitted before `done`.
+ *
+ * MODULE 2 (Automated Feedback Test Runner) runs IMMEDIATELY AFTER the
+ * `writeWorkspaceFilesBulk` call (before the Module 4 loop) and emits a
+ * `test` SSE event {command, exit_code, stdout, stderr, http_status,
+ * duration_ms, ran} so the LLM's next prompt context window sees its own
+ * runtime errors. The result is also persisted as a `post_write_test`
+ * generation row (fire-and-forget — never blocks generation).
+ *
+ * MODULE 4 (Async Multi-Agent Compilation & Verification Pipeline) runs
+ * AFTER the VM writes and BEFORE `done`. It drives the
+ *   Architect → Developers → Serve → Debugger → Auto-correct
+ * loop inside the VM, emitting `activity` events at each phase transition
+ * and a final `audit` event with {status, iterations, failures,
+ * screenshot_b64?, dom_snapshot?, production_ready}. The `done` payload
+ * merges in `audit_status`, `audit_iterations`, `audit_failures`, and
+ * `production_ready`. VM / Playwright failures are non-fatal — the loop
+ * returns `status: "skipped"` and generation still ships the produced code.
  */
 import { Router, type IRouter, type Request, type Response } from "express";
 import { agentPlatform } from "../services/agent-platform";
@@ -22,6 +39,7 @@ import {
   dbCreateProject,
   dbGetProject,
   dbSaveChatMessage,
+  dbSaveGeneration,
   dbUpdateProject,
   getServiceSupabase,
   isSupabaseConfigured,
@@ -34,6 +52,7 @@ import {
   uploadWorkspaceLogo,
   writeWorkspaceFilesBulk,
 } from "../services/daytona-workspace";
+import { runPostWriteTest, type TestResult } from "../services/feedback-test-runner";
 
 const router: IRouter = Router();
 
@@ -216,10 +235,10 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         const synthFiles = [...files];
         if (synthFiles.length === 0) {
           if (project.codebase.backend) {
-            synthFiles.push({ path: "backend/app.py", content: project.codebase.backend, action: "create" as const });
+            synthFiles.push({ path: "backend/app.py", content: project.codebase.backend });
           }
           if (project.codebase.frontend) {
-            synthFiles.push({ path: "frontend/App.tsx", content: project.codebase.frontend, action: "create" as const });
+            synthFiles.push({ path: "frontend/App.tsx", content: project.codebase.frontend });
           }
         }
         const mainCode = synthFiles.find((f) => f.path.includes("page.tsx"));
@@ -232,6 +251,17 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         // Failures here must NEVER fail the generation.
         let sandboxId: string | null = null;
         let sandboxTree: unknown = null;
+        // Module 2 test-runner result — hoisted out of the sandbox block
+        // so the `done` event always has access to it even when no
+        // sandbox ran (test_result stays null in that case).
+        let testResult: TestResult | null = null;
+        // Module 4 audit payload — hoisted out of the sandbox block so the
+        // `done` event always has access to it even when no sandbox ran
+        // (status stays "skipped" with 0 iterations in that case).
+        let auditStatus: "passed" | "failed" | "skipped" = "skipped";
+        let auditIterations = 0;
+        let auditFailures: string[] = [];
+        let productionReady = false;
         if (dbProject && isSupabaseConfigured()) {
           try {
             emit("activity", { label: "Writing files into VM", status: "active", kind: "generate" });
@@ -279,6 +309,99 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
               );
             }
 
+            // 5b-post. MODULE 2 — Automated Feedback Test Runner.
+            // Run an in-VM test / health-check / syntax check on the
+            // freshly-written code and capture stdout/stderr/HTTP status
+            // so the LLM's next prompt context window sees its own
+            // runtime errors. Failures are non-fatal — emit a `test`
+            // event with ran:false + skipped_reason when anything goes
+            // wrong. The result is also persisted as a `post_write_test`
+            // generation row (diagnostics column) for the next LLM round.
+            try {
+              emit("activity", {
+                label: "Running post-write test",
+                status: "active",
+                kind: "think",
+              });
+              testResult = await runPostWriteTest(sandboxId, synthFiles);
+              emit("test", {
+                ran: testResult.ran,
+                command: testResult.command,
+                exit_code: testResult.exit_code,
+                stdout: (testResult.stdout ?? "").slice(0, 4096),
+                stderr: (testResult.stderr ?? "").slice(0, 4096),
+                http_status: testResult.http_status,
+                duration_ms: testResult.duration_ms,
+                skipped_reason: testResult.skipped_reason ?? null,
+              });
+              emit("activity", {
+                label: testResult.ran
+                  ? `Post-write test done (exit ${testResult.exit_code ?? "n/a"})`
+                  : `Post-write test skipped: ${testResult.skipped_reason ?? "unknown"}`,
+                status: "done",
+                kind: "think",
+              });
+
+              // Persist as a generation row (fire-and-forget). The
+              // `diagnostics` JSONB array carries the full TestResult so
+              // the next LLM round can read its own runtime errors.
+              if (dbProject) {
+                dbSaveGeneration(dbProject.id, {
+                  kind: "post_write_test",
+                  status: testResult.ran
+                    ? testResult.exit_code === 0
+                      ? "passed"
+                      : "failed"
+                    : "skipped",
+                  diagnostics: [testResult],
+                  summary: (testResult.stdout ?? "").slice(0, 500) || null,
+                  duration_ms: testResult.duration_ms,
+                }).catch((err: unknown) => {
+                  logger.warn(
+                    { projectId: dbProject!.id, err: err instanceof Error ? err.message : err },
+                    "Failed to persist post_write_test generation row",
+                  );
+                });
+              }
+            } catch (testErr: unknown) {
+              logger.warn(
+                {
+                  projectId: dbProject.id,
+                  sandboxId,
+                  err: testErr instanceof Error ? testErr.message : testErr,
+                },
+                "Post-write test runner crashed — generation continues",
+              );
+              testResult = {
+                ran: false,
+                command: "",
+                exit_code: null,
+                stdout: "",
+                stderr: "",
+                http_status: null,
+                duration_ms: 0,
+                skipped_reason:
+                  testErr instanceof Error
+                    ? `test runner crashed: ${testErr.message}`
+                    : "test runner crashed",
+              };
+              emit("test", {
+                ran: false,
+                command: "",
+                exit_code: null,
+                stdout: "",
+                stderr: "",
+                http_status: null,
+                duration_ms: 0,
+                skipped_reason: testResult.skipped_reason ?? null,
+              });
+              emit("activity", {
+                label: `Post-write test skipped: ${testResult.skipped_reason}`,
+                status: "done",
+                kind: "think",
+              });
+            }
+
             // 5c. Upload the project logo (data URL) to /workspace/logo.png
             // when the sandbox was reused (fresh sandboxes got it in 5a).
             if (ensured.reused && row.logo_url && !logoUploaded) {
@@ -296,11 +419,107 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
               }
             }
 
-            // 5d. Fresh file tree for the Files Tab.
-            sandboxTree = await getWorkspaceFileTree(sandboxId);
+            // 5d. MODULE 4 — Async Multi-Agent Compilation & Verification
+            // Pipeline. Drive the Architect → Developers → Serve → Debugger
+            // → Auto-correct loop INSIDE the Daytona VM. The first iteration
+            // picks up at the Serve phase against the files we just wrote.
+            // On failure, the Architect re-plans and the Developers
+            // re-codegen, then we rewrite files into the VM and re-audit
+            // (up to MAX_CORRECTION_ITERATIONS = 2 retries).
+            //
+            // Resilience: NEVER fail generation from this block. Any VM /
+            // Playwright / dev-server crash is logged warn and the loop
+            // returns a `skipped` status so the surrounding pipeline still
+            // ships the produced code.
+            let auditScreenshot: string | null = null;
+            let auditDom: string | null = null;
+            try {
+              emit("activity", {
+                label: "Launching Module 4 verification pipeline",
+                status: "active",
+                kind: "generate",
+              });
+              const loopResult = await agentPlatform.runPostCodegenLoop(
+                project,
+                sandboxId,
+                emit,
+              );
+              auditIterations = loopResult.iterations ?? 0;
+              const finalAudit = loopResult.final_audit;
+              if (loopResult.status === "production_ready") {
+                auditStatus = "passed";
+                productionReady = true;
+              } else if (loopResult.status === "max_iterations_exceeded") {
+                auditStatus = "failed";
+                productionReady = false;
+              } else {
+                auditStatus = "skipped";
+                productionReady = false;
+              }
+              auditFailures = finalAudit?.error_logs ?? [];
+              if (finalAudit?.screenshot_b64) {
+                auditScreenshot = finalAudit.screenshot_b64;
+              }
+              if (finalAudit?.dom_snapshot) {
+                auditDom = finalAudit.dom_snapshot;
+              }
+              // Fresh tree after the loop's possible re-codegen so the
+              // Files Tab reflects the latest VM state.
+              sandboxTree = await getWorkspaceFileTree(sandboxId);
+              emit("audit", {
+                status: auditStatus,
+                iterations: auditIterations,
+                failures: auditFailures,
+                screenshot_b64: auditScreenshot,
+                dom_snapshot: auditDom,
+                production_ready: productionReady,
+              });
+              emit("activity", {
+                label:
+                  auditStatus === "passed"
+                    ? "Build verified — production-ready"
+                    : auditStatus === "failed"
+                      ? `Audit failed after ${auditIterations} iteration(s)`
+                      : "Audit skipped",
+                status: auditStatus === "passed" ? "done" : auditStatus === "failed" ? "error" : "done",
+                kind: "generate",
+              });
+            } catch (loopErr: unknown) {
+              logger.warn(
+                {
+                  projectId: dbProject.id,
+                  sandboxId,
+                  err: loopErr instanceof Error ? loopErr.message : loopErr,
+                },
+                "Module 4 orchestration loop crashed — generation continues",
+              );
+              emit("audit", {
+                status: "skipped",
+                iterations: 0,
+                failures: [],
+                production_ready: false,
+              });
+              emit("activity", {
+                label: "Audit skipped (loop crashed — non-fatal)",
+                status: "done",
+                kind: "think",
+              });
+              // Re-fetch the tree so the Files Tab still shows something.
+              try {
+                sandboxTree = await getWorkspaceFileTree(sandboxId);
+              } catch {
+                /* leave sandboxTree as-is */
+              }
+            }
+
+            // 5e. Fresh file tree for the Files Tab (re-fetched after the
+            // loop above so it reflects any re-codegen writes).
+            if (!sandboxTree) {
+              try { sandboxTree = await getWorkspaceFileTree(sandboxId); } catch { /* leave as null */ }
+            }
 
             emit("activity", { label: "Files written to VM", status: "done", kind: "generate" });
-            // 5e. New SSE event BEFORE done.
+            // 5f. New SSE event BEFORE done.
             emit("sandbox", {
               sandbox_id: sandboxId,
               project_id: row.id,
@@ -348,6 +567,27 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
           duration_ms: duration,
           sandbox_id: sandboxId,
           tree: sandboxTree,
+          // Module 2 test result — null when no sandbox ran. Always
+          // present as a key so the frontend can null-check rather
+          // than hasOwnProperty-check.
+          test_result: testResult
+            ? {
+                ran: testResult.ran,
+                command: testResult.command,
+                exit_code: testResult.exit_code,
+                stdout: (testResult.stdout ?? "").slice(0, 4096),
+                stderr: (testResult.stderr ?? "").slice(0, 4096),
+                http_status: testResult.http_status,
+                duration_ms: testResult.duration_ms,
+                skipped_reason: testResult.skipped_reason ?? null,
+              }
+            : null,
+          // Module 4 audit fields — always present so the frontend can
+          // render the verification panel without null-checking each.
+          audit_status: auditStatus,
+          audit_iterations: auditIterations,
+          audit_failures: auditFailures,
+          production_ready: productionReady,
         });
       } catch (pipelineErr: unknown) {
         const msg = pipelineErr instanceof Error ? pipelineErr.message : "Pipeline failed";

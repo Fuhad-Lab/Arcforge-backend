@@ -1,10 +1,13 @@
 /**
  * /api/workspace — Daytona VM orchestration routes.
  *
- * Two families of routes:
+ * Three families of routes:
  *   1. Project-scoped (preferred): resolve sandbox_id from the projects
  *      table and enforce ownership (project.user_id === req.userId).
- *   2. Legacy sandboxId-based proxies (kept for the AI agent tooling).
+ *   2. Preview proxy (Module 2): `/preview/:sandboxId/:port[/<path>]`
+ *      resolves a public/loopback URL per (sandbox, port) pair and
+ *      proxies HTTP through to the VM via in-VM curl.
+ *   3. Legacy sandboxId-based proxies (kept for the AI agent tooling).
  *
  * Auth: requireAuth (JWT) on every route — the sandbox VMs are the user's
  * workspaces; nobody may touch another user's VM.
@@ -17,10 +20,17 @@ import {
   destroyWorkspace,
   ensureProjectSandbox,
   getWorkspaceFileTree,
+  isSandboxAlive,
   parseDataUrl,
   proxyToDaytona,
   uploadWorkspaceLogo,
 } from "../services/daytona-workspace";
+import {
+  buildPreviewUrl,
+  probePort,
+  proxyThroughVm,
+  type PreviewResolution,
+} from "../services/preview-proxy";
 
 const router: IRouter = Router();
 
@@ -82,6 +92,64 @@ async function saveSandboxId(projectId: string, sandboxId: string): Promise<void
     .update({ sandbox_id: sandboxId, updated_at: new Date().toISOString() })
     .eq("id", projectId);
   if (error) throw new Error(`sandbox_id save: ${error.message}`);
+}
+
+/**
+ * Look up a project row by its sandbox_id. Used by the preview proxy
+ * routes to verify the caller owns the sandbox before proxying through
+ * to the VM. Returns null when no project owns this sandbox (or DB down).
+ */
+async function getProjectRowBySandbox(
+  sandboxId: string,
+): Promise<ProjectRow | null> {
+  if (!isSupabaseConfigured()) return null;
+  const supabase = getServiceSupabase();
+  const { data, error } = await supabase
+    .from("projects")
+    .select("id,user_id,name,logo_url,session_id,sandbox_id")
+    .eq("sandbox_id", sandboxId)
+    .maybeSingle();
+  if (error) throw new Error(`project lookup by sandbox: ${error.message}`);
+  return (data as ProjectRow) ?? null;
+}
+
+/**
+ * Ownership guard variant for the preview proxy routes: when the DB
+ * is configured, the sandbox MUST be owned by a project whose user_id
+ * matches the caller. When Supabase is NOT configured (local dev), the
+ * sandbox is allowed through so preview works in offline development.
+ *
+ * Returns the validated `ProjectRow` (or `null` in dev mode) when the
+ * request may proceed, OR sends 404/403 and returns `false` otherwise.
+ */
+async function authorizeSandboxAccess(
+  req: Request,
+  res: Response,
+  sandboxId: string,
+): Promise<ProjectRow | null | false> {
+  // Dev fallback: no DB → skip ownership check (matches the legacy
+  // sandbox-id proxy behavior elsewhere in this router).
+  if (!isSupabaseConfigured()) return null;
+
+  // 1. Sandbox must be real & alive before we touch it.
+  let alive = false;
+  try {
+    alive = await isSandboxAlive(sandboxId);
+  } catch (err: unknown) {
+    logger.warn(
+      { sandboxId, err: err instanceof Error ? err.message : err },
+      "preview: sandbox liveness check threw",
+    );
+  }
+  if (!alive) {
+    res.status(404).json({ error: "Sandbox not found or not alive" });
+    return false;
+  }
+
+  // 2. Caller must own the project that owns this sandbox.
+  const row = await getProjectRowBySandbox(sandboxId);
+  if (!isOwnedBy(res, row, req.userId)) return false;
+  return row;
 }
 
 // ─── POST /api/workspace/init — project-scoped workspace bootstrap ─────────
@@ -347,6 +415,180 @@ router.delete("/project/:projectId", async (req: Request, res: Response, next: N
     next(error);
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 2 — REVERSE PROXY (host-side) + PREVIEW URL RESOLVER
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The Daytona MicroVM only binds dev-server ports inside its network
+// namespace. To expose them externally without per-port host ingress,
+// we proxy HTTP requests through this backend: each request triggers
+// a `curl -sS -i http://localhost:<port><path>` inside the VM via
+// runWorkspaceTerminal. The full HTTP response (status line + headers
+// + body) is parsed and streamed back to the caller with the original
+// Content-Type and status code preserved.
+//
+//   GET  /api/workspace/preview/:sandboxId/:port        → PreviewResolution JSON
+//   ALL  /api/workspace/preview/:sandboxId/:port/<path>  → proxied HTTP stream
+//
+// Auth: requireAuth (applied at the router level above) + an explicit
+// ownership guard that verifies the caller's project owns the sandbox.
+
+/**
+ * Parse the `:port` route param to a positive integer 1..65535. Returns
+ * NaN on invalid input; callers should treat NaN as a 400 error.
+ */
+function parsePort(raw: string | undefined): number {
+  const n = parseInt(String(raw ?? ""), 10);
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : NaN;
+}
+
+// ─── GET /api/workspace/preview/:sandboxId/:port ──────────────────────────
+// Resolve a (sandbox, port) pair to its PreviewResolution JSON. Probes
+// the port liveness inside the VM and returns the public/loopback URL
+// the frontend should embed. The trailing-slash form (`.../:port/`)
+// falls through to the proxy so the iframe URL produced here, when
+// loaded, actually proxies to the VM root rather than returning JSON.
+
+router.get(
+  "/preview/:sandboxId/:port",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      // Strict routing is off by default — `/preview/sbx/5173/` also
+      // matches this route. Forward those to the proxy so the
+      // preview_url's trailing-slash form actually serves content.
+      if (req.path.endsWith("/")) {
+        return next();
+      }
+      const sandboxId = String(req.params.sandboxId);
+      const port = parsePort(
+        Array.isArray(req.params.port) ? req.params.port[0] : req.params.port,
+      );
+      if (Number.isNaN(port)) {
+        res.status(400).json({ error: "port must be 1..65535" });
+        return;
+      }
+
+      const authorized = await authorizeSandboxAccess(req, res, sandboxId);
+      if (authorized === false) return; // 404/403 already sent
+
+      let alive = false;
+      try {
+        alive = await probePort(sandboxId, port);
+      } catch (err: unknown) {
+        logger.warn(
+          { sandboxId, port, err: err instanceof Error ? err.message : err },
+          "preview resolver: probePort threw",
+        );
+      }
+
+      const resolution: PreviewResolution = {
+        sandbox_id: sandboxId,
+        port,
+        preview_url: buildPreviewUrl(sandboxId, port),
+        internal_url: `http://localhost:${port}`,
+        alive,
+      };
+      res.json(resolution);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// ─── ALL /api/workspace/preview/:sandboxId/:port/* — proxy through VM ────
+// Mounted as middleware so it matches EVERY method (GET/POST/PUT/etc)
+// and every sub-path under `/preview/:sandboxId/:port/...`. The
+// in-VM path is derived from `req.url` (the portion of the URL after
+// the matched prefix). Query strings are forwarded.
+
+router.use(
+  "/preview/:sandboxId/:port",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const sandboxId = String(req.params.sandboxId);
+      const port = parsePort(
+        Array.isArray(req.params.port) ? req.params.port[0] : req.params.port,
+      );
+      if (Number.isNaN(port)) {
+        res.status(400).json({ error: "port must be 1..65535" });
+        return;
+      }
+
+      const authorized = await authorizeSandboxAccess(req, res, sandboxId);
+      if (authorized === false) return;
+
+      // `req.url` at a mounted middleware is the part of the path
+      // AFTER the matched mount point. For `/preview/sbx/5173/foo?b=1`
+      // the matched prefix is `/preview/sbx/5173` and req.url is
+      // `/foo?b=1`. Normalize empty → "/" so curl always hits root.
+      const remainder = (req.url || "/").replace(/^\/+/, "/");
+      const queryIdx = remainder.indexOf("?");
+      const inVmPath = queryIdx >= 0 ? remainder.slice(0, queryIdx) : remainder;
+      const queryString = queryIdx >= 0 ? remainder.slice(queryIdx + 1) : undefined;
+
+      const proxied = await proxyThroughVm(
+        sandboxId,
+        port,
+        inVmPath || "/",
+        queryString,
+      );
+
+      if (proxied.failed || proxied.status === 0) {
+        // Curl couldn't get a usable HTTP response — likely the dev
+        // server isn't bound yet, or the VM is unreachable.
+        res.status(502).json({
+          error: "Preview upstream unavailable",
+          sandbox_id: sandboxId,
+          port,
+          path: inVmPath,
+          detail: proxied.body.toString("utf-8").slice(0, 1024) || "no response",
+        });
+        return;
+      }
+
+      // Preserve the upstream status code & content-type (default to
+      // octet-stream when the upstream omitted it — mirrors curl).
+      res.status(proxied.status);
+      const contentType =
+        proxied.headers["content-type"] ?? "application/octet-stream";
+      res.setHeader("Content-Type", contentType);
+
+      // Forward a safe subset of headers. Skip hop-by-hop & security-
+      // sensitive headers (Set-Cookie, Transfer-Encoding, etc.) so we
+      // don't shadow the backend's own response semantics.
+      const FORWARDABLE = [
+        "cache-control",
+        "etag",
+        "last-modified",
+        "vary",
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+      ];
+      for (const key of FORWARDABLE) {
+        const val = proxied.headers[key];
+        if (val) res.setHeader(toHeaderCase(key), val);
+      }
+
+      res.send(proxied.body);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * Title-case a header key for the outbound response (e.g.
+ * "content-type" → "Content-Type"). Lowercase input is the canonical
+ * form we store in `proxied.headers`.
+ */
+function toHeaderCase(key: string): string {
+  return key
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join("-");
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LEGACY SANDBOX-ID PROXIES (authenticated) — kept for AI agent tooling
