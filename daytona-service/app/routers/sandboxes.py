@@ -53,10 +53,18 @@ async def create_sandbox(req: CreateSandboxRequest) -> SandboxResponse:
 @router.get(
     "",
     response_model=SandboxListResponse,
-    summary="List all sandboxes",
+    summary="List sandboxes (all states with ?all=true)",
 )
-async def list_sandboxes() -> SandboxListResponse:
+async def list_sandboxes(all: bool = False) -> SandboxListResponse:
+    """List sandboxes.
+
+    By default only default-state sandboxes are returned (SDK behaviour).
+    Pass ?all=true to include stopped/archived/error sandboxes — the ones
+    that still consume CPU quota and block creation on the free tier.
+    """
     try:
+        if all:
+            return await sandbox_service.list_all_sandboxes()
         return await sandbox_service.list_sandboxes()
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

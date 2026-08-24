@@ -101,15 +101,43 @@ async def get_sandbox(sandbox_id: str) -> SandboxResponse:
     return _to_response(extract_sandbox_data(sandbox))
 
 
-async def list_sandboxes() -> SandboxListResponse:
+async def list_sandboxes(states: list[str] | None = None) -> SandboxListResponse:
+    """List sandboxes.
+
+    By default the Daytona SDK's list() only returns sandboxes in the
+    default states (started etc.) — stopped/archived/error sandboxes are
+    INVISIBLE even though they still hold CPU quota against the org limit
+    ("Total CPU limit exceeded" on create). Callers that need the full
+    picture (cleanup jobs, quota debugging) pass the full state list.
+    """
     daytona = get_daytona()
     try:
-        sandboxes = await asyncio.to_thread(daytona.list)
+        if states:
+            from daytona import ListSandboxesQuery
+
+            query = ListSandboxesQuery(states=states)  # type: ignore[arg-type]
+            sandboxes = await asyncio.to_thread(lambda: list(daytona.list(query)))
+        else:
+            sandboxes = await asyncio.to_thread(lambda: list(daytona.list()))
     except Exception as exc:
         raise _wrap("list sandboxes", exc) from exc
 
     items = [_to_response(extract_sandbox_data(s)) for s in sandboxes]
     return SandboxListResponse(items=items, total=len(items))
+
+
+# State buckets that still consume quota or block cleanup.
+ALL_STATES = [
+    "creating", "restoring", "started", "starting", "stopping", "stopped",
+    "error", "build_failed", "pending_build", "building_snapshot",
+    "pulling_snapshot", "archived", "archiving", "snapshotting", "forking",
+    "pausing", "paused", "resuming", "resizing", "unknown",
+]
+
+
+async def list_all_sandboxes() -> SandboxListResponse:
+    """List sandboxes in EVERY state (used by cleanup + quota debugging)."""
+    return await list_sandboxes(ALL_STATES)
 
 
 # ---------------------------------------------------------------------------
