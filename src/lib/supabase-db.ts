@@ -149,6 +149,55 @@ export function getServiceSupabase(): SupabaseClient {
   return getSupabaseClient();
 }
 
+// ─── USER ROW SAFETY NET (FK CONSTRAINT GUARD) ────────────────────────────
+
+/**
+ * Ensure a row exists in public.users for the given (userId, email) pair.
+ *
+ * THE BUG THIS FIXES:
+ *   public.projects.user_id REFERENCES public.users(id) (migration 001).
+ *   When a brand-new Supabase Auth user signs in for the first time, their
+ *   UUID is present in auth.users but NOT yet in public.users (that row is
+ *   normally created lazily by GET /settings upsert-on-read). The very
+ *   first request the frontend makes after sign-in is POST /api/db/projects
+ *   from the Build modal, so the projects INSERT violates the
+ *   `projects_user_id_fkey` constraint with:
+ *       "insert or update on table \"projects\" violates foreign key
+ *        constraint \"projects_user_id_fkey\""
+ *
+ * THE FIX (defense in depth — the DB trigger in migration 004 is the other
+ * layer). The service-role client bypasses RLS so this upsert always works
+ * even if the auth.users → public.users trigger has not fired yet.
+ *
+ * Idempotent — uses onConflict: "id" so a row that already exists is left
+ * untouched (email is refreshed only when a non-empty email is supplied).
+ */
+export async function ensureUserRow(
+  userId: string,
+  email: string | null,
+): Promise<void> {
+  if (!userId) return;
+  const client = getSupabaseClient();
+  const patch: Record<string, unknown> = {};
+  if (email) patch.email = email;
+  try {
+    const { error } = await client
+      .from("users")
+      .upsert({ id: userId, ...patch }, { onConflict: "id" });
+    if (error) {
+      logger.warn(
+        { userId, err: error.message },
+        "ensureUserRow: upsert failed (continuing — trigger may still resolve)",
+      );
+    }
+  } catch (err: unknown) {
+    logger.warn(
+      { userId, err: err instanceof Error ? err.message : err },
+      "ensureUserRow: upsert threw (continuing)",
+    );
+  }
+}
+
 // ─── PROJECT OPERATIONS ──────────────────────────────────────────────────
 
 /**
@@ -160,6 +209,10 @@ export async function dbCreateProject(
   mode: string,
 ): Promise<DbProject> {
   const client = getSupabaseClient();
+
+  // FK safety net — guarantees public.users has a row for this userId before
+  // we insert into public.projects (which references it). See ensureUserRow.
+  await ensureUserRow(userId, null);
 
   // Derive a short name from the prompt (first 80 chars, trimmed)
   const name = prompt.length > 80 ? `${prompt.slice(0, 77)}...` : prompt;

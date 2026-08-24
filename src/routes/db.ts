@@ -10,6 +10,7 @@ import { logger } from "../lib/logger";
 import { requireAuth } from "../middleware/auth";
 import {
   getServiceSupabase,
+  ensureUserRow,
   isSupabaseConfigured,
   type DbProject,
   type DbUser,
@@ -127,6 +128,12 @@ router.post("/projects", async (req: Request, res: Response, next: NextFunction)
     const logoUrl = typeof body.logoUrl === "string" ? body.logoUrl : null;
     const sessionId = typeof body.sessionId === "string" && body.sessionId ? body.sessionId : null;
     const description = typeof body.description === "string" ? body.description : null;
+
+    // FK SAFETY NET — fixes "projects_user_id_fkey" violation for brand-new
+    // auth users who have never visited /settings (no public.users row yet).
+    // The service-role client bypasses RLS; onConflict id = idempotent.
+    // This runs BEFORE the projects INSERT so the constraint is satisfiable.
+    await ensureUserRow(req.userId ?? "", req.userEmail ?? null);
 
     const { data, error } = await supabase
       .from("projects")
