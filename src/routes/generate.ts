@@ -80,8 +80,15 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
   }
 
   function emit(event: string, data: object) {
+    if (res.writableEnded || res.destroyed) return; // client gone — keep generating
     const payload = JSON.stringify(data);
-    res.write(`event: ${event}\ndata: ${payload}\n\n`);
+    // Swallow write errors when the client has disconnected mid-stream so
+    // the rest of the pipeline (notably the VM file writes) still completes.
+    try {
+      res.write(`event: ${event}\ndata: ${payload}\n\n`);
+    } catch {
+      /* client disconnected — ignore */
+    }
   }
 
   (async () => {
@@ -351,7 +358,9 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
       const msg = err instanceof Error ? err.message : "Generation failed";
       emit("error", { message: msg });
     } finally {
-      res.end();
+      if (!res.writableEnded && !res.destroyed) {
+        try { res.end(); } catch { /* client already gone */ }
+      }
     }
   })();
 });
