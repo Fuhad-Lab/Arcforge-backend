@@ -15,7 +15,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.middleware.error_handler import register_error_handlers
-from app.routers import code_execution, files, health, sandboxes, workspace
+from app.routers import (
+    code_execution,
+    files,
+    health,
+    orchestrator,
+    sandboxes,
+    workspace,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -80,6 +87,7 @@ def create_app() -> FastAPI:
     application.include_router(code_execution.router, prefix=api_prefix)
     application.include_router(files.router, prefix=api_prefix)
     application.include_router(workspace.router, prefix=api_prefix)
+    application.include_router(orchestrator.router, prefix=api_prefix)
 
     return application
 
