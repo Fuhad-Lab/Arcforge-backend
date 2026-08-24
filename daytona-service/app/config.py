@@ -25,10 +25,10 @@ class Settings(BaseSettings):
 
     # --- Daytona ---
     daytona_api_key: str = ""
-    # Target region for sandbox creation. The org default ("eu") has been
-    # landing every sandbox in state=Error with no error_reason — "us" is
-    # the reliable default. Override with DAYTONA_TARGET env var.
-    daytona_target: str = "us"
+    # Optional target region override. The org only has access to 'eu' —
+    # forcing an unavailable region fails creation with 'Region <x> is not
+    # available to the organization'. Leave empty for the org default.
+    daytona_target: str = ""
     daytona_default_timeout: int = 300  # seconds for sandbox provisioning
     daytona_max_concurrent_sandboxes: int = 50
 

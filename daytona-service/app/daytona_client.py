@@ -97,7 +97,10 @@ def build_create_params(
     """
     resources_kwargs: dict[str, object] = {}
     if cpu is not None:
-        resources_kwargs["cpu"] = float(cpu)
+        # Daytona's API requires INTEGER cpu — a float (2.0) is rejected
+        # with "Input should be a valid integer".
+        cpu_val = float(cpu)
+        resources_kwargs["cpu"] = int(cpu_val) if cpu_val.is_integer() else cpu_val
     if memory is not None:
         # SDK accepts numeric (GB) or string — pass as float (GB)
         resources_kwargs["memory"] = float(memory)
