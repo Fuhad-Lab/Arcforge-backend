@@ -202,6 +202,20 @@ const SINGLE_MODE_API_URL =
 const SINGLE_MODE_API_KEY =
   process.env.SINGLE_MODE_API_KEY ?? process.env.NVIDIA_API_KEY;
 
+/**
+ * Single-mode ("Solo · GLM") LLM endpoint config, exported for the In-VM
+ * agent sidecar: the daytona-service hands it to the orchestrator daemon
+ * at sandbox creation so the multi-agent pipeline can call the LLM
+ * directly from INSIDE the VM (no host round-trip per phase).
+ */
+export function getSingleModeLlmConfig(): { url: string; key: string; model: string } {
+  return {
+    url: SINGLE_MODE_API_URL,
+    key: SINGLE_MODE_API_KEY ?? "",
+    model: SINGLE_MODE_MODEL,
+  };
+}
+
 const MAX_CODE_BYTES = 1_000_000;
 
 type PipelineResult = {

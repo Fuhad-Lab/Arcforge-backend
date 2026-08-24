@@ -7,6 +7,7 @@
  * this backend's local disk.
  */
 import { logger } from "../lib/logger";
+import { getSingleModeLlmConfig } from "./agent-platform";
 
 // Generous timeouts — the Render-hosted daytona-service may cold-start.
 const TIMEOUTS = {
@@ -123,6 +124,33 @@ export type DaytonaWorkspaceInitResult = {
   structure?: string[];
 };
 
+/** Connection info for the in-VM agent orchestrator sidecar, probed live
+ * from the daytona-service (which reads the token from inside the VM). */
+export type AgentSidecarInfo = {
+  installed: boolean;
+  port: number;
+  url: string | null;
+  token: string | null;
+  launcher: string | null;
+  alive: boolean;
+};
+
+/** LLM config handed to the in-VM orchestrator daemon at sandbox creation
+ * so the multi-agent pipeline runs entirely inside the VM. */
+export type AgentLlmConfig = { url: string; key: string; model: string };
+
+/**
+ * Resolve the sidecar LLM config from the platform's single-mode ("Solo")
+ * settings. Returns undefined when no key is configured — the sidecar then
+ * installs without an LLM endpoint and the platform keeps using host-side
+ * SSE for that project.
+ */
+function buildAgentLlmConfig(): AgentLlmConfig | undefined {
+  const cfg = getSingleModeLlmConfig();
+  if (!cfg.url || !cfg.key) return undefined;
+  return cfg;
+}
+
 /**
  * Create (and scaffold) a project workspace VM via the daytona-service.
  * The sandbox is labeled with {user_id, project_id, type:"workspace"} and
@@ -132,6 +160,7 @@ export async function initWorkspace(params: {
   project_id: string;
   user_id?: string;
   language?: string;
+  agent_llm?: AgentLlmConfig;
 }): Promise<DaytonaWorkspaceInitResult> {
   const result = await proxyToDaytona("/init", {
     method: "POST",
@@ -139,10 +168,27 @@ export async function initWorkspace(params: {
       project_id: params.project_id,
       user_id: params.user_id ?? null,
       language: normalizeLanguage(params.language),
+      ...(params.agent_llm ? { agent_llm: params.agent_llm } : {}),
     },
     timeoutMs: TIMEOUTS.init,
   });
   return result as DaytonaWorkspaceInitResult;
+}
+
+/** Probe the in-VM agent orchestrator ("Shadow Agent") in a sandbox.
+ *
+ * The daytona-service reads the per-VM shared-secret token from inside
+ * the VM, health-checks the daemon on port 9000, and opens the Daytona
+ * preview link the browser's WebSocket connects to. Returns
+ * installed=false while the async install is still in flight (or when the
+ * sidecar is unavailable and the platform uses host-side SSE instead).
+ */
+export async function getAgentInfo(sandboxId: string): Promise<AgentSidecarInfo> {
+  const result = await proxyToDaytona(
+    `/${encodeURIComponent(sandboxId)}/agent-info`,
+    { timeoutMs: 30_000 },
+  );
+  return result as AgentSidecarInfo;
 }
 
 /** Destroy a workspace sandbox. */
@@ -311,10 +357,13 @@ export async function ensureProjectSandbox(
   }
 
   // 2. Provision a fresh, scaffolded sandbox labeled with user + project ids.
+  //    The In-VM agent sidecar receives the single-mode LLM config so its
+  //    pipeline runs autonomously inside the VM (In-VM Sidecar pattern).
   const init = await initWorkspace({
     project_id: row.id,
     user_id: row.user_id,
     language: options.language,
+    agent_llm: buildAgentLlmConfig(),
   });
   const sandboxId = init.sandbox_id;
 

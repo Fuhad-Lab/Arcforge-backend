@@ -228,6 +228,19 @@ class BulkActionResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class AgentLlmConfig(BaseModel):
+    """LLM endpoint config handed to the in-VM orchestrator daemon.
+
+    Mirrors the platform's single-mode ("Solo · GLM") settings from the
+    Node backend — the daemon calls the OpenAI-compatible endpoint
+    directly from inside the VM, so the pipeline no longer round-trips
+    through the host for every phase.
+    """
+    url: str = Field(default="", description="OpenAI-compatible chat-completions URL")
+    key: str = Field(default="", description="API key (Bearer)")
+    model: str = Field(default="glm-5.2", description="Model id")
+
+
 class CreateWorkspaceRequest(BaseModel):
     """Create a new project workspace with the mandatory directory blueprint."""
     project_id: str = Field(min_length=1, max_length=128, description="Project UUID")
@@ -237,6 +250,14 @@ class CreateWorkspaceRequest(BaseModel):
         description="Owner user UUID — every sandbox must carry BOTH user_id and project_id labels",
     )
     language: str = Field(default="nodejs", description="Sandbox language runtime")
+    agent_llm: AgentLlmConfig | None = Field(
+        default=None,
+        description=(
+            "Optional LLM config for the in-VM agent orchestrator sidecar. "
+            "When omitted the sidecar is installed WITHOUT an LLM endpoint "
+            "(daemon runs, pipeline degrades to host-side SSE)."
+        ),
+    )
 
 
 class AgentCodeWriteRequest(BaseModel):
@@ -296,6 +317,30 @@ class WorkspaceInitResponse(BaseModel):
         default_factory=lambda: ["git/", "frontend/", "backend/", "logo.png"],
         description="Mandatory workspace directories",
     )
+
+
+class AgentSidecarInfo(BaseModel):
+    """Connection info for the in-VM agent orchestrator ("Shadow Agent").
+
+    The browser connects its WebSocket straight to `url` (a Daytona preview
+    link for the daemon's port) authenticating with `token`. The token is
+    generated per-VM at creation and lives only inside the VM — this
+    response is the sole broker path, always behind JWT + ownership checks.
+    Served by GET /api/v1/workspace/{id}/agent-info (probes the live VM).
+    """
+    installed: bool = False
+    port: int = 9000
+    url: str | None = None
+    token: str | None = None
+    launcher: str | None = Field(
+        default=None, description="'pm2' or 'watchdog' (fallback supervisor)",
+    )
+    alive: bool = Field(
+        default=False, description="True when the daemon answers /health",
+    )
+
+
+WorkspaceInitResponse.model_rebuild()
 
 
 # ---------------------------------------------------------------------------

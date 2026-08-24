@@ -19,6 +19,7 @@ import { getServiceSupabase, isSupabaseConfigured } from "../lib/supabase-db";
 import {
   destroyWorkspace,
   ensureProjectSandbox,
+  getAgentInfo,
   getWorkspaceFileTree,
   isSandboxAlive,
   parseDataUrl,
@@ -151,6 +152,57 @@ async function authorizeSandboxAccess(
   if (!isOwnedBy(res, row, req.userId)) return false;
   return row;
 }
+
+// ─── GET /api/workspace/agent-info/:projectId ────────────────────────────
+// Broker connection info for the project's In-VM agent orchestrator (the
+// "Shadow Agent" sidecar). The studio frontend calls this (via the vm-ops
+// edge function) when the studio mounts: on success it opens a WebSocket
+// straight to the daemon inside the VM (the "dumb terminal" model) and the
+// multi-agent pipeline runs entirely inside the VM. When the sidecar is
+// missing/not-yet-installed, the frontend transparently falls back to the
+// host-side SSE pipeline.
+
+router.get("/agent-info/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const projectId = String(req.params.projectId || "");
+    if (!projectId) {
+      res.status(400).json({ error: "projectId is required" });
+      return;
+    }
+
+    const row = await getProjectRow(projectId);
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    // No sandbox provisioned yet — nothing to probe.
+    if (!row?.sandbox_id) {
+      res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false });
+      return;
+    }
+
+    // Sandbox dead → sidecar unreachable; report not-installed so the
+    // frontend uses SSE (and the normal init flow can re-provision).
+    let alive = false;
+    try {
+      alive = await isSandboxAlive(row.sandbox_id);
+    } catch {
+      alive = false;
+    }
+    if (!alive) {
+      res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false });
+      return;
+    }
+
+    const info = await getAgentInfo(row.sandbox_id);
+    res.json(info);
+  } catch (error) {
+    // Degradation contract: never 500 here — the frontend falls back to SSE.
+    logger.warn(
+      { projectId: req.params.projectId, err: error instanceof Error ? error.message : error },
+      "agent-info probe failed — frontend will use host-side SSE",
+    );
+    res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false });
+  }
+});
 
 // ─── POST /api/workspace/init — project-scoped workspace bootstrap ─────────
 // Create (or reuse) the project's Daytona VM with the scaffold

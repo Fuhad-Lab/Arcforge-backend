@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, status
 from app.models import (
     AgentBulkWriteRequest,
     AgentCodeWriteRequest,
+    AgentSidecarInfo,
     BrowserAuditRequest,
     BrowserAuditResult,
     BrowserInstallResult,
@@ -57,6 +58,11 @@ async def create_workspace(req: CreateWorkspaceRequest) -> WorkspaceInitResponse
             project_id=req.project_id,
             language=req.language,
             user_id=req.user_id,
+            agent_llm=(
+                {"url": req.agent_llm.url, "key": req.agent_llm.key,
+                 "model": req.agent_llm.model}
+                if req.agent_llm else None
+            ),
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -83,6 +89,47 @@ async def destroy_workspace(sandbox_id: str) -> None:
         await workspace_manager.destroy_workspace(sandbox_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# ======================================================================
+# In-VM Agent Orchestrator ("Shadow Agent" sidecar)
+# ======================================================================
+
+
+@router.get(
+    "/{sandbox_id}/agent-info",
+    response_model=AgentSidecarInfo,
+    summary="Broker connection info for the in-VM agent orchestrator daemon",
+    responses={
+        200: {"description": "Sidecar probe result (installed=false while the async install is in flight)"},
+        404: {"description": "Sandbox not found"},
+    },
+)
+async def get_agent_info(sandbox_id: str) -> AgentSidecarInfo:
+    """Probe the live VM for the agent orchestrator sidecar.
+
+    Reads the per-VM shared-secret token from inside the sandbox, checks
+    the daemon's /health endpoint, and opens the Daytona preview link for
+    port 9000. This is the ONLY path by which the daemon's token reaches
+    the outside world — the Node backend calls it behind JWT + project
+    ownership checks and relays it to the studio frontend.
+    """
+    from app.services.agent_installer import agent_installer
+
+    try:
+        sandbox = await workspace_manager._resolve_sandbox(sandbox_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Sandbox not found: {exc}") from exc
+
+    info = await agent_installer.get_agent_info(sandbox)
+    return AgentSidecarInfo(
+        installed=info.get("installed", False),
+        port=info.get("port", 9000),
+        url=info.get("url"),
+        token=info.get("token"),
+        launcher=info.get("launcher"),
+        alive=info.get("alive", False),
+    )
 
 
 # ======================================================================

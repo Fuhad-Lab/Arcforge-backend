@@ -73,6 +73,7 @@ class DaytonaWorkspaceManager:
         project_id: str,
         language: str = "python",
         user_id: str | None = None,
+        agent_llm: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Spawn a Daytona MicroVM and enforce the strict directory blueprint.
 
@@ -154,6 +155,50 @@ class DaytonaWorkspaceManager:
                 "Failed to install guest agent in sandbox %s: %s "
                 "(continuing without agent — stream-write will fall back "
                 "to upload_file)",
+                sandbox.id, exc,
+            )
+
+        # --- Install the in-VM agent ORCHESTRATOR sidecar (fire-and-forget) ---
+        # The "Shadow Agent": FastAPI daemon on :9000 with SQLite state,
+        # PM2-supervised, reachable by the browser through a Daytona preview
+        # link. When installed, the studio frontend becomes a dumb terminal
+        # (WebSocket) and the multi-agent pipeline runs INSIDE this VM.
+        #
+        # The install involves pip + npm installs inside the VM (~60-120s on
+        # a cold box) — it MUST NOT block workspace creation (the frontend
+        # races init against 8s and the SSE fallback keeps working). It runs
+        # as a detached asyncio task; `GET /{id}/agent-info` probes the live
+        # VM and reports installed=true the moment the daemon answers.
+        try:
+            from app.services.agent_installer import agent_installer
+
+            install_task = asyncio.create_task(
+                agent_installer.install(sandbox, llm_config=agent_llm),
+            )
+
+            def _log_sidecar(fut: "asyncio.Future[dict[str, Any]]") -> None:
+                try:
+                    res = fut.result()
+                    if res.get("installed"):
+                        logger.info(
+                            "Agent sidecar READY in sandbox %s (launcher=%s)",
+                            sandbox.id, res.get("launcher"),
+                        )
+                    else:
+                        logger.info(
+                            "Agent sidecar not installed in sandbox %s — "
+                            "platform will use host-side SSE", sandbox.id,
+                        )
+                except Exception as exc:  # pragma: no cover — task guard
+                    logger.warning(
+                        "Agent sidecar install task errored for %s: %s",
+                        sandbox.id, exc,
+                    )
+
+            install_task.add_done_callback(_log_sidecar)
+        except Exception as exc:
+            logger.warning(
+                "Could not schedule agent sidecar install for sandbox %s: %s",
                 sandbox.id, exc,
             )
 
