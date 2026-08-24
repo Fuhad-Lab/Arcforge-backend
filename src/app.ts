@@ -34,8 +34,11 @@ app.use(
   }),
 );
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// 10 MB limit: project creation carries the app logo as a base64 data URL,
+// and workspace file writes can carry multi-file code payloads. The Express
+// default (100 KB) rejected those with 413 "request entity too large".
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/")) {

@@ -396,8 +396,11 @@ export function skillsForPhase(
   const departments = PHASE_DEPARTMENTS[phase];
   return allSkills.filter((skill) => {
     if (!departments.includes(skill.department)) return false;
-    if (skill.requiresConnection && activeConnections) {
-      return activeConnections.has(skill.requiresConnection);
+    // Connection-gated skills (linear, figma, github, …) are only active
+    // when that connection is actually enabled on the project. Previously
+    // a missing activeConnections set let them slip through.
+    if (skill.requiresConnection) {
+      return activeConnections?.has(skill.requiresConnection) === true;
     }
     return true;
   });
