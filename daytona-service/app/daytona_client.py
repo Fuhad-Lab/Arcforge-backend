@@ -96,16 +96,19 @@ def build_create_params(
     Resources(cpu=float, memory=float, disk=float, gpu, gpu_type)
     """
     resources_kwargs: dict[str, object] = {}
+    # Daytona's API requires INTEGER cpu/memory (and float-tolerant disk)
+    # — floats are rejected with "Input should be a valid integer".
+    def _as_int_or_float(v: float) -> float | int:
+        fv = float(v)
+        return int(fv) if fv.is_integer() else fv
+
     if cpu is not None:
-        # Daytona's API requires INTEGER cpu — a float (2.0) is rejected
-        # with "Input should be a valid integer".
-        cpu_val = float(cpu)
-        resources_kwargs["cpu"] = int(cpu_val) if cpu_val.is_integer() else cpu_val
+        resources_kwargs["cpu"] = _as_int_or_float(cpu)
     if memory is not None:
-        # SDK accepts numeric (GB) or string — pass as float (GB)
-        resources_kwargs["memory"] = float(memory)
+        # SDK accepts numeric (GB) or string — pass int when whole
+        resources_kwargs["memory"] = _as_int_or_float(memory)
     if disk is not None:
-        resources_kwargs["disk"] = float(disk)
+        resources_kwargs["disk"] = _as_int_or_float(disk)
 
     resources: SdkResources | None = (
         SdkResources(**resources_kwargs) if resources_kwargs else None
