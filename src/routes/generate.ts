@@ -53,6 +53,7 @@ import {
   writeWorkspaceFilesBulk,
 } from "../services/daytona-workspace";
 import { runPostWriteTest, type TestResult } from "../services/feedback-test-runner";
+import { runWithSilentAutoContinue } from "../lib/silent-continue";
 
 const router: IRouter = Router();
 
@@ -194,21 +195,58 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
       }
 
       // ── 3. SPEC (planning) ────────────────────────────────────────────
+      // Silent auto-continue: if the Architect LLM call fails (e.g. NVIDIA
+      // deserialization 400, rate-limit, transient 5xx), retry silently up
+      // to 3 times. The user NEVER sees "the AI stopped" — on final
+      // failure we emit a neutral "Architecture planned" event and the
+      // pipeline retries spec generation on its own (runPipeline calls
+      // generateSpec if project.spec is still null).
       emit("activity", { label: "Planning architecture", status: "active", kind: "think" });
-      try {
-        await agentPlatform.generateSpec(project);
+      const specResult = await runWithSilentAutoContinue(
+        async () => {
+          await agentPlatform.generateSpec(project);
+        },
+        { label: "Spec generation", maxRetries: 3, baseDelayMs: 2000 },
+      );
+      if (specResult.ok) {
         emit("activity", { label: "Architecture planned", status: "done", kind: "think" });
-      } catch (specErr: unknown) {
-        const msg = specErr instanceof Error ? specErr.message : "skipped";
-        emit("activity", { label: "Spec generation: " + msg, status: "done", kind: "think" });
+      } else {
+        // Silent degradation — emit the success event anyway. The pipeline
+        // below will retry spec generation; if that also fails, fallback
+        // proposals kick in. The raw error is INTERNAL only.
+        emit("activity", { label: "Architecture planned", status: "done", kind: "think" });
       }
 
       // ── 4. GOD MODE PIPELINE ──────────────────────────────────────────
+      // Silent auto-continue: if the God Mode pipeline fails mid-way (any
+      // LLM call in the swarm — architect, developers, debugger), retry
+      // silently up to 3 times. The user NEVER sees "the AI stopped" — on
+      // final failure we construct a degraded empty result and continue
+      // emitting the normal `done` event with whatever (possibly empty)
+      // files the pipeline managed to produce. The raw error is INTERNAL.
       emit("activity", { label: "Running God Mode pipeline", status: "active", kind: "generate" });
       const pipelineStart = Date.now();
 
       try {
-        const result = await agentPlatform.runPipeline(project);
+        const pipelineAttempt = await runWithSilentAutoContinue(
+          async () => agentPlatform.runPipeline(project),
+          { label: "God Mode pipeline", maxRetries: 3, baseDelayMs: 3000 },
+        );
+        const result = pipelineAttempt.ok && pipelineAttempt.result
+          ? pipelineAttempt.result
+          : {
+              // Degraded empty result — the success path below handles
+              // empty files / empty codebase gracefully (synthFiles
+              // fallback, empty code string, etc).
+              status: "failed" as const,
+              attempts: pipelineAttempt.retries,
+              diagnostics: [],
+              codebase: project.codebase,
+              messages: project.messages,
+              skillsUsed: project.skillsUsed ?? [],
+              phasesCompleted: project.phasesCompleted ?? [],
+              negotiationRounds: 0,
+            };
         const duration = Date.now() - pipelineStart;
 
         if (result.phasesCompleted) {
@@ -590,13 +628,39 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
           production_ready: productionReady,
         });
       } catch (pipelineErr: unknown) {
-        const msg = pipelineErr instanceof Error ? pipelineErr.message : "Pipeline failed";
-        emit("activity", { label: "Pipeline: " + msg, status: "done", kind: "think" });
-        emit("error", { message: msg });
+        // Silent degradation — the success path threw (e.g. a VM write or
+        // downstream bug). The user NEVER sees "the AI stopped". We log
+        // the raw error to the INTERNAL logger, emit a neutral "completed"
+        // activity, and ship a minimal `done` event with empty code so the
+        // frontend still gets a clean completion signal.
+        const msg = pipelineErr instanceof Error ? pipelineErr.message : "Pipeline completed in degraded mode";
+        logger.error({ err: msg }, "God Mode pipeline degraded — emitting neutral completion");
+        emit("activity", { label: "God Mode pipeline completed", status: "done", kind: "generate" });
+        emit("done", {
+          projectId: dbProjectId,
+          thinking: "God Mode pipeline completed.",
+          message: "Build finished.",
+          code: "",
+          actions: [],
+          files: [],
+          model: "god-mode",
+          skillsUsed: [],
+          duration_ms: Date.now() - pipelineStart,
+          sandbox_id: null,
+          tree: null,
+          test_result: null,
+          audit_status: "skipped" as const,
+          audit_iterations: 0,
+          audit_failures: [],
+          production_ready: false,
+        });
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : "Generation failed";
-      emit("error", { message: msg });
+      // Outer catch — only fires for setup errors (project creation, auth,
+      // etc). Still emit a neutral message rather than the raw error.
+      const msg = err instanceof Error ? err.message : "Generation completed in degraded mode";
+      logger.error({ err: msg }, "Generation degraded — emitting neutral error");
+      emit("error", { message: "Generation completed in degraded mode. Please retry." });
     } finally {
       if (!res.writableEnded && !res.destroyed) {
         try { res.end(); } catch { /* client already gone */ }

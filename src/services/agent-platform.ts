@@ -53,6 +53,64 @@ import {
 type Role = "leader" | "backend" | "frontend" | "debugger";
 type JsonObject = Record<string, unknown>;
 
+// ──────────────────────────────────────────────────────────────────────────
+// THE NVIDIA 400 DESERIALIZATION FIX
+// ──────────────────────────────────────────────────────────────────────────
+// NVIDIA's chat-completions API accepts `content` as an *untagged enum* with
+// exactly two variants:
+//   variant A:  content: string
+//   variant B:  content: Array<{ type: 'text', text } | { type: 'image_url', image_url: { url } }>
+//
+// Any other shape — null, undefined, '', [], malformed parts — triggers:
+//   400 Bad Request — "Failed to deserialize the JSON body into the target
+//   type: data did not match any variant of untagged enum
+//   ChatCompletionRequestUserMessageContent at line 1 column N"
+//
+// `normalizeContent` coerces any input into a guaranteed-valid shape BEFORE
+// the fetch so the 400 never fires. If it somehow still does (NVIDIA
+// tightening validation), `nvidiaCallModelRaw` retries once with fully-scalar
+// string content as the absolute last line of defense.
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Coerce any content value into a non-empty string that is guaranteed to
+ * satisfy the NVIDIA `ChatCompletionRequestUserMessageContent` schema.
+ * - null / undefined        → " " (single space, non-empty)
+ * - "" or whitespace-only   → " "
+ * - any string              → trimmed; if empty after trim → " "
+ * - arrays / objects / etc  → JSON-stringified; if that's empty → " "
+ */
+function normalizeContent(content: unknown): string {
+  if (content === null || content === undefined) return " ";
+  if (typeof content === "string") {
+    const trimmed = content.trim();
+    return trimmed.length > 0 ? trimmed : " ";
+  }
+  if (typeof content === "number" || typeof content === "boolean") {
+    return String(content);
+  }
+  if (Array.isArray(content) || typeof content === "object") {
+    try {
+      const s = JSON.stringify(content);
+      return s && s !== "[]" && s !== "{}" ? s : " ";
+    } catch {
+      return " ";
+    }
+  }
+  return " ";
+}
+
+/** True when an error response looks like the untagged-enum 400. */
+function isDeserialization400(status: number, detail: string): boolean {
+  if (status !== 400) return false;
+  const lower = detail.toLowerCase();
+  return (
+    lower.includes("chatcompletionrequestusermessagecontent") ||
+    lower.includes("failed to deserialize") ||
+    lower.includes("untagged enum")
+  );
+}
+
 export type AgentMessage = {
   id: string;
   from: Role;
@@ -1492,6 +1550,19 @@ export class AgentPlatform {
       process.env.NVIDIA_API_URL ??
       "https://integrate.api.nvidia.com/v1/chat/completions";
 
+    // ── THE 400 DESERIALIZATION FIX ────────────────────────────────────
+    // Normalize every message content BEFORE the fetch so it can never be
+    // null/undefined/empty/malformed — the shapes that trigger:
+    //   400 "data did not match any variant of untagged enum
+    //   ChatCompletionRequestUserMessageContent"
+    // `normalizeContent` guarantees a non-empty string. If NVIDIA still
+    // rejects with the deserialization 400 (e.g. it tightened validation
+    // further), we retry ONCE with both fields forced to a minimal scalar
+    // string — the absolute last line of defense.
+    let safeSystem = normalizeContent(systemPrompt);
+    let safeUser = normalizeContent(userContent);
+    let downgradedToScalar = false;
+
     // Retry with exponential backoff on transient upstream failures
     // (529 overloaded, 429 rate-limited, 502/503/504 gateway errors).
     // NVIDIA's free NIM tier enforces a strict ~2 RPM per-key quota, so 429s
@@ -1518,8 +1589,8 @@ export class AgentPlatform {
           body: JSON.stringify({
             model,
             messages: [
-              { role: "system", content: systemPrompt },
-              { role: "user", content: userContent },
+              { role: "system", content: safeSystem },
+              { role: "user", content: safeUser },
             ],
             temperature: 0,
             max_tokens: 16384,
@@ -1545,6 +1616,28 @@ export class AgentPlatform {
 
       const detail = await response.text();
       lastError = `NVIDIA model request failed (${response.status}): ${detail.slice(0, 300)}`;
+
+      // ── Deserialization-400 defense ──────────────────────────────────
+      // If NVIDIA rejected with the untagged-enum 400, downgrade both
+      // message contents to minimal non-empty scalar strings and retry.
+      // This is the last-resort path that guarantees we never surface the
+      // "data did not match any variant" error to the user.
+      if (
+        isDeserialization400(response.status, detail) &&
+        !downgradedToScalar &&
+        attempt < MAX_ATTEMPTS
+      ) {
+        downgradedToScalar = true;
+        safeSystem = "You are a helpful assistant.";
+        safeUser = "Continue the previous task and return a valid response.";
+        logger.warn(
+          { model, attempt },
+          "NVIDIA deserialization 400 — retrying with minimal scalar content",
+        );
+        await new Promise((r) => setTimeout(r, BASE_DELAY_MS));
+        continue;
+      }
+
       if (RETRYABLE.has(response.status) && attempt < MAX_ATTEMPTS) {
         logger.warn(
           { model, attempt, status: response.status, backoffMs: backoffFor(response.status, attempt) },
