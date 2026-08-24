@@ -104,11 +104,13 @@ async def get_sandbox(sandbox_id: str) -> SandboxResponse:
 async def list_sandboxes(states: list[str] | None = None) -> SandboxListResponse:
     """List sandboxes.
 
-    By default the Daytona SDK's list() only returns sandboxes in the
-    default states (started etc.) — stopped/archived/error sandboxes are
-    INVISIBLE even though they still hold CPU quota against the org limit
-    ("Total CPU limit exceeded" on create). Callers that need the full
-    picture (cleanup jobs, quota debugging) pass the full state list.
+    NOTE: the Daytona API's state filter is case-sensitive and uses the
+    serialized form ("Error", "Started", ...) which does NOT match the
+    SDK enum values ("error", "started", ...) — filtering by state
+    silently returns ZERO results. The unfiltered list() already returns
+    every state that matters for quota/cleanup (verified live: 10
+    Error-state sandboxes appeared in the plain listing), so state
+    filtering is only used when explicitly requested and verified.
     """
     daytona = get_daytona()
     try:
@@ -126,18 +128,14 @@ async def list_sandboxes(states: list[str] | None = None) -> SandboxListResponse
     return SandboxListResponse(items=items, total=len(items))
 
 
-# State buckets that still consume quota or block cleanup.
-ALL_STATES = [
-    "creating", "restoring", "started", "starting", "stopping", "stopped",
-    "error", "build_failed", "pending_build", "building_snapshot",
-    "pulling_snapshot", "archived", "archiving", "snapshotting", "forking",
-    "pausing", "paused", "resuming", "resizing", "unknown",
-]
-
-
 async def list_all_sandboxes() -> SandboxListResponse:
-    """List sandboxes in EVERY state (used by cleanup + quota debugging)."""
-    return await list_sandboxes(ALL_STATES)
+    """List sandboxes in every quota-relevant state.
+
+    Uses the unfiltered list() — Daytona's plain listing already includes
+    Error/Stopped sandboxes (the CPU-quota holders); only fully destroyed
+    sandboxes are excluded, and those consume nothing.
+    """
+    return await list_sandboxes()
 
 
 # ---------------------------------------------------------------------------

@@ -46,15 +46,18 @@ _lock = Lock()
 
 
 def get_daytona() -> Daytona:
-    """Return the singleton ``Daytona`` client, creating it if necessary."""
+    """Return the singleton ``Daytona`` client, creating it if required."""
     global _client
     if _client is None:
         with _lock:
             if _client is None:  # double-checked
                 logger.info("Initialising Daytona SDK client …")
-                config = DaytonaConfig(api_key=settings.daytona_api_key)
+                config = DaytonaConfig(**settings.daytona_config_dict)
                 _client = Daytona(config)
-                logger.info("Daytona SDK client ready.")
+                logger.info(
+                    "Daytona SDK client ready (target=%s).",
+                    settings.daytona_target or "org-default",
+                )
     return _client
 
 

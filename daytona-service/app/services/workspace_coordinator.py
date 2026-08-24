@@ -135,6 +135,24 @@ class DaytonaWorkspaceManager:
             timeout=settings.daytona_default_timeout,
         )
 
+        # Post-create health gate: a sandbox can land in state=Error with
+        # NO error_reason (observed live in the 'eu' target — every sandbox
+        # failed to boot). Delete the corpse immediately so it doesn't leak
+        # CPU quota, and raise so the caller knows provisioning failed.
+        state_str = str(getattr(sandbox, "state", "") or "")
+        if "error" in state_str.lower():
+            try:
+                await asyncio.to_thread(
+                    daytona.delete, sandbox, 30, False,
+                )
+            except Exception:  # pragma: no cover — cleanup is best-effort
+                pass
+            raise RuntimeError(
+                f"Newly created sandbox {sandbox.id} landed in state={state_str} "
+                f"(target={getattr(sandbox, 'target', '?')}) — deleted to protect "
+                "CPU quota. Check the DAYTONA_TARGET region."
+            )
+
         elapsed = int((time.monotonic() - t0) * 1000)
         logger.info(
             "Sandbox %s created in %d ms for project %s",

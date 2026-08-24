@@ -356,6 +356,28 @@ export async function ensureProjectSandbox(
     };
   }
 
+  // 1b. QUOTA SELF-HEALING: a dead (error/archived) sandbox still holds CPU
+  //     quota on Daytona's free tier. Delete it before provisioning the
+  //     replacement — otherwise every failed VM permanently leaks quota
+  //     until the org hits "Total CPU limit exceeded" (exactly what
+  //     happened live: 10 stale Error sandboxes ate the entire 10-CPU
+  //     budget and blocked ALL workspace creation).
+  if (row.sandbox_id) {
+    try {
+      await destroyWorkspace(row.sandbox_id);
+      logger.info(
+        { projectId: row.id, deadSandboxId: row.sandbox_id },
+        "Deleted dead sandbox to free CPU quota before re-provisioning",
+      );
+    } catch (err: unknown) {
+      // Best-effort — a 404 (already gone) is fine.
+      logger.debug(
+        { projectId: row.id, err: err instanceof Error ? err.message : err },
+        "Dead-sandbox cleanup failed (continuing)",
+      );
+    }
+  }
+
   // 2. Provision a fresh, scaffolded sandbox labeled with user + project ids.
   //    The In-VM agent sidecar receives the single-mode LLM config so its
   //    pipeline runs autonomously inside the VM (In-VM Sidecar pattern).

@@ -25,6 +25,10 @@ class Settings(BaseSettings):
 
     # --- Daytona ---
     daytona_api_key: str = ""
+    # Target region for sandbox creation. The org default ("eu") has been
+    # landing every sandbox in state=Error with no error_reason — "us" is
+    # the reliable default. Override with DAYTONA_TARGET env var.
+    daytona_target: str = "us"
     daytona_default_timeout: int = 300  # seconds for sandbox provisioning
     daytona_max_concurrent_sandboxes: int = 50
 
@@ -43,9 +47,12 @@ class Settings(BaseSettings):
 
     @property
     def daytona_config_dict(self) -> dict:
-        return {
+        cfg = {
             "api_key": self.daytona_api_key,
         }
+        if self.daytona_target:
+            cfg["target"] = self.daytona_target
+        return cfg
 
 
 settings = Settings()
