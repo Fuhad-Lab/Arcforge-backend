@@ -1417,12 +1417,19 @@ export class AgentPlatform {
 
     // Retry with exponential backoff on transient upstream failures
     // (529 overloaded, 429 rate-limited, 502/503/504 gateway errors).
+    // NVIDIA's free NIM tier enforces a strict ~2 RPM per-key quota, so 429s
+    // need a much longer spacing (≈30s) than other transient errors (4s) —
+    // otherwise the multi-call swarm pipeline never completes.
     const RETRYABLE = new Set([429, 502, 503, 504, 529]);
-    const MAX_ATTEMPTS = 4;
+    const MAX_ATTEMPTS = 5;
     const BASE_DELAY_MS = 4000;
+    const RATE_LIMIT_DELAY_MS = 30000;
+
+    const backoffFor = (status: number, attempt: number) =>
+      status === 429 ? RATE_LIMIT_DELAY_MS * attempt : BASE_DELAY_MS * attempt;
 
     let lastError = "";
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       let response: Response;
       try {
         response = await fetch(url, {
@@ -1463,10 +1470,10 @@ export class AgentPlatform {
       lastError = `NVIDIA model request failed (${response.status}): ${detail.slice(0, 300)}`;
       if (RETRYABLE.has(response.status) && attempt < MAX_ATTEMPTS) {
         logger.warn(
-          { model, attempt, status: response.status },
+          { model, attempt, status: response.status, backoffMs: backoffFor(response.status, attempt) },
           "NVIDIA transient failure — retrying with backoff",
         );
-        await new Promise((r) => setTimeout(r, BASE_DELAY_MS * attempt));
+        await new Promise((r) => setTimeout(r, backoffFor(response.status, attempt)));
         continue;
       }
       logger.error({ model, status: response.status }, "NVIDIA model request failed");
