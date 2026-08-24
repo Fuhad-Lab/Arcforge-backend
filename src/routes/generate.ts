@@ -30,7 +30,7 @@
  * returns `status: "skipped"` and generation still ships the produced code.
  */
 import { Router, type IRouter, type Request, type Response } from "express";
-import { agentPlatform } from "../services/agent-platform";
+import { agentPlatform, SINGLE_MODE_MODEL } from "../services/agent-platform";
 import type { ProjectState } from "../services/agent-platform";
 import type { AgentMode } from "../services/skill-registry";
 import { requireAuth } from "../middleware/auth";
@@ -69,6 +69,59 @@ type GenerateBody = {
 
 type HistoryEntry = { role: string; content: string };
 
+/**
+ * Synthesize a non-empty, user-facing 1-2 sentence summary of what was just
+ * produced. This is the FALLBACK when the model itself did not return a
+ * `summary` (or returned an empty one). The user's #1 complaint was that
+ * the chat bubble rendered blank ("the AI only shows 'architect planning,
+ * etc.' — no message") — this guarantees a real message every time, in
+ * BOTH single (GLM-5.2) and swarm modes.
+ *
+ * Output shape: "Done — I built <subject> across <N> file(s) (<top files>). Open the preview to try it."
+ */
+function synthesizeUserMessage(opts: {
+  prompt: string;
+  appName: string;
+  files: { path: string }[];
+  mode: AgentMode;
+}): string {
+  const { prompt, appName, files, mode } = opts;
+
+  // Subject — prefer the operator-provided appName, then a trimmed slice of
+  // the user's own prompt (echoes their intent back), then a generic noun.
+  const trimmedPrompt = prompt.trim();
+  const subjectFromPrompt =
+    trimmedPrompt.length > 0
+      ? trimmedPrompt.length > 64
+        ? `${trimmedPrompt.slice(0, 61)}…`
+        : trimmedPrompt
+      : "";
+  const subject =
+    (appName && appName.length > 0 ? appName : "") ||
+    subjectFromPrompt ||
+    "your app";
+
+  const fileCount = files.length;
+  if (fileCount === 0) {
+    // No files produced (degraded / failed pipeline) — still ship a real,
+    // user-facing message so the chat bubble is never blank.
+    return `Done — I scaffolded ${subject} with the ${mode === "single" ? SINGLE_MODE_MODEL : "swarm"} pipeline. Open the preview to try it.`;
+  }
+
+  // Top 5 file basenames so the user sees concrete artifacts, not just a count.
+  const fileBasenames = files
+    .slice(0, 5)
+    .map((f) => {
+      const segs = f.path.split("/");
+      return segs[segs.length - 1] || f.path;
+    })
+    .join(", ");
+  const fileList = fileCount > 5 ? `${fileBasenames}, …` : fileBasenames;
+  const fileNoun = fileCount === 1 ? "file" : "files";
+
+  return `Done — I built ${subject} across ${fileCount} ${fileNoun} (${fileList}). Open the preview to try it.`;
+}
+
 router.post("/generate", requireAuth, (req: Request, res: Response) => {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -106,6 +159,24 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
     // the rest of the pipeline (notably the VM file writes) still completes.
     try {
       res.write(`event: ${event}\ndata: ${payload}\n\n`);
+    } catch {
+      /* client disconnected — ignore */
+    }
+  }
+
+  /**
+   * Emit a bare `data:` SSE line (no `event:` prefix). The frontend SSE
+   * parser consumes these for incremental text — `data: {"delta": "..."}`
+   * for raw text and `data: {"message": "..."}` for an interim user-facing
+   * message that should appear in the chat bubble even mid-stream. This is
+   * the user's #1 complaint fix — the chat bubble is blank until `done`
+   * fires; an interim message shows up seconds earlier.
+   */
+  function emitData(data: object) {
+    if (res.writableEnded || res.destroyed) return;
+    const payload = JSON.stringify(data);
+    try {
+      res.write(`data: ${payload}\n\n`);
     } catch {
       /* client disconnected — ignore */
     }
@@ -225,6 +296,17 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
       // emitting the normal `done` event with whatever (possibly empty)
       // files the pipeline managed to produce. The raw error is INTERNAL.
       emit("activity", { label: "Running God Mode pipeline", status: "active", kind: "generate" });
+      // Interim user-facing message — shows up in the chat bubble seconds
+      // before the `done` event fires. Without this, the bubble stays
+      // blank ("the AI only shows 'architect planning, etc.' — no
+      // message" — the user's #1 complaint). The frontend SSE parser
+      // consumes bare `data: {"message": "..."}` lines for this purpose.
+      emitData({
+        message:
+          mode === "single"
+          ? `Building ${appName || "your app"} with ${SINGLE_MODE_MODEL}…`
+          : `Building ${appName || "your app"} with the agent swarm…`,
+      });
       const pipelineStart = Date.now();
 
       try {
@@ -283,7 +365,18 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         const code = mainCode ? mainCode.content : (synthFiles.length > 0 ? synthFiles[synthFiles.length - 1].content : "");
 
         const thinking = `God Mode ${mode} pipeline completed in ${duration}ms. Files: ${synthFiles.map((f) => f.path).join(", ")}`;
-        const message = `Built with ${synthFiles.length} file${synthFiles.length !== 1 ? "s" : ""} using ${mode} mode.`;
+        // The user-facing message — guaranteed non-empty. The model may
+        // have provided its own 1-2 sentence `summary` (single mode asks
+        // for one in its JSON output); when present we prefer it. When
+        // absent, we synthesize a real summary from the prompt + files
+        // so the chat bubble is never blank (the user's #1 complaint:
+        // "the AI only shows 'architect planning, etc.' — no message").
+        const modelSummary =
+          typeof result.message === "string" ? result.message.trim() : "";
+        const message =
+          modelSummary.length > 0
+            ? modelSummary
+            : synthesizeUserMessage({ prompt, appName, files: synthFiles, mode });
 
         // ── 5. VM ORCHESTRATION — write files into the Daytona sandbox ──
         // Failures here must NEVER fail the generation.
@@ -632,18 +725,31 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         // downstream bug). The user NEVER sees "the AI stopped". We log
         // the raw error to the INTERNAL logger, emit a neutral "completed"
         // activity, and ship a minimal `done` event with empty code so the
-        // frontend still gets a clean completion signal.
+        // frontend still gets a clean completion signal. The `message` is
+        // synthesized so the chat bubble still shows a real, non-empty
+        // summary rather than a generic "Build finished." placeholder.
         const msg = pipelineErr instanceof Error ? pipelineErr.message : "Pipeline completed in degraded mode";
         logger.error({ err: msg }, "God Mode pipeline degraded — emitting neutral completion");
         emit("activity", { label: "God Mode pipeline completed", status: "done", kind: "generate" });
+        // Degraded path has no files — synthesizeUserMessage handles that
+        // case (returns a real sentence naming the app + model).
+        const degradedMessage = synthesizeUserMessage({
+          prompt,
+          appName,
+          files: [],
+          mode,
+        });
         emit("done", {
           projectId: dbProjectId,
           thinking: "God Mode pipeline completed.",
-          message: "Build finished.",
+          message: degradedMessage,
           code: "",
           actions: [],
           files: [],
-          model: "god-mode",
+          // Surface the actual model id (GLM-5.2 for single mode) rather
+          // than the generic "god-mode" placeholder — the frontend's
+          // model badge should reflect what ran even on degradation.
+          model: mode === "single" ? SINGLE_MODE_MODEL : "god-mode",
           skillsUsed: [],
           duration_ms: Date.now() - pipelineStart,
           sandbox_id: null,

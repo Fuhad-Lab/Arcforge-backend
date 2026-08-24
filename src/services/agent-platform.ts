@@ -178,6 +178,30 @@ const DEFAULT_MODELS: Record<Role, string> = {
   debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "minimaxai/minimax-m3",
 };
 
+// ──────────────────────────────────────────────────────────────────────────
+// GLM 5.2 ROUTING FOR SINGLE ("SOLO") MODE
+// ──────────────────────────────────────────────────────────────────────────
+// The user explicitly requires the single-agent ("Solo", labelled "GLM-5.2"
+// in the UI) mode to be powered by GLM 5.2. Swarm mode keeps the multi-agent
+// DEFAULT_MODELS setup above.
+//
+// The single-mode endpoint is OpenAI-compatible (same /v1/chat/completions
+// shape NVIDIA uses), so it reuses `nvidiaCallModelRaw` with an explicit
+// `apiUrl` / `apiKey` override. On Render, set:
+//   SINGLE_MODE_MODEL       = glm-5.2            (or any other model id)
+//   SINGLE_MODE_API_URL     = https://open.bigmodel.cn/api/paas/v4/chat/completions
+//   SINGLE_MODE_API_KEY     = <Zhipu / OpenAI-compatible key>
+// If unset, single mode falls back to the NVIDIA endpoint + key so the
+// pipeline still works in dev/test without extra configuration.
+export const SINGLE_MODE_MODEL =
+  process.env.SINGLE_MODE_MODEL ?? "glm-5.2";
+const SINGLE_MODE_API_URL =
+  process.env.SINGLE_MODE_API_URL ??
+  process.env.NVIDIA_API_URL ??
+  "https://integrate.api.nvidia.com/v1/chat/completions";
+const SINGLE_MODE_API_KEY =
+  process.env.SINGLE_MODE_API_KEY ?? process.env.NVIDIA_API_KEY;
+
 const MAX_CODE_BYTES = 1_000_000;
 
 type PipelineResult = {
@@ -191,6 +215,14 @@ type PipelineResult = {
   negotiationRounds: number;
   /** Model identifier used for the run (optional — callers fall back to "god-mode"). */
   model?: string;
+  /**
+   * User-facing 1-2 sentence summary of what was just produced. When the
+   * model itself supplies a `summary` (single-mode JSON output), it flows
+   * through here; callers fall back to {@link synthesizeUserMessage} when
+   * absent. NEVER surfaces an empty string — the chat bubble is otherwise
+   * blank (the user's #1 complaint).
+   */
+  message?: string;
 };
 
 function emptySpec(): ProjectSpec {
@@ -875,6 +907,10 @@ export class AgentPlatform {
           skillsUsed: [...project.skillsUsed],
           phasesCompleted: [...project.phasesCompleted],
           negotiationRounds,
+          // Swarm path: surface the leader model id so the frontend's
+          // `done.model` reflects what actually ran (not the generic
+          // "god-mode" fallback).
+          model: DEFAULT_MODELS.leader,
         };
       }
 
@@ -902,6 +938,9 @@ export class AgentPlatform {
       skillsUsed: [...project.skillsUsed],
       phasesCompleted: [...project.phasesCompleted],
       negotiationRounds,
+      // Swarm path (failed): still surface the leader model id so the
+      // frontend's `done.model` reflects what actually ran.
+      model: DEFAULT_MODELS.leader,
     };
   }
 
@@ -986,13 +1025,25 @@ export class AgentPlatform {
     project.attempts = 0;
     project.diagnostics = [];
 
+    // Track the model-supplied user-facing summary across attempts so
+    // the approved result can carry it forward. The summary is purely
+    // cosmetic — when absent or empty, the caller (generate.ts) falls
+    // back to {@link synthesizeUserMessage} so the chat bubble is never
+    // blank (the user's #1 complaint: "the AI only shows 'architect
+    // planning, etc.' — no message").
+    let userSummary: string | undefined;
+
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       project.attempts = attempt;
 
       this.activatePhase(project, "planning");
       const generated = await this.callModel(
         "leader",
-        `You are the single full-stack engineer. Generate a complete implementation from this OpenAPI contract. Return only JSON with string fields "backend" (valid Python source) and "frontend" (valid React TypeScript source). ${directive}`,
+        // The model is asked for a 1-2 sentence user-facing `summary`
+        // of what it just built. This is the PRIMARY source of the
+        // chat-bubble message; the generate.ts route synthesizes a
+        // fallback when the model omits or empties the field.
+        `You are the single full-stack engineer. Generate a complete implementation from this OpenAPI contract. Return only JSON with string fields "backend" (valid Python source), "frontend" (valid React TypeScript source), and "summary" (a 1-2 sentence user-facing description of what you built, e.g. "Done — I built a todo app with add/complete/delete and a clean UI. Open the preview to try it."). ${directive}`,
         JSON.stringify(project.spec),
         true,
         project,
@@ -1005,6 +1056,14 @@ export class AgentPlatform {
       }
       const backend = codeOnly(String(parsed.backend ?? ""));
       const frontend = codeOnly(String(parsed.frontend ?? ""));
+      // Capture the model-supplied summary (trim + non-empty). We keep
+      // the most recent non-empty value across attempts — the approved
+      // attempt is the one whose summary ships, but earlier attempts'
+      // summaries are harmless if the approved one is empty.
+      if (typeof parsed.summary === "string") {
+        const trimmed = parsed.summary.trim();
+        if (trimmed.length > 0) userSummary = trimmed;
+      }
 
       // QA phase
       this.activatePhase(project, "qa");
@@ -1026,7 +1085,13 @@ export class AgentPlatform {
         }
 
         this.commit(project);
-        return this.pipelineResult(project, "approved", attempt, 0);
+        return {
+          ...this.pipelineResult(project, "approved", attempt, 0),
+          // Surface the model-supplied summary so the frontend's chat
+          // bubble renders a real message. If absent, generate.ts will
+          // synthesize one — but we prefer the model's own phrasing.
+          ...(userSummary ? { message: userSummary } : {}),
+        };
       }
 
       project.diagnostics = diagnostics;
@@ -1039,7 +1104,13 @@ export class AgentPlatform {
           : `REPAIR DIRECTIVE. Fix: ${message}`;
       if (attempt >= 2) this.rollback(project);
     }
-    return this.pipelineResult(project, "failed", project.attempts, 0);
+    return {
+      ...this.pipelineResult(project, "failed", project.attempts, 0),
+      // Even on failure, surface the model's last summary if any so the
+      // chat bubble is informative. generate.ts will still synthesize a
+      // fallback when this is absent.
+      ...(userSummary ? { message: userSummary } : {}),
+    };
   }
 
   // ─── LIVE DEBUGGING (QA PHASE) ──────────────────────────────────────
@@ -1536,17 +1607,28 @@ export class AgentPlatform {
    * role-aware wrapper below. This is the RAW NVIDIA fetch — the public
    * `callModelRaw(role, system, user)` builds the God Mode system prompt
    * and delegates here.
+   *
+   * Accepts an optional `options` bag so single-mode ("Solo" / GLM-5.2)
+   * calls can target an OpenAI-compatible endpoint + key OTHER than
+   * NVIDIA's without duplicating the retry / 400-fix envelope. When
+   * `options.apiUrl` / `options.apiKey` are absent, the NVIDIA env vars
+   * are used (the historical behavior — unchanged for swarm mode).
    */
   private async nvidiaCallModelRaw(
     model: string,
     systemPrompt: string,
     userContent: string,
     jsonMode: boolean,
+    options?: { apiUrl?: string; apiKey?: string },
   ): Promise<string> {
-    const apiKey = process.env.NVIDIA_API_KEY;
-    if (!apiKey) throw new Error("NVIDIA_API_KEY is not configured.");
-
+    const apiKey = options?.apiKey ?? process.env.NVIDIA_API_KEY;
+    if (!apiKey) {
+      throw new Error(
+        "LLM API key is not configured. Set NVIDIA_API_KEY (or SINGLE_MODE_API_KEY for single mode).",
+      );
+    }
     const url =
+      options?.apiUrl ??
       process.env.NVIDIA_API_URL ??
       "https://integrate.api.nvidia.com/v1/chat/completions";
 
@@ -1672,10 +1754,17 @@ export class AgentPlatform {
   }
 
   /**
-   * Calls the NVIDIA model with phase-aware God Mode skill injection.
+   * Calls the LLM with phase-aware God Mode skill injection.
    * Public so the orchestration loop (Module 4) can drive planning-phase
    * re-plans through the same retry/backoff path as the rest of the
    * pipeline. Internally still used by single-mode + planning.
+   *
+   * ROUTING: when `project?.mode === "single"` (the "Solo" / "GLM-5.2"
+   * tile in the UI), the call targets the GLM 5.2 model on a dedicated
+   * OpenAI-compatible endpoint (configured via SINGLE_MODE_MODEL /
+   * SINGLE_MODE_API_URL / SINGLE_MODE_API_KEY env vars, falling back to
+   * NVIDIA when unset). Swarm mode keeps the multi-agent DEFAULT_MODELS
+   * setup hitting the NVIDIA endpoint as before.
    */
   async callModel(
     role: Role,
@@ -1688,6 +1777,15 @@ export class AgentPlatform {
     const fullSystem = project
       ? this.buildSystemPrompt(role, phase, project, system)
       : system;
+    if (project?.mode === "single") {
+      return this.nvidiaCallModelRaw(
+        SINGLE_MODE_MODEL,
+        fullSystem,
+        user,
+        jsonMode,
+        { apiUrl: SINGLE_MODE_API_URL, apiKey: SINGLE_MODE_API_KEY },
+      );
+    }
     return this.nvidiaCallModelRaw(
       DEFAULT_MODELS[role],
       fullSystem,
@@ -1810,6 +1908,11 @@ export class AgentPlatform {
       skillsUsed: [...project.skillsUsed],
       phasesCompleted: [...project.phasesCompleted],
       negotiationRounds,
+      // Surface the actual model id so the frontend's `done.model` field
+      // reflects what was used (GLM-5.2 for single mode, the NVIDIA leader
+      // model for swarm). Without this, callers fall back to "god-mode".
+      model:
+        project.mode === "single" ? SINGLE_MODE_MODEL : DEFAULT_MODELS.leader,
     };
   }
 
