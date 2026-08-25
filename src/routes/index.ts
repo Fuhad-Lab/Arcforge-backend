@@ -5,11 +5,15 @@ import generateRouter from "./generate";
 import mcpRouter from "./mcp";
 import workspaceRouter from "./workspace";
 import dbRouter from "./db";
+import llmRouter from "./llm";
 
 const router: IRouter = Router();
 
 // /api/healthz — PUBLIC (Render health check). Must stay unauthenticated.
 router.use(healthRouter);
+
+// /api/llm/* — LLM proxy for the In-VM agent sidecar (X-Agent-Token auth).
+router.use("/llm", llmRouter);
 
 // /api/db/* — frontend data routes (JWT required; applied inside db.ts).
 router.use("/db", dbRouter);

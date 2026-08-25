@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import time
 from pathlib import Path
@@ -117,13 +118,29 @@ class AgentInstaller:
 
             # 3) Prepare dirs, symlink the canonical path, persist the LLM
             #    config as the daemon's env file (mode 600).
+            #
+            #    LLM ROUTING: eu-region VMs are geo-blocked from the LLM
+            #    providers (verified live: nvidia/google unreachable,
+            #    connection reset) — so the daemon calls the platform's
+            #    backend LLM PROXY instead (reachable from the VMs), which
+            #    forwards to the provider with the server-side key. The
+            #    per-VM token doubles as the proxy auth (X-Agent-Token).
+            proxy_base = os.environ.get("ARCFORGE_BACKEND_URL", "").rstrip("/")
+            proxy_secret = os.environ.get("ARCFORGE_AGENT_PROXY_SECRET", "")
+            if proxy_base and proxy_secret:
+                llm_url = f"{proxy_base}/api/llm/chat"
+                llm_key = f"agent-token:{token}"
+            else:
+                # Fallback: direct provider call (works on unblocked regions).
+                llm_url = llm["url"]
+                llm_key = llm["key"]
             env_lines = "\n".join([
                 f"ORCH_PORT={ORCHESTRATOR_PORT}",
                 f"ORCH_TOKEN={token}",
                 "ORCH_WORKSPACE=/workspace",
                 f"ORCH_SYSTEM_DIR={SIDE_CAR_HOME}",
-                f"ORCH_LLM_URL={llm['url']}",
-                f"ORCH_LLM_KEY={llm['key']}",
+                f"ORCH_LLM_URL={llm_url}",
+                f"ORCH_LLM_KEY={llm_key}",
                 f"ORCH_LLM_MODEL={llm['model']}",
             ])
             await asyncio.to_thread(

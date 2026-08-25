@@ -178,6 +178,12 @@ export type AgentLlmConfig = { url: string; key: string; model: string };
  * settings. Returns undefined when no key is configured — the sidecar then
  * installs without an LLM endpoint and the platform keeps using host-side
  * SSE for that project.
+ *
+ * NOTE: the eu-region VMs are geo-blocked from the LLM providers, so the
+ * daytona-service's installer actually points the daemon at this backend's
+ * LLM PROXY (/api/llm/chat) using ARCFORGE_BACKEND_URL + the shared
+ * ARCFORGE_AGENT_PROXY_SECRET (both env vars on the daytona-service). This
+ * config is the DIRECT-provider fallback for regions without blocking.
  */
 function buildAgentLlmConfig(): AgentLlmConfig | undefined {
   const cfg = getSingleModeLlmConfig();

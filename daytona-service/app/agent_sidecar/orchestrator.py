@@ -387,7 +387,16 @@ def llm_chat(
             data=json.dumps(body).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
+                # The key is either a provider API key OR "agent-token:<vm
+                # secret>" when routed through the platform's LLM proxy
+                # (eu VMs are geo-blocked from the providers) — the proxy
+                # authenticates with X-Agent-Token.
                 "Authorization": f"Bearer {LLM_KEY}",
+                **(
+                    {"X-Agent-Token": LLM_KEY.split("agent-token:", 1)[1]}
+                    if LLM_KEY.startswith("agent-token:")
+                    else {}
+                ),
             },
             method="POST",
         )
