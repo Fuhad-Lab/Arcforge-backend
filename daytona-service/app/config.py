@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # --- Sandbox defaults ---
     default_sandbox_language: str = "python"
     default_sandbox_image: str = "daytonaio/workspace-python:latest"
+    # Classic snapshot used for project workspaces. The SDK's
+    # language=code-toolbox path is broken in the eu region (every sandbox
+    # lands in state=Error) — classic snapshots boot reliably. daytona-medium
+    # carries cpu=2 / mem=4Gi / disk=8Gi and ships python3 + node + bash/zsh +
+    # passwordless sudo (all verified live 2026-08-25).
+    default_workspace_snapshot: str = "daytona-medium"
     default_cpu: float = 2.0
     default_memory: str = "4Gi"
     default_disk: str = "10Gi"

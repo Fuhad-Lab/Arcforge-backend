@@ -78,6 +78,7 @@ def build_create_params(
     method: str,
     language: str | None = None,
     image: str | None = None,
+    snapshot: str | None = None,
     name: str | None = None,
     cpu: float | int | None = None,
     memory: float | int | None = None,
@@ -89,11 +90,20 @@ def build_create_params(
     """Build the correct ``CreateParams`` variant for ``daytona.create()``.
 
     SDK CreateSandboxBaseParams fields:
-      name, language, os_user, env_vars, labels, public,
+      name, language, snapshot, os_user, env_vars, labels, public,
       auto_stop_interval, auto_pause_interval, auto_archive_interval,
       auto_delete_interval, ttl_minutes, volumes, secrets, etc.
 
     Resources(cpu=float, memory=float, disk=float, gpu, gpu_type)
+
+    SNAPSHOT vs LANGUAGE: passing ``language`` makes the SDK resolve a
+    platform-managed "code-toolbox" snapshot — that path is currently
+    BROKEN in the eu region (every sandbox lands in state=Error with no
+    error_reason; verified live 2026-08-25). Passing an explicit
+    ``snapshot`` name (e.g. "daytonaio/sandbox:0.8.0") creates from a
+    classic snapshot that boots reliably. Verified live: shell, python3,
+    node, process.exec, fs ops and sudo scaffolding all work on
+    daytonaio/sandbox:0.8.0.
     """
     resources_kwargs: dict[str, object] = {}
     # Daytona's API requires INTEGER cpu/memory (and float-tolerant disk)
@@ -132,7 +142,14 @@ def build_create_params(
             **common_kwargs,
         )
 
-    # Default: snapshot-based creation
+    # Default: snapshot-based creation. Prefer an explicit snapshot name —
+    # the language/code-toolbox path is broken in eu (see docstring).
+    if snapshot:
+        return CreateSandboxFromSnapshotParams(
+            snapshot=snapshot,
+            resources=resources,
+            **common_kwargs,
+        )
     lang = language or settings.default_sandbox_language
     return CreateSandboxFromSnapshotParams(
         language=lang,

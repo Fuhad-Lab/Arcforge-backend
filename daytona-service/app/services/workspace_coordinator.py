@@ -112,9 +112,12 @@ class DaytonaWorkspaceManager:
 
         params = build_create_params(
             method="snapshot",
-            # Force the python snapshot — it is the only image with a working
-            # shell for process.exec() (validated empirically 2026-08-23).
-            language="python",
+            # Classic snapshot (NOT language=) — the SDK's code-toolbox
+            # language path is broken in the eu region (every sandbox lands
+            # in state=Error with no error_reason; verified live 2026-08-25).
+            # daytonaio/sandbox:0.8.0 boots reliably and ships python3 +
+            # node + bash/zsh + passwordless sudo (all verified live).
+            snapshot=settings.default_workspace_snapshot,
             name=name,
             cpu=settings.default_cpu,
             memory=_parse_resource_size(settings.default_memory),
