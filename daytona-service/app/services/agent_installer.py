@@ -280,17 +280,26 @@ class AgentInstaller:
     # ------------------------------------------------------------------
 
     async def _preview_link(self, sandbox: Any) -> str | None:
-        """Daytona preview URL for the sidecar port (opens the port if
-        closed). Returns the public https URL the browser connects to
-        (wss:// for WebSocket, https:// for the REST fallback)."""
+        """SIGNED Daytona preview URL for the sidecar port.
+
+        The plain preview link (get_preview_link) is gated behind Daytona
+        dashboard session auth — useless for ArcForge end users. The SIGNED
+        URL (create_signed_preview_url) embeds its auth token in the
+        hostname, is self-contained, and works from any browser. Verified
+        live: REST + WebSocket both flow through it.
+
+        Each agent-info probe mints a fresh 24h signed URL, so an active
+        studio never sees an expired link.
+        """
         try:
             link = await asyncio.to_thread(
-                sandbox.get_preview_link, ORCHESTRATOR_PORT,
+                sandbox.create_signed_preview_url,
+                ORCHESTRATOR_PORT, 86400,
             )
             url = getattr(link, "url", None)
             return str(url) if url else None
         except Exception as exc:
-            logger.warning("preview link unavailable for %s: %s",
+            logger.warning("signed preview link unavailable for %s: %s",
                            getattr(sandbox, "id", "?"), exc)
             return None
 
