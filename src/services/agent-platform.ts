@@ -188,13 +188,13 @@ const DEFAULT_MODELS: Record<Role, string> = {
 // The single-mode endpoint is OpenAI-compatible (same /v1/chat/completions
 // shape NVIDIA uses), so it reuses `nvidiaCallModelRaw` with an explicit
 // `apiUrl` / `apiKey` override. On Render, set:
-//   SINGLE_MODE_MODEL       = glm-5.2            (or any other model id)
+//   SINGLE_MODE_MODEL       = minimaxai/minimax-m3 (any NVIDIA-hosted model id)
 //   SINGLE_MODE_API_URL     = https://open.bigmodel.cn/api/paas/v4/chat/completions
 //   SINGLE_MODE_API_KEY     = <Zhipu / OpenAI-compatible key>
 // If unset, single mode falls back to the NVIDIA endpoint + key so the
 // pipeline still works in dev/test without extra configuration.
 export const SINGLE_MODE_MODEL =
-  process.env.SINGLE_MODE_MODEL ?? "glm-5.2";
+  process.env.SINGLE_MODE_MODEL ?? "minimaxai/minimax-m3";
 const SINGLE_MODE_API_URL =
   process.env.SINGLE_MODE_API_URL ??
   process.env.NVIDIA_API_URL ??

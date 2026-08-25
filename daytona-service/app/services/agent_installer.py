@@ -168,6 +168,7 @@ class AgentInstaller:
                 sandbox.id, direct_ok, direct_code, proxy_ok,
                 llm_url if "proxy" not in llm_url else "backend-proxy",
             )
+            llm_ready = "1" if (direct_ok or proxy_ok) else "0"
             env_lines = "\n".join([
                 f"ORCH_PORT={ORCHESTRATOR_PORT}",
                 f"ORCH_TOKEN={token}",
@@ -176,6 +177,13 @@ class AgentInstaller:
                 f"ORCH_LLM_URL={llm_url}",
                 f"ORCH_LLM_KEY={llm_key}",
                 f"ORCH_LLM_MODEL={llm['model']}",
+                # Region-aware readiness: 0 when the VM's egress filter
+                # blocks every reachable LLM route (eu blocks NVIDIA) —
+                # the daemon then reports llm_ready=false in its sync
+                # payload and the frontend routes generation through the
+                # host-side pipeline (backend -> NVIDIA) while the WS keeps
+                # owning sync/files/status/history.
+                f"ORCH_LLM_READY={llm_ready}",
             ])
             await asyncio.to_thread(
                 sandbox.fs.upload_file,

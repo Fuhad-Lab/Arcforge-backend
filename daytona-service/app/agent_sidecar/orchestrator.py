@@ -103,6 +103,10 @@ LLM_URL = os.environ.get("ORCH_LLM_URL", "")
 LLM_KEY = os.environ.get("ORCH_LLM_KEY", "")
 LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "glm-5.2")
 LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "300"))
+# Region-aware readiness flag (written by the installer after probing the
+# LLM routes from inside the VM). 0 = this VM's egress cannot reach any LLM
+# endpoint (eu blocks NVIDIA) — clients then route generation host-side.
+LLM_READY = os.environ.get("ORCH_LLM_READY", "1") == "1"
 
 # Pipeline tuning
 DEV_SERVER_PORT = int(os.environ.get("ORCH_DEV_SERVER_PORT", "5173"))
@@ -816,6 +820,7 @@ def _sync_payload() -> Dict[str, Any]:
             "uptime_s": int(time.time() - STARTED_AT),
             "model": LLM_MODEL,
             "workspace": WORKSPACE,
+            "llm_ready": LLM_READY,
         },
     }
 
@@ -862,6 +867,7 @@ async def status_route(request: Request):
         "tasks": counts,
         "connected_clients": len(manager.active),
         "model": LLM_MODEL,
+        "llm_ready": LLM_READY,
     }
 
 
