@@ -119,21 +119,55 @@ class AgentInstaller:
             # 3) Prepare dirs, symlink the canonical path, persist the LLM
             #    config as the daemon's env file (mode 600).
             #
-            #    LLM ROUTING: eu-region VMs are geo-blocked from the LLM
-            #    providers (verified live: nvidia/google unreachable,
-            #    connection reset) — so the daemon calls the platform's
-            #    backend LLM PROXY instead (reachable from the VMs), which
-            #    forwards to the provider with the server-side key. The
-            #    per-VM token doubles as the proxy auth (X-Agent-Token).
+            #    LLM ROUTING — region-aware: eu-region VMs sit behind an
+            #    egress filter that BLOCKS many endpoints (verified live:
+            #    integrate.api.nvidia.com and *.onrender.com are TCP-reset;
+            #    open.bigmodel.cn / api.openai.com / pypi / npm are allowed).
+            #    Probe the DIRECT provider endpoint from inside the VM first;
+            #    only fall back to the backend LLM proxy when the direct
+            #    route is dead AND the proxy is reachable.
             proxy_base = os.environ.get("ARCFORGE_BACKEND_URL", "").rstrip("/")
             proxy_secret = os.environ.get("ARCFORGE_AGENT_PROXY_SECRET", "")
-            if proxy_base and proxy_secret:
+            direct_code = ""
+            try:
+                probe_out = await arun(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 8 "
+                    f"{llm['url']}",
+                    15,
+                )
+                direct_code = probe_out.strip().splitlines()[-1].strip()
+            except Exception:
+                direct_code = "000"
+            direct_ok = direct_code.isdigit() and direct_code not in ("000", "")
+
+            proxy_ok = False
+            if not direct_ok and proxy_base and proxy_secret:
+                try:
+                    proxy_out = await arun(
+                        f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 8 "
+                        f"{proxy_base}/api/healthz",
+                        15,
+                    )
+                    pcode = proxy_out.strip().splitlines()[-1].strip()
+                    proxy_ok = pcode.isdigit() and pcode not in ("000", "")
+                except Exception:
+                    proxy_ok = False
+
+            if direct_ok:
+                llm_url, llm_key = llm["url"], llm["key"]
+            elif proxy_ok:
                 llm_url = f"{proxy_base}/api/llm/chat"
                 llm_key = f"agent-token:{token}"
             else:
-                # Fallback: direct provider call (works on unblocked regions).
-                llm_url = llm["url"]
-                llm_key = llm["key"]
+                # Neither route works from this VM — record the direct config
+                # anyway (the daemon degrades gracefully and the platform's
+                # host-side SSE pipeline stays in charge).
+                llm_url, llm_key = llm["url"], llm["key"]
+            logger.info(
+                "sidecar LLM routing for %s: direct=%s(%s) proxy=%s -> %s",
+                sandbox.id, direct_ok, direct_code, proxy_ok,
+                llm_url if "proxy" not in llm_url else "backend-proxy",
+            )
             env_lines = "\n".join([
                 f"ORCH_PORT={ORCHESTRATOR_PORT}",
                 f"ORCH_TOKEN={token}",
