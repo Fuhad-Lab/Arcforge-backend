@@ -91,35 +91,58 @@ from urllib.error import HTTPError, URLError
 PORT = int(os.environ.get("ORCH_PORT", "9000"))
 TOKEN = os.environ.get("ORCH_TOKEN", "")
 WORKSPACE = os.environ.get("ORCH_WORKSPACE", "/workspace")
+# Reverse-tunnel auth: the shared AGENT_PROXY_SECRET between the VM and
+# the backend. The backend presents this as `X-Agent-Token` (or ?token=)
+# when it dials into /reverse-tunnel. Empty in dev — auth is bypassed.
+RT_TOKEN = os.environ.get("TUNNEL_TOKEN", "")
 # Physical home is DISK-backed (survives VM stop/start). /workspace may be a
 # tmpfs RAM disk, so the host symlinks /workspace/.system -> this directory.
 SYSTEM_DIR = os.environ.get("ORCH_SYSTEM_DIR", "/home/daytona/.system")
 DB_PATH = os.environ.get("ORCH_DB", os.path.join(SYSTEM_DIR, "state.db"))
 
 # LLM (OpenAI-compatible chat-completions endpoint). The VM's AI client
-# points at the LOCAL tunnel bridge (http://localhost:7777/v1) — the
-# tunnel_client daemon (PM2 process "tunnel-client") forwards each
-# request over a WebSocket to the ArcForge backend, which INJECTS the
-# real NVIDIA key server-side and forwards to NVIDIA (US region). The VM
-# NEVER sees the real key. ORCH_LLM_KEY is a dummy placeholder — the
-# OpenAI-compatible client API requires *an* api_key arg, but its value
-# is stripped at the tunnel edge (tunnel_client drops the Authorization
-# header) and the backend replaces it with the real NVIDIA Bearer token.
-# Direct mode (VM→NVIDIA) is DISABLED: the VM has no NVIDIA key by design
-# (Daytona's EU egress filter blocks NVIDIA TLS anyway), so the WS tunnel
-# is the only viable path. The installer may probe NVIDIA reachability as
-# a connectivity hint, but never enables direct forwarding.
-LLM_URL = os.environ.get("ORCH_LLM_URL", "http://localhost:7777/v1").rstrip("/")
-# Accept either a base URL (http://localhost:7777/v1) or the full
-# chat-completions URL; normalize to the full endpoint.
-if not LLM_URL.endswith("/chat/completions"):
-    LLM_URL = f"{LLM_URL}/chat/completions"
+# supports TWO modes, selected by the ORCH_LLM_URL scheme:
+#
+#   "reverse-tunnel://"  →  NEW (post-Task-15) — the BACKEND dials INTO
+#     this orchestrator's /reverse-tunnel WS endpoint (inbound through
+#     the signed daytonaproxy01.eu URL — bypasses the Daytona EU egress
+#     filter that blocks the VM dialing OUT to *.onrender.com). When the
+#     orchestrator needs to call the LLM, it sends a `req` frame over
+#     the inbound WS to the backend; the backend injects the real
+#     NVIDIA key (server-side only) and streams res/chunk/done frames
+#     back down the same WS. The VM NEVER holds the real key.
+#
+#   "http://..." / "https://..."  →  LEGACY — the orchestrator POSTs
+#     directly via urllib. Used when the VM CAN reach the LLM endpoint
+#     (e.g. a non-Daytona region, or the local tunnel_client on
+#     http://localhost:7777/v1). Maintained for backward compat and
+#     for environments where the egress filter isn't blocking.
+#
+# ORCH_LLM_KEY is a dummy placeholder when reverse-tunnel mode is active
+# (the OpenAI-compatible client API requires *an* api_key arg, but its
+# value is ignored — the backend injects the real Bearer token
+# server-side before forwarding to NVIDIA). Direct mode (VM→NVIDIA) is
+# DISABLED: the VM has no NVIDIA key by design.
+LLM_URL = os.environ.get("ORCH_LLM_URL", "http://localhost:7777/v1")
+# Detect the reverse-tunnel sentinel BEFORE rstrip — the sentinel is
+# "reverse-tunnel://" and we MUST NOT strip its trailing slashes (they
+# are part of the scheme marker).
+LLM_USE_REVERSE_TUNNEL = LLM_URL.startswith("reverse-tunnel://")
+if not LLM_USE_REVERSE_TUNNEL:
+    # Normal URL — strip trailing slashes, normalize to the full
+    # chat-completions endpoint.
+    LLM_URL = LLM_URL.rstrip("/")
+    if not LLM_URL.endswith("/chat/completions"):
+        LLM_URL = f"{LLM_URL}/chat/completions"
 LLM_KEY = os.environ.get("ORCH_LLM_KEY", "tunnel-injected")
 LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "glm-5.2")
 LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "300"))
 # Region-aware readiness flag (written by the installer after probing the
 # LLM routes from inside the VM). 0 = this VM's egress cannot reach any LLM
 # endpoint (eu blocks NVIDIA) — clients then route generation host-side.
+# NOTE: in reverse-tunnel mode, LLM_READY is set to 1 by the installer
+# because the path doesn't depend on the VM's egress — it depends on the
+# backend's ability to dial IN (which is always possible via the signed URL).
 LLM_READY = os.environ.get("ORCH_LLM_READY", "1") == "1"
 
 # Pipeline tuning
@@ -375,6 +398,113 @@ def emit(event: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# REVERSE TUNNEL — backend dials INTO this orchestrator's /reverse-tunnel
+# WS endpoint (inbound through the signed daytonaproxy01.eu URL). Bypasses
+# the Daytona EU egress filter that blocks the VM dialing OUT to
+# *.onrender.com. See module-level docstring on the LLM_URL config above.
+#
+# PROTOCOL (matches src/routes/tunnel.ts on the backend — keep in sync):
+#   VM→backend: {t:"req", id, method, path, headers, body}
+#   backend→VM: {t:"res", id, status, headers}
+#                {t:"chunk", id, body}
+#                {t:"done", id}
+#                {t:"error", id, message}
+#                {t:"ping"} / {t:"pong"}
+#
+# The VM is the WS SERVER (the backend dials in). The orchestrator's
+# worker thread (which calls llm_chat) sends `req` frames over the WS;
+# the backend receives them, calls NVIDIA with the server-side key,
+# and streams res/chunk/done back. The multiplexer tracks in-flight
+# req IDs and resolves their asyncio.Futures when the matching frames
+# arrive on the /reverse-tunnel WS.
+# ---------------------------------------------------------------------------
+
+
+class _InflightRT:
+    """One in-flight LLM request pending on the reverse-tunnel WS."""
+
+    __slots__ = ("future", "status", "headers", "body_parts")
+
+    def __init__(self) -> None:
+        # asyncio.Future — must be created on the loop (this class is
+        # only ever instantiated from inside coroutines scheduled on
+        # _LOOP, so get_running_loop() works).
+        self.future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.status: int = 0
+        self.headers: Dict[str, str] = {}
+        self.body_parts: List[str] = []
+
+
+class ReverseTunnelMultiplexer:
+    """Tracks in-flight LLM requests pending on the reverse-tunnel WS.
+
+    Each register(req_id) returns an _InflightRT whose .future the
+    worker thread's bridged coroutine awaits. The /reverse-tunnel WS
+    handler dispatches res/chunk/done/error frames here. On WS
+    disconnect, fail_all() errors every pending request so the worker
+    thread's llm_chat raises immediately instead of hanging.
+    """
+
+    def __init__(self) -> None:
+        self._inflight: Dict[str, _InflightRT] = {}
+        self._ws: Any = None  # starlette WebSocket (the backend's inbound WS)
+        self._ws_connected: asyncio.Event = asyncio.Event()
+        self._ws_connected.clear()
+        self._send_lock = asyncio.Lock()
+
+    @property
+    def connected(self) -> bool:
+        return self._ws is not None and self._ws_connected.is_set()
+
+    def register(self, req_id: str) -> _InflightRT:
+        entry = _InflightRT()
+        self._inflight[req_id] = entry
+        return entry
+
+    def on_res(self, req_id: str, status: int, headers: Dict[str, str]) -> None:
+        e = self._inflight.get(req_id)
+        if e is not None:
+            e.status = int(status) if status else 502
+            e.headers = headers or {}
+
+    def on_chunk(self, req_id: str, body: str) -> None:
+        e = self._inflight.get(req_id)
+        if e is not None:
+            e.body_parts.append(body or "")
+
+    def on_done(self, req_id: str) -> None:
+        e = self._inflight.pop(req_id, None)
+        if e is not None and not e.future.done():
+            e.future.set_result(None)
+
+    def on_error(self, req_id: str, message: str) -> None:
+        e = self._inflight.pop(req_id, None)
+        if e is not None and not e.future.done():
+            e.future.set_exception(RuntimeError(f"reverse-tunnel: {message}"))
+
+    def cancel(self, req_id: str) -> None:
+        self._inflight.pop(req_id, None)
+
+    def fail_all(self, reason: str) -> None:
+        """Fail every in-flight request (called on WS disconnect)."""
+        for e in self._inflight.values():
+            if not e.future.done():
+                e.future.set_exception(ConnectionError(reason))
+        self._inflight.clear()
+
+    async def send_req(self, frame: Dict[str, Any]) -> None:
+        """Send a req frame over the inbound WS (VM→backend). Raises if
+        the backend hasn't dialed in yet (or the WS has dropped)."""
+        async with self._send_lock:
+            if self._ws is None or not self._ws_connected.is_set():
+                raise ConnectionError("reverse-tunnel WS not connected (backend hasn't dialed in)")
+            await self._ws.send_text(json.dumps(frame))
+
+
+rt_mux = ReverseTunnelMultiplexer()
+
+
+# ---------------------------------------------------------------------------
 # LLM client (stdlib urllib — OpenAI-compatible chat completions)
 # ---------------------------------------------------------------------------
 
@@ -385,7 +515,20 @@ def llm_chat(
     max_tokens: int = 16384,
 ) -> str:
     """Call the configured OpenAI-compatible endpoint. Raises RuntimeError
-    with a readable message on failure (the worker catches and degrades)."""
+    with a readable message on failure (the worker catches and degrades).
+
+    Dispatches on the ORCH_LLM_URL scheme:
+      - "reverse-tunnel://"  →  send a `req` frame over the inbound
+        /reverse-tunnel WS to the backend; the backend injects the real
+        NVIDIA key server-side and streams res/chunk/done back.
+      - "http(s)://..."       →  legacy urllib POST (used in non-Daytona
+        environments or where the egress filter isn't blocking).
+    """
+    if LLM_USE_REVERSE_TUNNEL:
+        return _llm_chat_via_reverse_tunnel(
+            messages, json_mode=json_mode, max_tokens=max_tokens,
+        )
+
     if not LLM_URL or not LLM_KEY:
         raise RuntimeError("LLM endpoint not configured (ORCH_LLM_URL / ORCH_LLM_KEY)")
 
@@ -435,6 +578,135 @@ def llm_chat(
                 continue
             raise RuntimeError(f"LLM unreachable: {exc}") from exc
     raise RuntimeError(f"LLM failed after retries: {last_err}")
+
+
+def _llm_chat_via_reverse_tunnel(
+    messages: List[Dict[str, str]],
+    json_mode: bool = False,
+    max_tokens: int = 16384,
+) -> str:
+    """Reverse-tunnel LLM call. Sends a `req` frame over the inbound
+    /reverse-tunnel WS to the backend, awaits res/chunk/done, returns
+    the assembled JSON payload (same shape as an OpenAI chat completion
+    response). Called from the worker THREAD (llm_chat runs there);
+    bridges to the asyncio loop via run_coroutine_threadsafe so the
+    frame send + future await both happen on _LOOP (single-threaded
+    by definition — no thread-safety issues on the multiplexer).
+    """
+    loop = _LOOP
+    if loop is None or loop.is_closed():
+        raise RuntimeError("reverse-tunnel: asyncio loop not initialized")
+
+    body: Dict[str, Any] = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+
+    body_str = json.dumps(body)
+    req_id = uuid.uuid4().hex
+    # Strip Authorization + Host + Content-Length — the backend injects
+    # the real NVIDIA Bearer token server-side and recomputes hop-by-hop
+    # headers. (We're not actually sending them anyway, but keep the
+    # protocol identical to the old tunnel_client for code symmetry.)
+    frame: Dict[str, Any] = {
+        "t": "req",
+        "id": req_id,
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": {"Content-Type": "application/json"},
+        "body": body_str,
+    }
+
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            # Schedule the send-and-await on the asyncio loop. Block the
+            # worker thread until it resolves (or times out). The future
+            # resolves when /reverse-tunnel receives a `done`/`error` frame.
+            future = asyncio.run_coroutine_threadsafe(
+                _rt_send_and_await(req_id, frame), loop,
+            )
+            entry = future.result(timeout=LLM_TIMEOUT_S + 10)
+        except asyncio.TimeoutError:
+            rt_mux.cancel(req_id)
+            if attempt < 2:
+                last_err = TimeoutError("reverse-tunnel LLM call timed out")
+                time.sleep(5)
+                continue
+            raise RuntimeError("reverse-tunnel: LLM call timed out")
+        except ConnectionError as exc:
+            # Backend hasn't dialed in yet, or WS dropped mid-call.
+            if attempt < 2:
+                last_err = exc
+                time.sleep(5)
+                continue
+            raise RuntimeError(f"reverse-tunnel WS not connected: {exc}") from exc
+        except RuntimeError as exc:
+            # The backend sent an `error` frame.
+            if attempt < 2:
+                last_err = exc
+                time.sleep(5)
+                continue
+            raise
+        except Exception as exc:  # noqa: BLE001 — defensive
+            if attempt < 2:
+                last_err = exc
+                time.sleep(5)
+                continue
+            raise RuntimeError(f"reverse-tunnel LLM call failed: {exc}") from exc
+
+        status = entry.status or 502
+        if status == 429 and attempt < 2:
+            # NVIDIA free-tier rate limit — retry with backoff.
+            last_err = RuntimeError(f"LLM HTTP 429: rate-limited")
+            time.sleep(20 * (attempt + 1))
+            continue
+        if status != 200:
+            body_text = "".join(entry.body_parts)[:500]
+            raise RuntimeError(f"LLM HTTP {status}: {body_text}")
+
+        # Success — assemble the JSON payload the same way the urllib
+        # path would: parse the body and extract choices[0].message.content.
+        full_body = "".join(entry.body_parts)
+        try:
+            payload = json.loads(full_body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"reverse-tunnel: LLM returned non-JSON (first 300 chars): {full_body[:300]}"
+            ) from exc
+        content = payload["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("LLM returned an empty message")
+        return content
+
+    raise RuntimeError(f"reverse-tunnel LLM failed after retries: {last_err}")
+
+
+async def _rt_send_and_await(req_id: str, frame: Dict[str, Any]) -> _InflightRT:
+    """Coroutine that runs on _LOOP: register the req id, send the req
+    frame over the reverse-tunnel WS, await the matching future.
+    Returns the resolved _InflightRT (with status + headers + body_parts
+    populated). Raises if the WS drops or the backend sends an `error`
+    frame — these are converted by the caller's exception handling
+    into retry/raise decisions.
+    """
+    entry = rt_mux.register(req_id)
+    try:
+        await rt_mux.send_req(frame)
+    except Exception:
+        rt_mux.cancel(req_id)
+        raise
+    try:
+        await entry.future
+    except Exception:
+        # The future was resolved with an exception (on_error or fail_all).
+        # entry has been popped from the mux already; just re-raise.
+        raise
+    return entry
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
@@ -944,6 +1216,78 @@ async def ws_endpoint(ws: WebSocket):
         manager.disconnect(ws)
     except Exception:
         manager.disconnect(ws)
+
+
+@app.websocket("/reverse-tunnel")
+async def reverse_tunnel_endpoint(ws: WebSocket):
+    """Inbound reverse-tunnel WS endpoint.
+
+    The BACKEND dials into this endpoint via the signed
+    *.daytonaproxy01.eu URL (the same proxy the frontend uses for /ws).
+    Auth is via the shared AGENT_PROXY_SECRET (TUNNEL_TOKEN env var) —
+    presented as `X-Agent-Token` header OR `?token=` query. The backend
+    uses the same secret for the existing /api/tunnel endpoint, so a VM
+    provisioned with its TUNNEL_TOKEN works for either transport.
+
+    Once accepted, the backend holds the WS open and waits for `req`
+    frames from this orchestrator (sent by the worker thread via
+    rt_mux.send_req when llm_chat is called). For each `req` frame,
+    the backend injects the real NVIDIA key, calls NVIDIA, and streams
+    res/chunk/done frames back. Those frames are dispatched into the
+    multiplexer to resolve the in-flight futures.
+
+    See the "REVERSE TUNNEL" section above for the full protocol.
+    """
+    # Auth — X-Agent-Token (preferred) OR ?token= query.
+    if RT_TOKEN:
+        header_tok = ws.headers.get("x-agent-token", "") or ""
+        query_tok = ws.query_params.get("token", "") or ""
+        if not (secrets.compare_digest(header_tok, RT_TOKEN)
+                or secrets.compare_digest(query_tok, RT_TOKEN)):
+            await ws.close(code=4401, reason="unauthorized")
+            log.warning("reverse-tunnel: rejected upgrade (bad/missing token)")
+            return
+    await ws.accept()
+    # Register the WS in the multiplexer so rt_mux.send_req can write to it.
+    rt_mux._ws = ws
+    rt_mux._ws_connected.set()
+    log.info("reverse-tunnel: backend dialed in — LLM bridge is live")
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning("reverse-tunnel: dropping malformed frame: %.200s", raw)
+                continue
+            t = data.get("t")
+            req_id = data.get("id")
+            if t == "res":
+                rt_mux.on_res(req_id, data.get("status", 200), data.get("headers", {}))
+            elif t == "chunk":
+                rt_mux.on_chunk(req_id, data.get("body", ""))
+            elif t == "done":
+                rt_mux.on_done(req_id)
+            elif t == "error":
+                rt_mux.on_error(req_id, data.get("message", "unknown"))
+            elif t == "ping":
+                try:
+                    await ws.send_text(json.dumps({"t": "pong"}))
+                except Exception:  # noqa: BLE001
+                    pass
+            elif t == "pong":
+                pass
+            else:
+                log.debug("reverse-tunnel: ignoring unknown frame t=%s", t)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log.warning("reverse-tunnel: WS handler crashed: %s", exc)
+    finally:
+        rt_mux._ws = None
+        rt_mux._ws_connected.clear()
+        rt_mux.fail_all("reverse-tunnel WS disconnected")
+        log.info("reverse-tunnel: backend disconnected")
 
 
 # ---------------------------------------------------------------------------

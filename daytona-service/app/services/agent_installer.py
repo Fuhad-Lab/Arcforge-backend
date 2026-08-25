@@ -42,15 +42,16 @@ ORCHESTRATOR_PORT = 9000
 # Where the sidecar source templates live on THIS host (the Render service).
 _SIDECAR_SRC_DIR = Path(__file__).resolve().parent.parent / "agent_sidecar"
 
-# pip deps the sidecar daemons need beyond the stdlib. The
-# orchestrator uses fastapi+uvicorn (its HTTP server); the tunnel_client
-# uses aiohttp (local HTTP bridge) + curl_cffi (WS client to backend).
+# pip deps the sidecar daemon needs beyond the stdlib. The orchestrator
+# uses fastapi+uvicorn (its HTTP+WS server). curl_cffi is kept so the
+# tunnel_client.py (still deployed for backward compat in non-REVERSE
+# mode — see ORCH_LLM_URL) has its WS transport available. aiohttp is
+# likewise kept for the same reason.
 #
-# curl_cffi is REQUIRED: the backend's /api/tunnel WS endpoint is
-# fronted by Cloudflare, which blocks Python's stdlib ssl TLS fingerprint
-# (JA3/JA4) — the WS dial is reset right after the Client Hello. curl_cffi
-# impersonates Chrome's TLS fingerprint (impersonate="chrome") so Cloudflare
-# lets the WS upgrade through. Verified end-to-end live.
+# In REVERSE mode (the new default — ORCH_LLM_URL=reverse-tunnel://),
+# the orchestrator handles the LLM bridge ITSELF over its own
+# /reverse-tunnel WS endpoint, so the tunnel_client daemon is no longer
+# started (see ecosystem.config.js — only agent-brain is launched).
 _PIP_DEPS = ("fastapi", "uvicorn[standard]", "aiohttp", "curl_cffi")
 
 
@@ -196,25 +197,40 @@ class AgentInstaller:
                 tunnel_ws_url or "<unset>",
             )
             llm_ready = "1" if backend_reachable else "0"
+            # In reverse-tunnel mode, LLM readiness doesn't depend on the
+            # VM's egress — it depends on the BACKEND's ability to dial IN
+            # via the signed daytonaproxy01.eu URL (always possible — that's
+            # the same path the frontend uses for its /ws). So we always
+            # report llm_ready=1 in reverse mode, even if the egress probe
+            # to *.onrender.com fails (which it does in EU region).
+            llm_ready_reverse = "1"
             env_lines = "\n".join([
                 f"ORCH_PORT={ORCHESTRATOR_PORT}",
                 f"ORCH_TOKEN={token}",
                 "ORCH_WORKSPACE=/workspace",
                 f"ORCH_SYSTEM_DIR={SIDE_CAR_HOME}",
-                # The orchestrator's AI client always hits the local tunnel.
-                "ORCH_LLM_URL=http://localhost:7777/v1",
-                # Dummy key — tunnel strips Authorization; backend injects
-                # the real NVIDIA Bearer token server-side.
+                # The orchestrator's AI client uses the IN-PROCESS reverse
+                # tunnel — it sends `req` frames over its own /reverse-tunnel
+                # WS endpoint to the backend (which dialed IN via the signed
+                # daytonaproxy01.eu URL). Bypasses the EU egress filter
+                # entirely. The VM never holds the NVIDIA key — the backend
+                # injects it server-side before forwarding to NVIDIA.
+                "ORCH_LLM_URL=reverse-tunnel://",
+                # Dummy key — kept for backward compat. In reverse-tunnel
+                # mode the orchestrator never sends it (the backend injects
+                # the real NVIDIA Bearer token server-side).
                 "ORCH_LLM_KEY=tunnel-injected",
                 f"ORCH_LLM_MODEL={llm['model']}",
-                # 1 when the backend (and thus the WS tunnel path) is
-                # reachable — the orchestrator reports llm_ready in its
-                # sync payload; 0 means the frontend routes generation
-                # host-side while the WS still owns sync/files/status.
-                f"ORCH_LLM_READY={llm_ready}",
-                # --- Tunnel config (read by tunnel_client.py at startup) ---
-                f"TUNNEL_BACKEND_WS_URL={tunnel_ws_url}",
+                # 1 = clients (frontend) route generation through the in-VM
+                # agent. In reverse mode this is ALWAYS 1 because the path
+                # doesn't depend on the VM's egress filter.
+                f"ORCH_LLM_READY={llm_ready_reverse}",
+                # --- Tunnel config (read by orchestrator.py for /reverse-tunnel
+                # auth — the shared AGENT_PROXY_SECRET between VM and backend) ---
                 f"TUNNEL_TOKEN={proxy_secret}",
+                # Kept for backward compat (the old tunnel_client.py reads
+                # these — harmless if tunnel_client isn't running).
+                f"TUNNEL_BACKEND_WS_URL={tunnel_ws_url}",
                 "TUNNEL_LISTEN_PORT=7777",
             ])
             await asyncio.to_thread(
@@ -289,28 +305,24 @@ class AgentInstaller:
                                sandbox.id, launch_out[-300:])
                 return result
 
-            # 6) Verify BOTH daemons answer: the tunnel on :7777 first
-            #    (it must be up before the orchestrator can reach the LLM),
-            #    then the orchestrator on :9000. The tunnel probe hits the
-            #    local /__tunnel_health endpoint which reports whether the WS
-            #    to the backend has connected.
+            # 6) Verify the orchestrator daemon answers on :9000. In
+            #    reverse-tunnel mode (the new default), there's only ONE
+            #    daemon — agent-brain. The old tunnel-client on :7777 is
+            #    not started (see ecosystem.config.js). The orchestrator's
+            #    /reverse-tunnel WS endpoint will accept the backend's
+            #    inbound dial AFTER install — driven by the backend's
+            #    reverse-tunnel-client service (not the installer).
             verify = await arun(
                 "sleep 3; "
-                # Wait for tunnel-client WS to connect (max ~20s).
+                # Wait for the orchestrator /health (max ~20s).
                 "for i in 1 2 3 4 5 6 7 8 9 10; do "
-                "tcode=$(curl -s -o /dev/null -w '%{{http_code}}' "
-                "http://localhost:7777/__tunnel_health --max-time 3); "
-                "[ \"$tcode\" = \"200\" ] && break; sleep 2; done; "
-                "echo TUNNEL_$tcode; "
-                # Then the orchestrator /health (max ~10s).
-                "for i in 1 2 3 4 5; do "
                 f"ocode=$(curl -s -o /dev/null -w '%{{http_code}}' "
                 f"http://localhost:{ORCHESTRATOR_PORT}/health --max-time 3); "
                 "[ \"$ocode\" = \"200\" ] && break; sleep 2; done; "
                 "echo VERIFY_$ocode",
                 timeout=60,
             )
-            if "TUNNEL_200" not in verify or "VERIFY_200" not in verify:
+            if "VERIFY_200" not in verify:
                 # Surface the daemon logs for debugging.
                 tail = await arun(
                     f"tail -n 20 {SIDE_CAR_HOME}/pm2-tunnel-err.log "
@@ -419,35 +431,40 @@ class AgentInstaller:
         tunnel_ws_url: str,
         tunnel_token: str,
     ) -> str:
-        """Render ecosystem.config.js with both env blocks baked in.
+        """Render ecosystem.config.js with the agent-brain env baked in.
 
-        The template carries two placeholder markers — /* __TUNNEL_ENV__ */
-        (inside the tunnel-client app's env) and /* __ORCH_ENV__ */ (inside
-        the agent-brain app's env). We replace each with the rendered env
+        In reverse-tunnel mode (the new default), there is only ONE
+        app in the ecosystem — agent-brain. The template carries a
+        single placeholder marker /* __ORCH_ENV__ */ (inside the
+        agent-brain app's env). We replace it with the rendered env
         lines. The install command ALSO sources orchestrator.env before
-        `pm2 start --update-env`, so both paths carry identical config."""
+        `pm2 start --update-env`, so both paths carry identical config.
+
+        The old /* __TUNNEL_ENV__ */ marker is gone (the tunnel-client
+        app was removed in Task 15). If the placeholder is somehow still
+        present in the template (someone reverted only the template),
+        the .replace below is a no-op — no error."""
         template = (_SIDECAR_SRC_DIR / "ecosystem.config.js").read_text("utf-8")
-        # tunnel-client env: only the tunnel vars (the daemon reads nothing
-        # from ORCH_*).
-        tunnel_env = (
-            f'TUNNEL_BACKEND_WS_URL: "{tunnel_ws_url}",\n'
-            f'        TUNNEL_TOKEN: "{tunnel_token}",\n'
-            '        TUNNEL_LISTEN_PORT: "7777",'
-        )
-        # agent-brain env: the orchestrator's config. The AI client always
-        # points at the local tunnel; the LLM key is a dummy stripped at the
-        # tunnel edge (the backend injects the real NVIDIA key).
+        # agent-brain env: the orchestrator's config. The AI client uses
+        # the IN-PROCESS reverse-tunnel WS endpoint — ORCH_LLM_URL is the
+        # sentinel "reverse-tunnel://" (the orchestrator detects this and
+        # routes through rt_mux.send_req instead of urllib). The LLM key
+        # is a dummy (the backend injects the real NVIDIA key server-side).
         orch_env = (
             f'ORCH_PORT: "{ORCHESTRATOR_PORT}",\n'
             f'        ORCH_TOKEN: "{token}",\n'
             '        ORCH_WORKSPACE: "/workspace",\n'
             f'        ORCH_SYSTEM_DIR: "{SIDE_CAR_HOME}",\n'
-            '        ORCH_LLM_URL: "http://localhost:7777/v1",\n'
+            '        ORCH_LLM_URL: "reverse-tunnel://",\n'
             '        ORCH_LLM_KEY: "tunnel-injected",\n'
             f'        ORCH_LLM_MODEL: "{llm["model"]}",\n'
-            '        ORCH_LLM_READY: "1",'
+            '        ORCH_LLM_READY: "1",\n'
+            f'        TUNNEL_TOKEN: "{tunnel_token}",'
         )
-        rendered = template.replace("/* __TUNNEL_ENV__ */", tunnel_env)
+        # If the old template (with __TUNNEL_ENV__) is somehow still
+        # deployed, drop a harmless empty placeholder to avoid leaving
+        # the literal string in the rendered output.
+        rendered = template.replace("/* __TUNNEL_ENV__ */", "")
         rendered = rendered.replace("/* __ORCH_ENV__ */", orch_env)
         return rendered
 

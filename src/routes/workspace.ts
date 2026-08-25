@@ -32,6 +32,12 @@ import {
   proxyThroughVm,
   type PreviewResolution,
 } from "../services/preview-proxy";
+// Reverse-tunnel-client: triggers the backend's inbound WS dial to
+// the VM when agent-info is fetched. The frontend uses the signed URL
+// (returned below) for its own /ws; we ALSO use it to dial in for the
+// LLM bridge — bypasses the Daytona EU egress filter (which blocks
+// the VM dialing OUT to *.onrender.com).
+import { ensureReverseTunnel, isReverseTunnelConnected } from "../services/reverse-tunnel-client";
 
 const router: IRouter = Router();
 
@@ -193,7 +199,23 @@ router.get("/agent-info/:projectId", async (req: Request, res: Response, next: N
     }
 
     const info = await getAgentInfo(row.sandbox_id);
-    res.json(info);
+    // Trigger the BACKEND's inbound WS dial to the VM via the signed
+    // daytonaproxy01.eu URL. The VM's orchestrator exposes a
+    // /reverse-tunnel WS endpoint that accepts this dial; the
+    // orchestrator's worker thread then sends `req` frames over this
+    // inbound WS to bridge LLM calls through this backend (with the
+    // server-side NVIDIA key injection). Idempotent — no-op if a
+    // connection to this sandbox is already live or in-flight.
+    if (info.url) {
+      ensureReverseTunnel(row.sandbox_id, info.url);
+    }
+    res.json({
+      ...info,
+      // Surface the bridge status to the frontend so it can show
+      // "in-VM agent ready" only when BOTH the VM is alive AND the
+      // reverse-tunnel WS is connected.
+      reverse_tunnel_connected: isReverseTunnelConnected(row.sandbox_id),
+    });
   } catch (error) {
     // Degradation contract: never 500 here — the frontend falls back to SSE.
     logger.warn(
