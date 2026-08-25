@@ -194,7 +194,7 @@ const DEFAULT_MODELS: Record<Role, string> = {
 // If unset, single mode falls back to the NVIDIA endpoint + key so the
 // pipeline still works in dev/test without extra configuration.
 export const SINGLE_MODE_MODEL =
-  process.env.SINGLE_MODE_MODEL ?? "minimaxai/minimax-m3";
+  process.env.SINGLE_MODE_MODEL ?? "deepseek-ai/deepseek-v4-flash-0731";
 const SINGLE_MODE_API_URL =
   process.env.SINGLE_MODE_API_URL ??
   process.env.NVIDIA_API_URL ??
