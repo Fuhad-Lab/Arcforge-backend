@@ -130,10 +130,37 @@ class DaytonaWorkspaceManager:
         )
         t0 = time.monotonic()
 
-        sandbox = await asyncio.to_thread(
-            daytona.create, params=params,
-            timeout=settings.daytona_default_timeout,
-        )
+        sandbox = None
+        try:
+            sandbox = await asyncio.to_thread(
+                daytona.create, params=params,
+                timeout=settings.daytona_default_timeout,
+            )
+        except Exception as exc:
+            # create() raises "entered error state" when the sandbox fails to
+            # boot during the SDK's wait — the sandbox STILL EXISTS server-side
+            # as an Error corpse holding CPU quota. Look it up by its unique
+            # name and delete it so this outage cannot leak one corpse per
+            # generation (observed live: the eu target fails every boot).
+            corpse = None
+            try:
+                corpse = await asyncio.to_thread(daytona.get, name)
+            except Exception:
+                corpse = None
+            if corpse is not None:
+                try:
+                    await asyncio.to_thread(daytona.delete, corpse, 30, False)
+                    logger.warning(
+                        "Sandbox creation failed (%s) — deleted the Error corpse "
+                        "%s to protect CPU quota", exc, getattr(corpse, "id", name),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Sandbox creation failed (%s) and corpse cleanup also "
+                        "failed for name=%s — manual cleanup may be needed",
+                        exc, name,
+                    )
+            raise
 
         # Post-create health gate: a sandbox can land in state=Error with
         # NO error_reason (observed live in the 'eu' target — every sandbox
