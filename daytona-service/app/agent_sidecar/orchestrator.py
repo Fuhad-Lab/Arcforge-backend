@@ -96,11 +96,25 @@ WORKSPACE = os.environ.get("ORCH_WORKSPACE", "/workspace")
 SYSTEM_DIR = os.environ.get("ORCH_SYSTEM_DIR", "/home/daytona/.system")
 DB_PATH = os.environ.get("ORCH_DB", os.path.join(SYSTEM_DIR, "state.db"))
 
-# LLM (OpenAI-compatible chat-completions endpoint; configured by the host
-# from the platform's single-mode settings — the VM never stores these in
-# code, only in the daemon process environment).
-LLM_URL = os.environ.get("ORCH_LLM_URL", "")
-LLM_KEY = os.environ.get("ORCH_LLM_KEY", "")
+# LLM (OpenAI-compatible chat-completions endpoint). The VM's AI client
+# points at the LOCAL tunnel bridge (http://localhost:7777/v1) — the
+# tunnel_client daemon (PM2 process "tunnel-client") forwards each
+# request over a WebSocket to the ArcForge backend, which INJECTS the
+# real NVIDIA key server-side and forwards to NVIDIA (US region). The VM
+# NEVER sees the real key. ORCH_LLM_KEY is a dummy placeholder — the
+# OpenAI-compatible client API requires *an* api_key arg, but its value
+# is stripped at the tunnel edge (tunnel_client drops the Authorization
+# header) and the backend replaces it with the real NVIDIA Bearer token.
+# Direct mode (VM→NVIDIA) is DISABLED: the VM has no NVIDIA key by design
+# (Daytona's EU egress filter blocks NVIDIA TLS anyway), so the WS tunnel
+# is the only viable path. The installer may probe NVIDIA reachability as
+# a connectivity hint, but never enables direct forwarding.
+LLM_URL = os.environ.get("ORCH_LLM_URL", "http://localhost:7777/v1").rstrip("/")
+# Accept either a base URL (http://localhost:7777/v1) or the full
+# chat-completions URL; normalize to the full endpoint.
+if not LLM_URL.endswith("/chat/completions"):
+    LLM_URL = f"{LLM_URL}/chat/completions"
+LLM_KEY = os.environ.get("ORCH_LLM_KEY", "tunnel-injected")
 LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "glm-5.2")
 LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "300"))
 # Region-aware readiness flag (written by the installer after probing the
@@ -391,16 +405,11 @@ def llm_chat(
             data=json.dumps(body).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                # The key is either a provider API key OR "agent-token:<vm
-                # secret>" when routed through the platform's LLM proxy
-                # (eu VMs are geo-blocked from the providers) — the proxy
-                # authenticates with X-Agent-Token.
+                # Dummy Authorization — tunnel_client strips this header
+                # at the edge and the ArcForge backend injects the real
+                # NVIDIA Bearer token before forwarding to NVIDIA. The VM
+                # never holds the real key.
                 "Authorization": f"Bearer {LLM_KEY}",
-                **(
-                    {"X-Agent-Token": LLM_KEY.split("agent-token:", 1)[1]}
-                    if LLM_KEY.startswith("agent-token:")
-                    else {}
-                ),
             },
             method="POST",
         )

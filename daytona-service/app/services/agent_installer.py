@@ -42,8 +42,10 @@ ORCHESTRATOR_PORT = 9000
 # Where the sidecar source templates live on THIS host (the Render service).
 _SIDECAR_SRC_DIR = Path(__file__).resolve().parent.parent / "agent_sidecar"
 
-# pip deps the orchestrator needs beyond the stdlib.
-_PIP_DEPS = ("fastapi", "uvicorn[standard]")
+# pip deps the sidecar daemons need beyond the stdlib. The
+# orchestrator uses fastapi+uvicorn (its HTTP server); the tunnel_client
+# uses aiohttp (local HTTP bridge) + websockets (WS client to backend).
+_PIP_DEPS = ("fastapi", "uvicorn[standard]", "aiohttp", "websockets")
 
 
 class AgentInstaller:
@@ -87,16 +89,42 @@ class AgentInstaller:
         try:
             # 1) Read the sidecar templates from this host.
             orchestrator_src = (_SIDECAR_SRC_DIR / "orchestrator.py").read_text("utf-8")
-            ecosystem_src = self._render_ecosystem(token, llm)
+            tunnel_src = (_SIDECAR_SRC_DIR / "tunnel_client.py").read_text("utf-8")
+
+            # --- Derive the WS tunnel config from the host env ------------
+            # The VM's AI client points at localhost:7777; the tunnel_client
+            # bridges that over a single WebSocket to the backend's /api/tunnel
+            # endpoint. The backend injects the real NVIDIA key (never in the
+            # VM) and forwards to NVIDIA (US region, unblocked by the EU
+            # egress filter). Direct mode (VM→NVIDIA) is OFF — the VM has no
+            # NVIDIA key by design.
+            backend_url = os.environ.get("ARCFORGE_BACKEND_URL", "").rstrip("/")
+            proxy_secret = os.environ.get("ARCFORGE_AGENT_PROXY_SECRET", "")
+            # Convert https://host -> wss://host  (http:// -> ws://)
+            if backend_url.startswith("https://"):
+                tunnel_ws_url = "wss://" + backend_url[len("https://"):]
+            elif backend_url.startswith("http://"):
+                tunnel_ws_url = "ws://" + backend_url[len("http://"):]
+            else:
+                tunnel_ws_url = ""  # not configured — tunnel will error loudly
+
+            ecosystem_src = self._render_ecosystem(
+                token, llm, tunnel_ws_url, proxy_secret,
+            )
             watchdog_src = (_SIDECAR_SRC_DIR / "watchdog.sh").read_text("utf-8")
 
-            # 2) Write the daemon + supervisor configs into the VM.
+            # 2) Write the daemons + supervisor configs into the VM.
             #    /home/daytona is the disk-backed user home — state.db,
-            #    logs and the daemon itself survive VM stop/start.
+            #    logs and the daemons themselves survive VM stop/start.
             await asyncio.to_thread(
                 sandbox.fs.upload_file,
                 orchestrator_src.encode("utf-8"),
                 f"{SIDE_CAR_HOME}/orchestrator.py",
+            )
+            await asyncio.to_thread(
+                sandbox.fs.upload_file,
+                tunnel_src.encode("utf-8"),
+                f"{SIDE_CAR_HOME}/tunnel_client.py",
             )
             await asyncio.to_thread(
                 sandbox.fs.upload_file,
@@ -116,74 +144,72 @@ class AgentInstaller:
                 f"{SIDE_CAR_HOME}/agent_token",
             )
 
-            # 3) Prepare dirs, symlink the canonical path, persist the LLM
-            #    config as the daemon's env file (mode 600).
+            # 3) Prepare dirs, symlink the canonical path, persist the
+            #    tunnel + LLM config as the daemons' env file (mode 600).
             #
-            #    LLM ROUTING — region-aware: eu-region VMs sit behind an
-            #    egress filter that BLOCKS many endpoints (verified live:
-            #    integrate.api.nvidia.com and *.onrender.com are TCP-reset;
-            #    open.bigmodel.cn / api.openai.com / pypi / npm are allowed).
-            #    Probe the DIRECT provider endpoint from inside the VM first;
-            #    only fall back to the backend LLM proxy when the direct
-            #    route is dead AND the proxy is reachable.
-            proxy_base = os.environ.get("ARCFORGE_BACKEND_URL", "").rstrip("/")
-            proxy_secret = os.environ.get("ARCFORGE_AGENT_PROXY_SECRET", "")
-            direct_code = ""
-            try:
-                probe_out = await arun(
-                    f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 8 "
-                    f"{llm['url']}",
-                    15,
-                )
-                direct_code = probe_out.strip().splitlines()[-1].strip()
-            except Exception:
-                direct_code = "000"
-            direct_ok = direct_code.isdigit() and direct_code not in ("000", "")
-
-            proxy_ok = False
-            if not direct_ok and proxy_base and proxy_secret:
+            #    LLM ROUTING — always via the IN-VM WS TUNNEL now. The
+            #    VM's AI client points at localhost:7777 (tunnel_client);
+            #    the tunnel bridges over a WS to the backend, which injects
+            #    the real NVIDIA key and forwards to NVIDIA (US region).
+            #    The VM holds NO NVIDIA key — direct mode is OFF.
+            #
+            #    We still probe whether the VM can reach the backend (HTTP
+            #    healthz) as a readiness hint: if the backend is reachable,
+            #    the WS tunnel will work once PM2 starts the tunnel_client.
+            backend_reachable = False
+            if backend_url:
                 try:
-                    proxy_out = await arun(
+                    probe_out = await arun(
                         f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 8 "
-                        f"{proxy_base}/api/healthz",
+                        f"{backend_url}/api/healthz",
                         15,
                     )
-                    pcode = proxy_out.strip().splitlines()[-1].strip()
-                    proxy_ok = pcode.isdigit() and pcode not in ("000", "")
+                    pcode = probe_out.strip().splitlines()[-1].strip()
+                    backend_reachable = (
+                        pcode.isdigit() and pcode not in ("000", "")
+                    )
                 except Exception:
-                    proxy_ok = False
-
-            if direct_ok:
-                llm_url, llm_key = llm["url"], llm["key"]
-            elif proxy_ok:
-                llm_url = f"{proxy_base}/api/llm/chat"
-                llm_key = f"agent-token:{token}"
-            else:
-                # Neither route works from this VM — record the direct config
-                # anyway (the daemon degrades gracefully and the platform's
-                # host-side SSE pipeline stays in charge).
-                llm_url, llm_key = llm["url"], llm["key"]
+                    backend_reachable = False
+            # Optional connectivity hint — does the VM's egress even see
+            # NVIDIA? (EU VMs are blocked.) NEVER enables direct mode; just
+            # logged for region diagnostics.
+            nvidia_hint = "?"
+            try:
+                hint_out = await arun(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 6 "
+                    f"{llm['url']}",
+                    12,
+                )
+                nvidia_hint = hint_out.strip().splitlines()[-1].strip()
+            except Exception:
+                nvidia_hint = "000"
             logger.info(
-                "sidecar LLM routing for %s: direct=%s(%s) proxy=%s -> %s",
-                sandbox.id, direct_ok, direct_code, proxy_ok,
-                llm_url if "proxy" not in llm_url else "backend-proxy",
+                "sidecar tunnel routing for %s: backend=%s(nvidia_hint=%s) "
+                "ws_url=%s",
+                sandbox.id, backend_reachable, nvidia_hint,
+                tunnel_ws_url or "<unset>",
             )
-            llm_ready = "1" if (direct_ok or proxy_ok) else "0"
+            llm_ready = "1" if backend_reachable else "0"
             env_lines = "\n".join([
                 f"ORCH_PORT={ORCHESTRATOR_PORT}",
                 f"ORCH_TOKEN={token}",
                 "ORCH_WORKSPACE=/workspace",
                 f"ORCH_SYSTEM_DIR={SIDE_CAR_HOME}",
-                f"ORCH_LLM_URL={llm_url}",
-                f"ORCH_LLM_KEY={llm_key}",
+                # The orchestrator's AI client always hits the local tunnel.
+                "ORCH_LLM_URL=http://localhost:7777/v1",
+                # Dummy key — tunnel strips Authorization; backend injects
+                # the real NVIDIA Bearer token server-side.
+                "ORCH_LLM_KEY=tunnel-injected",
                 f"ORCH_LLM_MODEL={llm['model']}",
-                # Region-aware readiness: 0 when the VM's egress filter
-                # blocks every reachable LLM route (eu blocks NVIDIA) —
-                # the daemon then reports llm_ready=false in its sync
-                # payload and the frontend routes generation through the
-                # host-side pipeline (backend -> NVIDIA) while the WS keeps
-                # owning sync/files/status/history.
+                # 1 when the backend (and thus the WS tunnel path) is
+                # reachable — the orchestrator reports llm_ready in its
+                # sync payload; 0 means the frontend routes generation
+                # host-side while the WS still owns sync/files/status.
                 f"ORCH_LLM_READY={llm_ready}",
+                # --- Tunnel config (read by tunnel_client.py at startup) ---
+                f"TUNNEL_BACKEND_WS_URL={tunnel_ws_url}",
+                f"TUNNEL_TOKEN={proxy_secret}",
+                "TUNNEL_LISTEN_PORT=7777",
             ])
             await asyncio.to_thread(
                 sandbox.fs.upload_file,
@@ -197,7 +223,8 @@ class AgentInstaller:
                 f"sudo ln -sfn {SIDE_CAR_HOME} {VM_CANONICAL_PATH} 2>/dev/null "
                 f"|| ln -sfn {SIDE_CAR_HOME} {VM_CANONICAL_PATH} 2>/dev/null; "
                 f"chmod 600 {SIDE_CAR_HOME}/agent_token {SIDE_CAR_HOME}/orchestrator.env; "
-                f"chmod +x {SIDE_CAR_HOME}/orchestrator.py {SIDE_CAR_HOME}/watchdog.sh; "
+                f"chmod +x {SIDE_CAR_HOME}/orchestrator.py "
+                f"{SIDE_CAR_HOME}/tunnel_client.py {SIDE_CAR_HOME}/watchdog.sh; "
                 f"echo PREP_OK"
             )
             prep_out = await arun(prep, 20)
@@ -220,11 +247,14 @@ class AgentInstaller:
                 )
                 return result  # installed=False — platform falls back to SSE
 
-            # 5) Launch: PM2 preferred, watchdog fallback. Both source the
-            #    env file so the token/LLM config never appears in `ps`.
+            # 5) Launch: PM2 preferred (manages BOTH tunnel-client +
+            #    agent-brain), watchdog fallback. Both source the env file
+            #    so the token/tunnel/LLM config never appears in `ps`.
             launch = (
-                # idempotent: stop any previous supervisor + daemon
+                # idempotent: stop any previous supervisor + daemons
+                "(pm2 delete tunnel-client 2>/dev/null || true); "
                 "(pm2 delete agent-brain 2>/dev/null || true); "
+                "pkill -f tunnel_client.py 2>/dev/null; "
                 "pkill -f orchestrator.py 2>/dev/null; "
                 "pkill -f watchdog.sh 2>/dev/null; "
                 "sleep 0.5; "
@@ -253,24 +283,38 @@ class AgentInstaller:
                                sandbox.id, launch_out[-300:])
                 return result
 
-            # 6) Verify the daemon answers /health on the sidecar port.
+            # 6) Verify BOTH daemons answer: the tunnel on :7777 first
+            #    (it must be up before the orchestrator can reach the LLM),
+            #    then the orchestrator on :9000. The tunnel probe hits the
+            #    local /__tunnel_health endpoint which reports whether the WS
+            #    to the backend has connected.
             verify = await arun(
-                "sleep 3; for i in 1 2 3 4 5; do "
-                f"code=$(curl -s -o /dev/null -w '%{{http_code}}' "
+                "sleep 3; "
+                # Wait for tunnel-client WS to connect (max ~20s).
+                "for i in 1 2 3 4 5 6 7 8 9 10; do "
+                "tcode=$(curl -s -o /dev/null -w '%{{http_code}}' "
+                "http://localhost:7777/__tunnel_health --max-time 3); "
+                "[ \"$tcode\" = \"200\" ] && break; sleep 2; done; "
+                "echo TUNNEL_$tcode; "
+                # Then the orchestrator /health (max ~10s).
+                "for i in 1 2 3 4 5; do "
+                f"ocode=$(curl -s -o /dev/null -w '%{{http_code}}' "
                 f"http://localhost:{ORCHESTRATOR_PORT}/health --max-time 3); "
-                "[ \"$code\" = \"200\" ] && break; sleep 2; done; "
-                "echo VERIFY_$code",
-                timeout=45,
+                "[ \"$ocode\" = \"200\" ] && break; sleep 2; done; "
+                "echo VERIFY_$ocode",
+                timeout=60,
             )
-            if "VERIFY_200" not in verify:
-                # Surface the daemon log tail for debugging.
+            if "TUNNEL_200" not in verify or "VERIFY_200" not in verify:
+                # Surface the daemon logs for debugging.
                 tail = await arun(
-                    f"tail -n 20 {SIDE_CAR_HOME}/pm2-err.log "
+                    f"tail -n 20 {SIDE_CAR_HOME}/pm2-tunnel-err.log "
+                    f"{SIDE_CAR_HOME}/pm2-err.log "
+                    f"{SIDE_CAR_HOME}/tunnel_client.log "
                     f"{SIDE_CAR_HOME}/orchestrator.log 2>/dev/null", 15,
                 )
                 logger.warning(
                     "sidecar health check failed in %s (verify=%s, tail=%s)",
-                    sandbox.id, verify.strip()[-80:], tail[-400:],
+                    sandbox.id, verify.strip()[-120:], tail[-500:],
                 )
                 return result
 
@@ -362,26 +406,43 @@ class AgentInstaller:
                            getattr(sandbox, "id", "?"), exc)
             return None
 
-    def _render_ecosystem(self, token: str, llm: dict[str, str]) -> str:
-        """Render ecosystem.config.js with the env baked in (the install
-        command also exports the env file before `pm2 start`, so both
-        paths carry identical config)."""
+    def _render_ecosystem(
+        self,
+        token: str,
+        llm: dict[str, str],
+        tunnel_ws_url: str,
+        tunnel_token: str,
+    ) -> str:
+        """Render ecosystem.config.js with both env blocks baked in.
+
+        The template carries two placeholder markers — /* __TUNNEL_ENV__ */
+        (inside the tunnel-client app's env) and /* __ORCH_ENV__ */ (inside
+        the agent-brain app's env). We replace each with the rendered env
+        lines. The install command ALSO sources orchestrator.env before
+        `pm2 start --update-env`, so both paths carry identical config."""
         template = (_SIDECAR_SRC_DIR / "ecosystem.config.js").read_text("utf-8")
-        env_block = (
-            "      env: {\n"
-            '        NODE_ENV: "production",\n'
-            f'        ORCH_PORT: "{ORCHESTRATOR_PORT}",\n'
+        # tunnel-client env: only the tunnel vars (the daemon reads nothing
+        # from ORCH_*).
+        tunnel_env = (
+            f'TUNNEL_BACKEND_WS_URL: "{tunnel_ws_url}",\n'
+            f'        TUNNEL_TOKEN: "{tunnel_token}",\n'
+            '        TUNNEL_LISTEN_PORT: "7777",'
+        )
+        # agent-brain env: the orchestrator's config. The AI client always
+        # points at the local tunnel; the LLM key is a dummy stripped at the
+        # tunnel edge (the backend injects the real NVIDIA key).
+        orch_env = (
+            f'ORCH_PORT: "{ORCHESTRATOR_PORT}",\n'
             f'        ORCH_TOKEN: "{token}",\n'
             '        ORCH_WORKSPACE: "/workspace",\n'
             f'        ORCH_SYSTEM_DIR: "{SIDE_CAR_HOME}",\n'
-            f'        ORCH_LLM_URL: "{llm["url"]}",\n'
-            f'        ORCH_LLM_KEY: "{llm["key"]}",\n'
+            '        ORCH_LLM_URL: "http://localhost:7777/v1",\n'
+            '        ORCH_LLM_KEY: "tunnel-injected",\n'
             f'        ORCH_LLM_MODEL: "{llm["model"]}",\n'
-            "      },"
+            '        ORCH_LLM_READY: "1",'
         )
-        # Replace the placeholder env block (the template's env: { ... })
-        import re
-        rendered = re.sub(r"      env: \{[\s\S]*?\},", env_block, template, count=1)
+        rendered = template.replace("/* __TUNNEL_ENV__ */", tunnel_env)
+        rendered = rendered.replace("/* __ORCH_ENV__ */", orch_env)
         return rendered
 
 

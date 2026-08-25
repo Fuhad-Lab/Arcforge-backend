@@ -11,6 +11,11 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "httpx>=0.28.0",
     "python-multipart>=0.0.20",
+    # In-VM tunnel client deps (installed into each MicroVM by the agent
+    # installer alongside fastapi+uvicorn). Declared here so the host service
+    # can import the agent_sidecar package for testing/py_compile.
+    "aiohttp>=3.10.0",
+    "websockets>=13.0",
 ]
 
 [project.optional-dependencies]

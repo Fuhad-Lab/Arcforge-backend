@@ -92,4 +92,37 @@ router.get("/health", (req: Request, res: Response) => {
   res.json({ ok: true, base: PUBLIC_BASE_URL || null });
 });
 
+/**
+ * GET /api/llm/tunnel-info — discovery for the VM-side installer.
+ *
+ * Returns the tunnel WS path, whether a token is required, and whether
+ * the NVIDIA upstream is configured. The VM installer calls this (with
+ * the X-Agent-Token) to pin the tunnel endpoint + verify the backend
+ * has a key before it rewrites the orchestrator's base_url to
+ * http://localhost:7777/v1.
+ */
+router.get("/tunnel-info", (req: Request, res: Response) => {
+  const agentToken = req.header("x-agent-token") || "";
+  const expected = process.env.AGENT_PROXY_SECRET || "";
+  if (!expected || agentToken !== expected) {
+    res.status(401).json({ error: "unauthorized" });
+    return;
+  }
+  const cfg = getSingleModeLlmConfig();
+  // Derive a public base URL hint for the VM (host-only — the VM
+  // actually talks to localhost:7777, but this tells the installer the
+  // upstream is configured).
+  const baseUrl =
+    (process.env.NVIDIA_NIM_BASE_URL || cfg.url || "").replace(
+      /\/chat\/completions$/,
+      "",
+    ) || null;
+  res.json({
+    tunnelPath: "/api/tunnel",
+    requiresToken: true,
+    nvidiaConfigured: Boolean(cfg.key),
+    baseUrl,
+  });
+});
+
 export default router;

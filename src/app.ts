@@ -5,14 +5,23 @@ import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
 import { wsSync } from "./services/websocket-sync";
+import { attachTunnelServer } from "./routes/tunnel";
 
 const app: Express = express();
 
 // Create HTTP server for Express + WebSocket
 export const server = createServer(app);
 
-// Attach WebSocket sync on /ws
+// Attach WebSocket sync on /ws (frontend live-collaboration)
 wsSync.attach(server);
+
+// Attach the Inbound Reverse Proxy Tunnel on /api/tunnel.
+// The VM opens a long-lived WS here to bypass Daytona's EU-region egress
+// firewall (which blocks *.nvidia.com AND *.onrender.com over TLS). The
+// VM's HTTP requests to localhost:7777 are bridged over this WS, the
+// backend injects the NVIDIA API key server-side, and forwards to NVIDIA.
+// See src/routes/tunnel.ts for the full protocol + rationale.
+attachTunnelServer(server);
 
 app.use(
   pinoHttp({
