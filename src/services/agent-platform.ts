@@ -1729,6 +1729,14 @@ export class AgentPlatform {
               max_tokens: 16384,
               ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
             }),
+            // Hard timeout — undici keep-alive connections can hang
+            // FOREVER without one (observed live: NVIDIA answered in 0.3s
+            // from a direct curl while the backend's in-flight fetch sat
+            // for 10+ minutes, starving the whole rate-limit queue).
+            // Real generations take <=60s; 180s is the generous ceiling.
+            signal: AbortSignal.timeout(
+              Number(process.env.LLM_FETCH_TIMEOUT_MS ?? 180_000),
+            ),
           });
         } finally {
           releaseSlot();
