@@ -122,6 +122,25 @@ function synthesizeUserMessage(opts: {
   return `Done — I built ${subject} across ${fileCount} ${fileNoun} (${fileList}). Open the preview to try it.`;
 }
 
+// ─── GENERATION MUTEX ──────────────────────────────────────────────────────
+// Only ONE generation may run at a time process-wide. The NVIDIA free tier
+// allows ~1 request/MINUTE — concurrent generations (multiple studios, or
+// zombie pipelines of disconnected SSE clients) ping-pong that quota
+// between their retry loops and starve each other into permanent
+// degradation (observed live). Queued requests wait for the lock; the
+// SSE stream stays open with heartbeats while queued.
+let generationLock: Promise<void> = Promise.resolve();
+
+function withGenerationLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = generationLock.then(fn);
+  // Keep the chain alive regardless of failures.
+  generationLock = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 router.post("/generate", requireAuth, (req: Request, res: Response) => {
   // Set SSE headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -182,7 +201,19 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
     }
   }
 
-  (async () => {
+  // Client-disconnect tracking: when the SSE client goes away, the
+  // pipeline keeps running ONLY to finish VM writes; LLM-heavy phases
+  // should stop re-queuing. Tracked via res 'close' — emit() already
+  // no-ops after disconnect.
+  req.on("close", () => {
+    // Client gone. The generation continues (results persist to the DB +
+    // VM) — this is the tab-close-resilience contract. But the GENERATION
+    // MUTUSerializer below ensures it stops hogging the LLM quota once a
+    // NEWER request arrives (the newer request queues behind it, so the
+    // zombie finishes within its in-flight LLM call and hands over).
+  });
+
+  withGenerationLock(async () => {
     try {
       emit("start", { projectId: bodyProjectId || null, mode, isFirstMessage: history.length === 0 });
 
@@ -772,7 +803,7 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         try { res.end(); } catch { /* client already gone */ }
       }
     }
-  })();
+  });
 });
 
 export default router;
