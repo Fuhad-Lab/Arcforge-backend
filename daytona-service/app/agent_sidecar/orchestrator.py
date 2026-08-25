@@ -1248,7 +1248,14 @@ async def reverse_tunnel_endpoint(ws: WebSocket):
             log.warning("reverse-tunnel: rejected upgrade (bad/missing token)")
             return
     await ws.accept()
-    # Register the WS in the multiplexer so rt_mux.send_req can write to it.
+    # If a previous backend WS is still tracked, fail its in-flight
+    # requests and mark it stale — the new connection replaces it.
+    # (We don't actively close the old WS object — its recv loop will
+    # exit on its own when it receives a close frame or hits a timeout;
+    # we just stop routing new req frames to it.)
+    if rt_mux._ws is not None and rt_mux._ws is not ws:
+        log.info("reverse-tunnel: new dial-in superseding previous connection — failing in-flight reqs")
+        rt_mux.fail_all("reverse-tunnel: new connection superseded")
     rt_mux._ws = ws
     rt_mux._ws_connected.set()
     log.info("reverse-tunnel: backend dialed in — LLM bridge is live")
@@ -1284,10 +1291,21 @@ async def reverse_tunnel_endpoint(ws: WebSocket):
     except Exception as exc:  # noqa: BLE001
         log.warning("reverse-tunnel: WS handler crashed: %s", exc)
     finally:
-        rt_mux._ws = None
-        rt_mux._ws_connected.clear()
-        rt_mux.fail_all("reverse-tunnel WS disconnected")
-        log.info("reverse-tunnel: backend disconnected")
+        # COMPARE-AND-SWAP: only clear the global WS state if it still
+        # points to THIS ws. If a newer connection has already replaced
+        # us (rt_mux._ws != ws), leave the global state alone — the
+        # newer connection is the source of truth. This prevents a
+        # stale disconnect handler from clearing the active backend
+        # connection (e.g. when a transient rogue client dials in and
+        # out, the real backend's WS must NOT be torn down).
+        if rt_mux._ws is ws:
+            rt_mux._ws = None
+            rt_mux._ws_connected.clear()
+            rt_mux.fail_all("reverse-tunnel WS disconnected")
+            log.info("reverse-tunnel: backend disconnected")
+        else:
+            log.info("reverse-tunnel: stale handler exiting (a newer "
+                     "connection is active — leaving rt_mux intact)")
 
 
 # ---------------------------------------------------------------------------
