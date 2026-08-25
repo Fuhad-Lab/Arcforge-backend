@@ -218,6 +218,37 @@ export function getSingleModeLlmConfig(): { url: string; key: string; model: str
 
 const MAX_CODE_BYTES = 1_000_000;
 
+// ─── PROCESS-WIDE LLM RATE LIMITER ────────────────────────────────────────
+// The NVIDIA free tier enforces ~1 request per minute per key. Concurrent
+// generations (multiple studios, SSE clients that disconnected but whose
+// backend pipeline keeps running) all share that quota — without
+// serialization they collide in 429 retry loops that starve each other
+// forever (observed live: every generation degraded to empty code while
+// each pipeline's 30s-backoff retries kept missing the 60s window).
+//
+// acquireLlmSlot() serializes EVERY NVIDIA call process-wide and spaces
+// consecutive calls MIN_CALL_SPACING_MS apart, so any number of in-flight
+// generations cooperatively share the quota. A generation needs ~2-3
+// slots (spec + codegen) → ~2-4 minutes at 1 RPM, and it ALWAYS lands.
+let llmChain: Promise<void> = Promise.resolve();
+let lastLlmCallAt = 0;
+const MIN_CALL_SPACING_MS = Number(process.env.LLM_MIN_SPACING_MS ?? 61_000);
+
+async function acquireLlmSlot(): Promise<() => void> {
+  let release!: () => void;
+  const prev = llmChain;
+  llmChain = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await prev;
+  const wait = Math.max(0, MIN_CALL_SPACING_MS - (Date.now() - lastLlmCallAt));
+  if (wait > 0) {
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+  lastLlmCallAt = Date.now();
+  return release;
+}
+
 type PipelineResult = {
   status: "approved" | "failed";
   attempts: number;
@@ -1676,23 +1707,32 @@ export class AgentPlatform {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
       let response: Response;
       try {
-        response = await fetch(url, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              { role: "system", content: safeSystem },
-              { role: "user", content: safeUser },
-            ],
-            temperature: 0,
-            max_tokens: 16384,
-            ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
-          }),
-        });
+        // Serialize through the process-wide rate limiter — the free-tier
+        // key allows ~1 request/minute; without this, concurrent callers
+        // (including zombie pipelines of disconnected SSE clients) 429
+        // each other into permanent degradation.
+        const releaseSlot = await acquireLlmSlot();
+        try {
+          response = await fetch(url, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model,
+              messages: [
+                { role: "system", content: safeSystem },
+                { role: "user", content: safeUser },
+              ],
+              temperature: 0,
+              max_tokens: 16384,
+              ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+            }),
+          });
+        } finally {
+          releaseSlot();
+        }
       } catch (err: unknown) {
         lastError = err instanceof Error ? err.message : String(err);
         logger.warn({ model, attempt, err: lastError }, "NVIDIA fetch error");
