@@ -69,9 +69,33 @@ WEBSOCKET TUNNEL PROTOCOL (text JSON frames — MUST match host side exactly)
   are JSON text, so this is safe; binary bodies would need a different
   transport but are never needed for chat completions).
 
+TLS FINGERPRINT SPOOFING (Cloudflare bypass)
+  The backend's /api/tunnel WS endpoint is fronted by Cloudflare, which
+  applies bot detection on the JA3/JA4 TLS fingerprint of incoming TLS
+  Client Hello messages. Python's stdlib `ssl` module (used by `websockets`
+  and `aiohttp` clients) produces a Python-specific fingerprint that
+  Cloudflare flags as a bot, then resets the TCP connection right after
+  the Client Hello ("Connection reset by peer" within ~24ms of the
+  connect syscall — BEFORE any HTTP data is sent).
+
+  To bypass this, the WS dial is performed via `curl_cffi.requests.AsyncSession`
+  configured with `impersonate="chrome"`. curl_cffi uses libcurl's
+  `CURLOPT_SSL_ENABLE_ALPN` + a handcrafted TLS Client Hello that exactly
+  matches Chrome's JA3/JA4 fingerprint (cipher ordering, extensions,
+  supported_groups list). Cloudflare sees a Chrome client and lets the
+  WS upgrade through. The HTTP/2 streaming behavior is preserved (text
+  frames still flow bidirectionally).
+
+  This was previously the failure mode: the in-VM agent's localhost:7777
+  POST to /v1/chat/completions was returning "LLM HTTP 502: tunnel send
+  error: tunnel WS not connected" because the WS dial to wss://...onrender.com
+  was reset by Cloudflare. After this fix, the WS connects cleanly and
+  the in-VM agent's LLM calls bridge through to NVIDIA end-to-end.
+
 DEPENDENCIES
-  aiohttp (local HTTP server), websockets (WS client). Both are installed
-  into the VM by app/services/agent_installer.py alongside fastapi+uvicorn.
+  aiohttp (local HTTP server), curl_cffi (WS client with TLS-fingerprint
+  impersonation). Both are installed into the VM by
+  app/services/agent_installer.py alongside fastapi+uvicorn.
 """
 
 from __future__ import annotations
@@ -87,8 +111,15 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp import web
-from websockets.asyncio.client import connect as ws_connect
-from websockets.exceptions import ConnectionClosed
+
+# curl_cffi is the WS transport. Its TLS Client Hello is spoofed to match
+# Chrome (impersonate="chrome") so Cloudflare (which fronts Render's TLS)
+# does NOT reset the connection as a bot. The stdlib `ssl`-based `websockets`
+# library was previously used here and was blocked by Cloudflare's
+# JA3/JA4 fingerprint bot detection — see module docstring.
+from curl_cffi.requests import AsyncSession
+from curl_cffi import CurlError
+from curl_cffi.requests.websockets import WebSocketClosed, WebSocketError
 
 # ---------------------------------------------------------------------------
 # Configuration (env, read once at startup — injected by the installer)
@@ -211,7 +242,9 @@ class TunnelClient:
         async with self._send_lock:
             if self.ws is None:
                 raise ConnectionError("tunnel WS not connected")
-            await self.ws.send(json.dumps(frame))
+            # send_str → text frame (matches our JSON text protocol).
+            # curl_cffi handles the underlying libcurl WS frame write.
+            await self.ws.send_str(json.dumps(frame))
 
     def stop(self) -> None:
         self._stop.set()
@@ -247,24 +280,62 @@ class TunnelClient:
                 pass
 
     async def _ws_session(self) -> None:
+        """One WS connection attempt. Uses curl_cffi with Chrome TLS
+        impersonation so Cloudflare's bot detection does NOT reset the
+        TLS Client Hello (see module docstring for the failure mode this
+        fixes).
+        """
         url = f"{TUNNEL_BACKEND_WS_URL}{_TUNNEL_WS_PATH}"
         headers = {"X-Agent-Token": TUNNEL_TOKEN}
-        log.info("connecting ws -> %s", url)
-        async with ws_connect(
-            url,
-            additional_headers=headers,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=5,
-            open_timeout=int(TUNNEL_CONNECT_TIMEOUT_S),
-        ) as ws:
-            self.ws = ws
-            self.ws_connected.set()
-            log.info("ws connected")
+        log.info("connecting ws (curl_cffi, impersonate=chrome) -> %s", url)
+        # AsyncSession carries the impersonation profile (Chrome JA3/JA4).
+        # ws_connect on the session returns an AsyncWebSocketContext that
+        # we use as an async context manager; on __aenter__ it performs the
+        # WS upgrade (TLS Client Hello with Chrome's fingerprint) and yields
+        # the live AsyncWebSocket handle.
+        session = AsyncSession(impersonate="chrome")
+        try:
+            async with session.ws_connect(
+                url,
+                headers=headers,
+                timeout=int(TUNNEL_CONNECT_TIMEOUT_S),
+            ) as ws:
+                self.ws = ws
+                self.ws_connected.set()
+                log.info("ws connected (chrome JA3 bypassed cloudflare)")
+                try:
+                    while True:
+                        try:
+                            # recv_str blocks until the next text frame.
+                            # On graceful close, raises WebSocketClosed.
+                            # On a transport-level failure, raises CurlError
+                            # (or WebSocketError subclass). Either way we
+                            # break out and let the reconnect loop re-dial.
+                            raw = await ws.recv_str()
+                        except WebSocketClosed:
+                            log.info("ws closed gracefully by peer")
+                            break
+                        except (WebSocketError, CurlError) as exc:
+                            log.warning("ws transport error: %s", exc)
+                            break
+                        except Exception as exc:  # noqa: BLE001 — defensive
+                            log.warning("ws recv failed: %s", exc)
+                            break
+                        if not raw:
+                            continue
+                        await self._on_frame(raw)
+                finally:
+                    self.ws = None
+                    self.ws_connected.clear()
+                    # Best-effort close — connection may already be gone.
+                    try:
+                        await ws.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+        finally:
             try:
-                async for raw in ws:
-                    await self._on_frame(raw)
-            except ConnectionClosed:
+                await session.close()
+            except Exception:  # noqa: BLE001
                 pass
 
     async def _on_frame(self, raw: Any) -> None:

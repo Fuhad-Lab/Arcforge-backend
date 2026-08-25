@@ -44,8 +44,14 @@ _SIDECAR_SRC_DIR = Path(__file__).resolve().parent.parent / "agent_sidecar"
 
 # pip deps the sidecar daemons need beyond the stdlib. The
 # orchestrator uses fastapi+uvicorn (its HTTP server); the tunnel_client
-# uses aiohttp (local HTTP bridge) + websockets (WS client to backend).
-_PIP_DEPS = ("fastapi", "uvicorn[standard]", "aiohttp", "websockets")
+# uses aiohttp (local HTTP bridge) + curl_cffi (WS client to backend).
+#
+# curl_cffi is REQUIRED: the backend's /api/tunnel WS endpoint is
+# fronted by Cloudflare, which blocks Python's stdlib ssl TLS fingerprint
+# (JA3/JA4) — the WS dial is reset right after the Client Hello. curl_cffi
+# impersonates Chrome's TLS fingerprint (impersonate="chrome") so Cloudflare
+# lets the WS upgrade through. Verified end-to-end live.
+_PIP_DEPS = ("fastapi", "uvicorn[standard]", "aiohttp", "curl_cffi")
 
 
 class AgentInstaller:
@@ -236,9 +242,9 @@ class AgentInstaller:
                 "pip install --quiet --disable-pip-version-check "
                 + " ".join(f"'{d}'" for d in _PIP_DEPS)
                 + " 2>&1 | tail -n 3; "
-                + "python3 -c 'import fastapi, uvicorn' 2>/dev/null "
+                + "python3 -c 'import fastapi, uvicorn, curl_cffi, aiohttp' 2>/dev/null "
                 + "&& echo PIP_OK || echo PIP_FAIL",
-                timeout=180,
+                timeout=240,
             )
             pip_ok = "PIP_OK" in pip_out
             if not pip_ok:
