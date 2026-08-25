@@ -43,9 +43,27 @@ export class WebSocketSyncManager {
 
   /**
    * Attach the WebSocket server to an existing HTTP server.
+   *
+   * Uses `noServer: true` + a manual `upgrade` listener that ONLY claims the
+   * `/ws` path. This is critical: the Inbound Reverse Proxy Tunnel
+   * (src/routes/tunnel.ts) also registers an `upgrade` listener for
+   * `/api/tunnel`. If this WSS used server mode (`{ server, path }`) the ws
+   * library would abort non-matching upgrade paths with a 400, breaking the
+   * tunnel handshake. In noServer mode each WS server owns exactly its path
+   * and ignores the rest, so both can coexist on the same HTTP server.
    */
   attach(server: Server): void {
-    this.wss = new WebSocketServer({ server, path: "/ws" });
+    this.wss = new WebSocketServer({ noServer: true });
+
+    server.on("upgrade", (req, socket, head) => {
+      // Only claim OUR path. Everything else (e.g. /api/tunnel) is left for
+      // the other noServer WSS to handle.
+      const path = (req.url || "").split("?")[0];
+      if (path !== "/ws") return;
+      this.wss?.handleUpgrade(req, socket, head, (ws) => {
+        this.wss?.emit("connection", ws, req);
+      });
+    });
 
     this.wss.on("connection", (ws: WebSocket, req) => {
       const userId = req.headers["x-user-id"] as string || "anonymous";

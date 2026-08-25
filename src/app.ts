@@ -12,16 +12,18 @@ const app: Express = express();
 // Create HTTP server for Express + WebSocket
 export const server = createServer(app);
 
-// Attach WebSocket sync on /ws (frontend live-collaboration)
-wsSync.attach(server);
-
-// Attach the Inbound Reverse Proxy Tunnel on /api/tunnel.
+// Attach the Inbound Reverse Proxy Tunnel on /api/tunnel FIRST.
 // The VM opens a long-lived WS here to bypass Daytona's EU-region egress
 // firewall (which blocks *.nvidia.com AND *.onrender.com over TLS). The
 // VM's HTTP requests to localhost:7777 are bridged over this WS, the
 // backend injects the NVIDIA API key server-side, and forwards to NVIDIA.
-// See src/routes/tunnel.ts for the full protocol + rationale.
+// See src/routes/tunnel.ts for the full protocol + rationale. Both this
+// WSS and the /ws WSS below use noServer mode + manual path-filtered
+// upgrade listeners, so each owns exactly its path with no conflict.
 attachTunnelServer(server);
+
+// Attach WebSocket sync on /ws (frontend live-collaboration).
+wsSync.attach(server);
 
 app.use(
   pinoHttp({
