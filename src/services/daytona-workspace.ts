@@ -103,6 +103,40 @@ export async function isSandboxAlive(sandboxId: string): Promise<boolean> {
   return true;
 }
 
+/**
+ * Ensure a live sandbox is RUNNING (not merely existing). Daytona
+ * auto-stops sandboxes after the idle interval — a stopped sandbox keeps
+ * its disk but rejects exec/fs calls. This starts it and waits for the
+ * run state. No-op for already-running sandboxes.
+ */
+export async function ensureSandboxRunning(sandboxId: string): Promise<void> {
+  const sandbox = await daytonaGetSandbox(sandboxId);
+  if (!sandbox) return;
+  const state = String(sandbox.state ?? "").toLowerCase();
+  if (state === "running" || state === "started" || state === "starting") return;
+  if (state === "error" || state === "archived") return; // dead — caller handles
+  try {
+    await fetch(
+      `${daytonaBaseUrl()}/api/v1/sandboxes/${encodeURIComponent(sandboxId)}/start`,
+      { method: "POST", signal: AbortSignal.timeout(120_000) },
+    );
+    // Wait for the running state (up to ~60s).
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3_000));
+      const check = await daytonaGetSandbox(sandboxId);
+      const s = String(check?.state ?? "").toLowerCase();
+      if (s === "running" || s === "started") return;
+      if (s === "error" || s === "archived") return;
+    }
+  } catch (err: unknown) {
+    logger.warn(
+      { sandboxId, err: err instanceof Error ? err.message : err },
+      "ensureSandboxRunning: start attempt failed (continuing)",
+    );
+  }
+}
+
 // ─── WORKSPACE LIFECYCLE ───────────────────────────────────────────────────
 
 /** Daytona accepts only python|typescript|javascript — normalize legacy names. */
@@ -347,6 +381,9 @@ export async function ensureProjectSandbox(
 ): Promise<EnsuredSandbox> {
   // 1. Reuse the existing sandbox when it is still alive.
   if (row.sandbox_id && (await isSandboxAlive(row.sandbox_id))) {
+    // Daytona auto-stops idle sandboxes — a stopped sandbox keeps its disk
+    // but rejects exec/fs. Start it before reuse.
+    await ensureSandboxRunning(row.sandbox_id);
     const tree = await getWorkspaceFileTree(row.sandbox_id);
     return {
       sandbox_id: row.sandbox_id,

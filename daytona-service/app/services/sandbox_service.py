@@ -38,6 +38,31 @@ from app.models import (
 logger = logging.getLogger(__name__)
 
 
+# SDK lowercase state -> service enum. Unmapped states become UNKNOWN
+# (NEVER Error — an unknown state must not read as a dead sandbox).
+_STATE_MAP: dict[str, SandboxState] = {
+    "creating": SandboxState.CREATING,
+    "restoring": SandboxState.CREATING,
+    "building_snapshot": SandboxState.CREATING,
+    "pending_build": SandboxState.CREATING,
+    "pulling_snapshot": SandboxState.CREATING,
+    "started": SandboxState.RUNNING,
+    "starting": SandboxState.STARTING,
+    "resuming": SandboxState.STARTING,
+    "stopping": SandboxState.STOPPING,
+    "stopped": SandboxState.STOPPED,
+    "destroying": SandboxState.STOPPED,
+    "destroyed": SandboxState.STOPPED,
+    "pausing": SandboxState.PAUSED,
+    "paused": SandboxState.PAUSED,
+    "error": SandboxState.ERROR,
+    "build_failed": SandboxState.ERROR,
+    "unknown": SandboxState.UNKNOWN,
+    "archiving": SandboxState.ARCHIVED,
+    "archived": SandboxState.ARCHIVED,
+}
+
+
 # ---------------------------------------------------------------------------
 # Create
 # ---------------------------------------------------------------------------
@@ -238,11 +263,14 @@ def _parse_resource_size(val: str | float) -> float:
 
 
 def _to_response(data: dict[str, Any]) -> SandboxResponse:
-    state_str = str(data.get("state", "Unknown"))
-    try:
-        state = SandboxState(state_str.upper())
-    except ValueError:
-        state = SandboxState.ERROR
+    # Normalize the SDK's lowercase states ('started', 'build_failed', ...)
+    # onto this service's enum. The previous code did SandboxState(value.upper())
+    # which NEVER matched (the enum values are Capitalized, not UPPER) and
+    # silently mapped EVERY state — including healthy 'started' sandboxes —
+    # to ERROR. That made the Node backend treat every live sandbox as dead
+    # (breaking sandbox reuse and the agent-info chain).
+    state_str = str(data.get("state", "") or "").lower().strip()
+    state = _STATE_MAP.get(state_str, SandboxState.UNKNOWN)
 
     from datetime import datetime
 
