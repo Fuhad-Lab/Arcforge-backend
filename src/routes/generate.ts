@@ -327,17 +327,13 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
       // emitting the normal `done` event with whatever (possibly empty)
       // files the pipeline managed to produce. The raw error is INTERNAL.
       emit("activity", { label: "Running God Mode pipeline", status: "active", kind: "generate" });
-      // Interim user-facing message — shows up in the chat bubble seconds
-      // before the `done` event fires. Without this, the bubble stays
-      // blank ("the AI only shows 'architect planning, etc.' — no
-      // message" — the user's #1 complaint). The frontend SSE parser
-      // consumes bare `data: {"message": "..."}` lines for this purpose.
-      emitData({
-        message:
-          mode === "single"
-          ? `Building ${appName || "your app"} with ${SINGLE_MODE_MODEL}…`
-          : `Building ${appName || "your app"} with the agent swarm…`,
-      });
+      // NO hardcoded interim message — the user's #1 complaint was that
+      // the chat bubble showed a hardcoded "Building..." string instead of
+      // the AI's actual output. We now emit the AI's real `summary` as a
+      // `delta` event the moment the pipeline returns it (below, after the
+      // pipeline call). The chat bubble stays empty (with the streaming
+      // indicator) until the AI has actually produced something — which is
+      // the honest UX: no fake progress text.
       const pipelineStart = Date.now();
 
       try {
@@ -408,6 +404,25 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
           modelSummary.length > 0
             ? modelSummary
             : synthesizeUserMessage({ prompt, appName, files: synthFiles, mode });
+
+        // ── 4a. STREAM THE AI'S ACTUAL MESSAGE ──────────────────────────
+        // Emit the AI's real summary as a `delta` event the MOMENT the
+        // pipeline returns it — NOT a hardcoded "Building..." string. The
+        // frontend's SSE parser appends `delta` chunks to its raw buffer
+        // and runs `parseLive()` to derive the chat-bubble message. This
+        // is the AI doing its own logging: the text shown is what the
+        // model actually produced, injected by nothing else.
+        if (message.length > 0) {
+          emitData({ delta: message });
+        }
+        // If the pipeline produced code, stream that too as a code fence
+        // so the frontend's `parseLive()` picks it up and renders the
+        // code preview from the AI's actual output (not a backend
+        // synthesis). We wrap it in a ```tsx fence so the parser's
+        // fence-extractor recognises it.
+        if (code && code.length > 0) {
+          emitData({ delta: `\n\n\`\`\`tsx\n${code}\n\`\`\`` });
+        }
 
         // ── 5. VM ORCHESTRATION — write files into the Daytona sandbox ──
         // Failures here must NEVER fail the generation.
