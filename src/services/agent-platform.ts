@@ -1783,6 +1783,19 @@ export class AgentPlatform {
       }
 
       if (RETRYABLE.has(response.status) && attempt < MAX_ATTEMPTS) {
+        // IP-THROTTLE FAIL-FAST: two consecutive 429s despite the 61s-spaced
+        // queue means the provider is throttling this IP (not the quota) —
+        // observed live after a retry storm; NVIDIA per-IP throttles last
+        // far longer than any in-request backoff. Retry within this request
+        // would only feed the storm: abort immediately and let the outer
+        // silent-continue retry (minutes later, through the queue) decide.
+        if (response.status === 429 && attempt >= 2) {
+          logger.error(
+            { model, attempt },
+            "NVIDIA 429 twice through the spaced queue — IP throttle suspected, failing fast",
+          );
+          break;
+        }
         logger.warn(
           { model, attempt, status: response.status, backoffMs: backoffFor(response.status, attempt) },
           "NVIDIA transient failure — retrying with backoff",
