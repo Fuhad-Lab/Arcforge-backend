@@ -50,9 +50,9 @@ import {
   getWorkspaceFileTree,
   parseDataUrl,
   uploadWorkspaceLogo,
-  writeWorkspaceFilesBulk,
 } from "../services/daytona-workspace";
 import { runPostWriteTest, type TestResult } from "../services/feedback-test-runner";
+import { delegateGenerationToVmAgent } from "../services/vm-agent-delegator";
 import { runWithSilentAutoContinue } from "../lib/silent-continue";
 
 const router: IRouter = Router();
@@ -103,9 +103,11 @@ function synthesizeUserMessage(opts: {
 
   const fileCount = files.length;
   if (fileCount === 0) {
-    // No files produced (degraded / failed pipeline) — still ship a real,
-    // user-facing message so the chat bubble is never blank.
-    return `Done — I scaffolded ${subject} with the ${mode === "single" ? SINGLE_MODE_MODEL : "swarm"} pipeline. Open the preview to try it.`;
+    // HONEST: no files were produced. Do NOT claim success. Tell the user the
+    // generation produced nothing so they can retry or check the activity log.
+    // (Previous behaviour returned "Done — I scaffolded ..." which was a lie
+    //  that hid pipeline failures from the user.)
+    return `Generation produced no files — the build pipeline did not complete. Check the activity log for the failure reason, then retry.`;
   }
 
   // Top 5 file basenames so the user sees concrete artifacts, not just a count.
@@ -320,172 +322,116 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
       }
 
       // ── 4. GOD MODE PIPELINE ──────────────────────────────────────────
-      // Silent auto-continue: if the God Mode pipeline fails mid-way (any
-      // LLM call in the swarm — architect, developers, debugger), retry
-      // silently up to 3 times. The user NEVER sees "the AI stopped" — on
-      // final failure we construct a degraded empty result and continue
-      // emitting the normal `done` event with whatever (possibly empty)
-      // files the pipeline managed to produce. The raw error is INTERNAL.
-      emit("activity", { label: "Running God Mode pipeline", status: "active", kind: "generate" });
-      // NO hardcoded interim message — the user's #1 complaint was that
-      // the chat bubble showed a hardcoded "Building..." string instead of
-      // the AI's actual output. We now emit the AI's real `summary` as a
-      // `delta` event the moment the pipeline returns it (below, after the
-      // pipeline call). The chat bubble stays empty (with the streaming
-      // indicator) until the AI has actually produced something — which is
-      // the honest UX: no fake progress text.
+      // ── 4. PROVISION SANDBOX + DELEGATE TO IN-VM AGENT (via reverse-tunnel) ─
+      // REPLACES the old host-side `agentPlatform.runPipeline()` +
+      // `writeWorkspaceFilesBulk()` path. First-gen now flows through the
+      // reverse-tunnel architecture: backend dials INTO the VM via the
+      // signed daytonaproxy01.eu URL, the in-VM orchestrator runs
+      // architect → developer → write_files → debugger, every llm_chat
+      // goes through the tunnel (backend forwards to NVIDIA, streams res
+      // back). Files are written NATIVELY in the VM by _write_files — no
+      // host-side writeWorkspaceFilesBulk. The LLM round-trip now uses the
+      // tunnel (the user's prescribed architecture), not host-side NVIDIA.
+      let sandboxId: string | null = null;
+      let sandboxTree: unknown = null;
+      let testResult: TestResult | null = null;
+      let auditStatus: "passed" | "failed" | "skipped" = "skipped";
+      let auditIterations = 0;
+      let auditFailures: string[] = [];
+      let productionReady = false;
+      let logoUploaded = false;
+
+      let message = "";
+      let code = "";
+      const synthFiles: { path: string; content: string }[] = [];
+
       const pipelineStart = Date.now();
 
       try {
-        const pipelineAttempt = await runWithSilentAutoContinue(
-          async () => agentPlatform.runPipeline(project),
-          { label: "God Mode pipeline", maxRetries: 3, baseDelayMs: 3000 },
-        );
-        const result = pipelineAttempt.ok && pipelineAttempt.result
-          ? pipelineAttempt.result
-          : {
-              // Degraded empty result — the success path below handles
-              // empty files / empty codebase gracefully (synthFiles
-              // fallback, empty code string, etc).
-              status: "failed" as const,
-              attempts: pipelineAttempt.retries,
-              diagnostics: [],
-              codebase: project.codebase,
-              messages: project.messages,
-              skillsUsed: project.skillsUsed ?? [],
-              phasesCompleted: project.phasesCompleted ?? [],
-              negotiationRounds: 0,
-            };
-        const duration = Date.now() - pipelineStart;
+        if (dbProject && isSupabaseConfigured()) {
+          // 4a. Provision the sandbox FIRST (the in-VM agent needs a live VM).
+          emit("activity", { label: "Provisioning sandbox", status: "active", kind: "generate" });
+          const row = (await dbGetProject(dbProject.id)) ?? dbProject;
+          const ensured = await ensureProjectSandbox(
+            {
+              id: row.id,
+              user_id: row.user_id,
+              logo_url: row.logo_url,
+              sandbox_id: row.sandbox_id,
+            },
+            {
+              language: "nodejs",
+              saveSandboxId: async (newSandboxId) => {
+                await dbUpdateProject(row.id, { sandbox_id: newSandboxId });
+              },
+            },
+          );
+          sandboxId = ensured.sandbox_id;
+          logoUploaded = ensured.logo_uploaded;
+          emit("activity", { label: "Sandbox provisioned", status: "done", kind: "generate" });
 
-        if (result.phasesCompleted) {
-          for (const phase of result.phasesCompleted) {
+          // 4b. DELEGATE the generation to the in-VM agent (via reverse-tunnel).
+          // The backend POSTs the prompt to the VM's /prompt endpoint; the
+          // orchestrator runs architect → developer → write_files → debugger
+          // (every llm_chat flows through the reverse-tunnel). Files are
+          // written natively in the VM — no host-side writeWorkspaceFilesBulk.
+          emit("activity", { label: "Running in-VM pipeline (via reverse-tunnel)", status: "active", kind: "generate" });
+          try {
+            const delegation = await delegateGenerationToVmAgent({
+              sandboxId,
+              prompt,
+              emit,
+            });
+            const duration = Date.now() - pipelineStart;
+            if (delegation.status === "done") {
+              message = delegation.summary || "Build complete.";
+              emit("activity", {
+                label: `In-VM pipeline complete (${duration}ms)`,
+                status: "done",
+                kind: "generate",
+              });
+            } else {
+              message = delegation.errorMessage
+                ? `Generation failed: ${delegation.errorMessage}`
+                : "Generation failed — see activity log.";
+              emit("activity", {
+                label: "In-VM pipeline failed",
+                status: "done",
+                kind: "generate",
+                detail: delegation.errorMessage || "",
+              });
+            }
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            message = `Generation failed: ${errorMessage}`;
+            logger.error(
+              { sandboxId, err: errorMessage },
+              "in-VM delegation threw",
+            );
             emit("activity", {
-              label: `${phase.charAt(0).toUpperCase() + phase.slice(1)} phase complete`,
+              label: "In-VM pipeline failed (exception)",
               status: "done",
               kind: "generate",
+              detail: errorMessage,
             });
           }
-        }
 
-        if (result.skillsUsed) {
-          for (const skill of result.skillsUsed) {
-            emit("activity", { label: `Skill: ${skill}`, status: "done", kind: "skill" });
+          // 4c. STREAM THE AI'S ACTUAL MESSAGE (or honest failure). Never a
+          // hardcoded "Done." — the text is the in-VM agent's real summary,
+          // or the real failure reason. The frontend's SSE parser appends
+          // `delta` chunks to its raw buffer and runs `parseLive()` to
+          // derive the chat-bubble message.
+          if (message.length > 0) {
+            emitData({ delta: message });
           }
-        }
-
-        const files = project.codebase.files || [];
-        // Single-mode pipeline returns backend/frontend STRINGS instead of a
-        // files array — map them into the mandatory workspace structure:
-        //   backend  → /workspace/backend/app.py
-        //   frontend → /workspace/frontend/App.tsx
-        const synthFiles = [...files];
-        if (synthFiles.length === 0) {
-          if (project.codebase.backend) {
-            synthFiles.push({ path: "backend/app.py", content: project.codebase.backend });
+          if (code && code.length > 0) {
+            emitData({ delta: `\n\n\`\`\`tsx\n${code}\n\`\`\`` });
           }
-          if (project.codebase.frontend) {
-            synthFiles.push({ path: "frontend/App.tsx", content: project.codebase.frontend });
-          }
-        }
-        const mainCode = synthFiles.find((f) => f.path.includes("page.tsx"));
-        const code = mainCode ? mainCode.content : (synthFiles.length > 0 ? synthFiles[synthFiles.length - 1].content : "");
 
-        const thinking = `God Mode ${mode} pipeline completed in ${duration}ms. Files: ${synthFiles.map((f) => f.path).join(", ")}`;
-        // The user-facing message — guaranteed non-empty. The model may
-        // have provided its own 1-2 sentence `summary` (single mode asks
-        // for one in its JSON output); when present we prefer it. When
-        // absent, we synthesize a real summary from the prompt + files
-        // so the chat bubble is never blank (the user's #1 complaint:
-        // "the AI only shows 'architect planning, etc.' — no message").
-        const modelSummary =
-          typeof result.message === "string" ? result.message.trim() : "";
-        const message =
-          modelSummary.length > 0
-            ? modelSummary
-            : synthesizeUserMessage({ prompt, appName, files: synthFiles, mode });
-
-        // ── 4a. STREAM THE AI'S ACTUAL MESSAGE ──────────────────────────
-        // Emit the AI's real summary as a `delta` event the MOMENT the
-        // pipeline returns it — NOT a hardcoded "Building..." string. The
-        // frontend's SSE parser appends `delta` chunks to its raw buffer
-        // and runs `parseLive()` to derive the chat-bubble message. This
-        // is the AI doing its own logging: the text shown is what the
-        // model actually produced, injected by nothing else.
-        if (message.length > 0) {
-          emitData({ delta: message });
-        }
-        // If the pipeline produced code, stream that too as a code fence
-        // so the frontend's `parseLive()` picks it up and renders the
-        // code preview from the AI's actual output (not a backend
-        // synthesis). We wrap it in a ```tsx fence so the parser's
-        // fence-extractor recognises it.
-        if (code && code.length > 0) {
-          emitData({ delta: `\n\n\`\`\`tsx\n${code}\n\`\`\`` });
-        }
-
-        // ── 5. VM ORCHESTRATION — write files into the Daytona sandbox ──
-        // Failures here must NEVER fail the generation.
-        let sandboxId: string | null = null;
-        let sandboxTree: unknown = null;
-        // Module 2 test-runner result — hoisted out of the sandbox block
-        // so the `done` event always has access to it even when no
-        // sandbox ran (test_result stays null in that case).
-        let testResult: TestResult | null = null;
-        // Module 4 audit payload — hoisted out of the sandbox block so the
-        // `done` event always has access to it even when no sandbox ran
-        // (status stays "skipped" with 0 iterations in that case).
-        let auditStatus: "passed" | "failed" | "skipped" = "skipped";
-        let auditIterations = 0;
-        let auditFailures: string[] = [];
-        let productionReady = false;
-        if (dbProject && isSupabaseConfigured()) {
+          // Wrap Module 2 + Module 4 + file-tree + sandbox event in a try
+          // so a failure in any of them degrades gracefully (the catch at
+          // the bottom clears sandboxId and continues to the done event).
           try {
-            emit("activity", { label: "Writing files into VM", status: "active", kind: "generate" });
-
-            // Fresh row (sandbox_id / logo_url may have changed since linkage).
-            const row = (await dbGetProject(dbProject.id)) ?? dbProject;
-
-            // 5a. Ensure a live sandbox exists (reuses the project's VM,
-            // re-provisions when missing/dead, uploads logo on creation and
-            // persists the new sandbox_id to projects.sandbox_id).
-            const ensured = await ensureProjectSandbox(
-              {
-                id: row.id,
-                user_id: row.user_id,
-                logo_url: row.logo_url,
-                sandbox_id: row.sandbox_id,
-              },
-              {
-                language: "nodejs",
-                saveSandboxId: async (newSandboxId) => {
-                  await dbUpdateProject(row.id, { sandbox_id: newSandboxId });
-                },
-              },
-            );
-            sandboxId = ensured.sandbox_id;
-            let logoUploaded = ensured.logo_uploaded;
-
-            // 5b. Write every generated file into the VM, routing by path:
-            //   backend/**  → /workspace/backend/**
-            //   frontend/** → /workspace/frontend/**
-            //   anything else (swarm-mode raw paths) → /workspace/frontend/**
-            if (synthFiles.length > 0) {
-              await writeWorkspaceFilesBulk(
-                sandboxId,
-                synthFiles.map((f) => {
-                  const rel = f.path.replace(/^\/+/, "");
-                  if (rel.startsWith("backend/")) {
-                    return { path: `/workspace/${rel}`, content: f.content };
-                  }
-                  if (rel.startsWith("frontend/")) {
-                    return { path: `/workspace/${rel}`, content: f.content };
-                  }
-                  return { path: `/workspace/frontend/${rel}`, content: f.content };
-                }),
-              );
-            }
-
             // 5b-post. MODULE 2 — Automated Feedback Test Runner.
             // Run an in-VM test / health-check / syntax check on the
             // freshly-written code and capture stdout/stderr/HTTP status
@@ -732,6 +678,8 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         }
 
         // ── 7. Done ──────────────────────────────────────────────────────
+        const duration = Date.now() - pipelineStart;
+        const thinking = `In-VM pipeline via reverse-tunnel (${mode} mode). Sandbox: ${sandboxId ?? "none"}.`;
         emit("done", {
           projectId: dbProjectId,
           thinking,
@@ -739,8 +687,8 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
           code,
           actions: synthFiles.map((f) => ({ label: `Creating ${f.path}`, type: "create", path: f.path })),
           files: synthFiles.map((f) => ({ path: f.path, action: "create", content: f.content })),
-          model: result.model || "god-mode",
-          skillsUsed: result.skillsUsed || [],
+          model: mode === "single" ? SINGLE_MODE_MODEL : "god-mode",
+          skillsUsed: [],
           duration_ms: duration,
           sandbox_id: sandboxId,
           tree: sandboxTree,

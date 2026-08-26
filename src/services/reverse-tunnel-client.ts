@@ -64,12 +64,25 @@ import { logger } from "../lib/logger";
 // ─── Configuration ──────────────────────────────────────────────────────
 /** Path on the VM's orchestrator (port 9000) where this service dials in. */
 const REVERSE_TUNNEL_PATH = "/reverse-tunnel";
-/** Max reconnect attempts before giving up. */
-const MAX_RETRIES = 30;
-/** Backoff schedule (seconds) — caps at the last value. */
-const BACKOFF_SEC = [1, 2, 5, 10, 30];
-/** Idle ping interval (ms) — if no frame received in this time, ping. */
-const IDLE_PING_MS = 60_000;
+/**
+ * NEVER give up. There is no max-retry cap.
+ *
+ * The previous cap (MAX_RETRIES=30) retired a live sandbox's bridge after
+ * 30 close events, creating a silent dead window until the next
+ * agent-info call re-triggered ensureReverseTunnel. With Render services
+ * on Uptime Robot (never sleep), every close is a transient (Daytona
+ * proxy idle timeout, VM orchestrator restart, network blip) that
+ * recovers on the next dial. Keep reconnecting forever with the backoff
+ * schedule below; a truly-dead VM fails harmlessly on each dial attempt.
+ */
+const BACKOFF_SEC = [1, 2, 5, 10, 30, 30, 30, 60];
+/**
+ * Ping every 15s (was 60s). The Daytona preview proxy closes idle WS
+ * connections on its own schedule (shorter than 60s), which caused
+ * silent drops before the keepalive ping could fire. 15s keeps the
+ * proxy from idle-closing the connection.
+ */
+const IDLE_PING_MS = 15_000;
 /** Pong timeout (ms) — if no pong after this, terminate the connection. */
 const PONG_TIMEOUT_MS = 30_000;
 
@@ -327,19 +340,15 @@ function dialOnce(conn: ReverseTunnelConnection): void {
     }
     conn.ws = null;
     conn.connecting = false;
-    if (conn.retries >= MAX_RETRIES) {
-      logger.warn(
-        { sandboxId: conn.sandboxId, retries: conn.retries },
-        "reverse-tunnel: max retries reached — giving up (a future agent-info call will re-trigger)",
-      );
-      connections.delete(conn.sandboxId);
-      return;
-    }
+    // NEVER give up — keep reconnecting forever (see BACKOFF_SEC comment).
+    // Render services are on Uptime Robot (never sleep); every close is a
+    // transient that recovers on the next dial. The previous cap retired
+    // live bridges after 30 closes — this reconnect loop now runs forever.
     const delaySec = BACKOFF_SEC[Math.min(conn.retries, BACKOFF_SEC.length - 1)];
     conn.retries += 1;
     logger.info(
       { sandboxId: conn.sandboxId, delaySec, attempt: conn.retries },
-      "reverse-tunnel: closed — scheduling reconnect",
+      "reverse-tunnel: closed — scheduling reconnect (no max-retry cap)",
     );
     setTimeout(() => {
       // Re-check that we haven't been retired in the meantime.
@@ -368,16 +377,41 @@ export function ensureReverseTunnel(sandboxId: string, signedUrl: string | null 
   }
   const existing = connections.get(sandboxId);
   if (existing) {
-    // Already connected (or trying) — no-op. If the signed URL has
-    // changed (rare — only if the sandbox was recreated), update it
-    // so the next reconnect uses the new URL.
-    if (existing.signedBaseUrl !== signedUrl) {
-      existing.signedBaseUrl = signedUrl;
-      logger.info(
-        { sandboxId, newUrl: signedUrl },
-        "reverse-tunnel: signed URL changed — next reconnect will use the new URL",
-      );
+    const isOpen = !!existing.ws && existing.ws.readyState === WebSocket.OPEN;
+    if (isOpen) {
+      // Live connection — no-op. If the signed URL changed (rare — only if
+      // the sandbox was recreated), update it so the next reconnect uses
+      // the new URL.
+      if (existing.signedBaseUrl !== signedUrl) {
+        existing.signedBaseUrl = signedUrl;
+        logger.info(
+          { sandboxId, newUrl: signedUrl },
+          "reverse-tunnel: signed URL changed — next reconnect will use the new URL",
+        );
+      }
+      return;
     }
+    // WS is dead/closed but the entry lingers in the Map. The previous
+    // code was a no-op here, which meant a dropped bridge stayed dead
+    // until the backoff timer fired (or forever if the timer had already
+    // fired and the entry was stale). Force a fresh dial NOW so the bridge
+    // recovers immediately on the next agent-info call.
+    if (existing.connecting) {
+      // A dial is already in flight (either the initial dial or a
+      // scheduled reconnect). Let it complete — don't pile on.
+      if (existing.signedBaseUrl !== signedUrl) {
+        existing.signedBaseUrl = signedUrl;
+      }
+      return;
+    }
+    logger.info(
+      { sandboxId },
+      "reverse-tunnel: existing entry has a dead WS — forcing fresh dial now",
+    );
+    existing.signedBaseUrl = signedUrl;  // refresh URL in case it changed
+    existing.retries = 0;                 // reset — this is a new attempt
+    existing.connecting = true;
+    dialOnce(existing);
     return;
   }
   const conn: ReverseTunnelConnection = {
