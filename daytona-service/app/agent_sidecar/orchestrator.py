@@ -1290,29 +1290,31 @@ class TaskWorker(threading.Thread):
                 app_port = NEXT_DEV_PORT
                 shell("npm install --no-audit --no-fund --loglevel=error",
                       fe, "debugger", 600)
-                already_up = _probe_up(NEXT_DEV_PORT)
-                if not already_up:
-                    # Kill any stale server on the port first (a previous
-                    # generation's next dev may still hold it).
-                    shell(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1",
-                          fe, "debugger", 15)
-                    shell(
-                        f"nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
-                        f"> /tmp/frontend-dev.log 2>&1 < /dev/null &",
-                        fe, "debugger", 20,
+                # ALWAYS restart the dev server on a new generation: a
+                # server left over from a previous generation holds a
+                # stale module graph (files were rewritten underneath it)
+                # and serves cached 500s. Purge the stale build cache and
+                # any leftover files' ghosts too.
+                shell(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1",
+                      fe, "debugger", 15)
+                shell("rm -rf .next node_modules/.cache", fe, "debugger", 30)
+                shell(
+                    f"nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
+                    f"> /tmp/frontend-dev.log 2>&1 < /dev/null &",
+                    fe, "debugger", 20,
+                )
+                # Next dev cold-boots + compiles the first route on the
+                # first request — give it room, then warm it with a real
+                # request so the first user page load is fast.
+                for _ in range(4):
+                    shell("sleep 5", fe, "debugger", 10)
+                    warm = shell(
+                        f"curl -s -o /dev/null -w '%{{http_code}}' "
+                        f"http://localhost:{NEXT_DEV_PORT}/ --max-time 20",
+                        fe, "debugger", 30,
                     )
-                    # Next dev cold-boots + compiles the first route on the
-                    # first request — give it room, then warm it with a real
-                    # request so the first user page load is fast.
-                    for _ in range(4):
-                        shell("sleep 5", fe, "debugger", 10)
-                        warm = shell(
-                            f"curl -s -o /dev/null -w '%{{http_code}}' "
-                            f"http://localhost:{NEXT_DEV_PORT}/ --max-time 20",
-                            fe, "debugger", 30,
-                        )
-                        if str(warm.get("stdout", "")).strip().startswith(("2", "3")):
-                            break
+                    if str(warm.get("stdout", "")).strip().startswith(("2", "3")):
+                        break
             else:
                 # Legacy Vite app — serve on the Vite port as before.
                 app_port = VITE_DEV_PORT
