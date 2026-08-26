@@ -132,7 +132,7 @@ async function enqueueVmTask(url: string, token: string, prompt: string): Promis
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Agent-Token": token,
+        "Authorization": `Bearer ${token}`,
       },
       body: JSON.stringify({ message: prompt }),
       signal: controller.signal,
@@ -162,7 +162,7 @@ async function fetchVmStatus(url: string, token: string): Promise<{
   const t = setTimeout(() => controller.abort(), VM_HTTP_TIMEOUT_MS);
   try {
     const res = await fetch(`${url}/status`, {
-      headers: { "X-Agent-Token": token },
+      headers: { "Authorization": `Bearer ${token}` },
       signal: controller.signal,
     });
     if (!res.ok) {
@@ -184,7 +184,7 @@ async function fetchVmHistory(url: string, token: string): Promise<Array<{
   const t = setTimeout(() => controller.abort(), VM_HTTP_TIMEOUT_MS);
   try {
     const res = await fetch(`${url}/history`, {
-      headers: { "X-Agent-Token": token },
+      headers: { "Authorization": `Bearer ${token}` },
       signal: controller.signal,
     });
     if (!res.ok) {
