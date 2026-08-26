@@ -1061,8 +1061,12 @@ class TaskWorker(threading.Thread):
             "@types/react-dom 18.3.0 (scripts dev=\"next dev\"); "
             "tsconfig.json (Next 14 standard JSX setup — REQUIRED, its "
             "absence crashes next dev); next.config.mjs; app/layout.tsx; "
-            "app/page.tsx; app/globals.css; and at most 3-4 "
-            "additional component/lib files. NO comments, NO blank-line "
+            "app/page.tsx; and at most 3-4 additional component/lib files. "
+            "STYLES: do NOT create any .css file and do NOT import css — "
+            "put ALL global styles in ONE <style> tag inside "
+            "app/layout.tsx's <head> and use inline style props in "
+            "components (the css pipeline is deliberately bypassed). "
+            "NO comments, NO blank-line "
             "padding — every line must carry code. NO create-react-app, NO "
             "Vite, NO index.html — Next.js only. "
             "BACKEND (YOUR CHOICE): only if the app truly needs a server, "
@@ -1102,7 +1106,8 @@ class TaskWorker(threading.Thread):
             "You are the Developer of ArcForge planning file layout. The "
             "frontend MUST be Next.js 14 App Router (TypeScript, tsconfig.json "
             "REQUIRED, deps pinned next 14.2.35 / react 18.3.1 / typescript "
-            "5.5.4) under 'frontend/'; the backend language is YOUR choice "
+            "5.5.4, NO .css files — all styles inline/<style>-tag only) "
+            "under 'frontend/'; the backend language is YOUR choice "
             "when needed (under 'backend/'). Reply with ONLY a JSON object: "
             '{"summary": "<one line>", "files": ['
             '{"path": "frontend/app/page.tsx", "purpose": "<what it contains, precisely>"}'
@@ -1265,16 +1270,27 @@ class TaskWorker(threading.Thread):
                 is_next = "next" in deps or any(p.endswith("next.config.mjs") or p.endswith("next.config.js") for p in [f["path"] for f in written])
             except Exception:
                 is_next = False
+            def _probe_up(port: int) -> bool:
+                """Is something already serving on `port`? Pure check — a
+                down server before launch is EXPECTED, never a failure."""
+                try:
+                    proc = subprocess.run(
+                        f"curl -s -o /dev/null -w '%{{http_code}}' "
+                        f"http://localhost:{port}/ --max-time 3",
+                        shell=True, cwd=fe, capture_output=True, text=True,
+                        timeout=10,
+                    )
+                    append_log(task_id, "debugger", "info",
+                               f"probe :{port} -> {str(proc.stdout or '').strip()}")
+                    return str(proc.stdout or "").strip().startswith(("2", "3"))
+                except Exception:
+                    return False
+
             if is_next:
                 app_port = NEXT_DEV_PORT
                 shell("npm install --no-audit --no-fund --loglevel=error",
                       fe, "debugger", 600)
-                probe = shell(
-                    f"curl -s -o /dev/null -w '%{{http_code}}' "
-                    f"http://localhost:{NEXT_DEV_PORT}/ --max-time 3",
-                    fe, "debugger", 10,
-                )
-                already_up = str(probe.get("stdout", "")).strip().startswith(("2", "3"))
+                already_up = _probe_up(NEXT_DEV_PORT)
                 if not already_up:
                     # Kill any stale server on the port first (a previous
                     # generation's next dev may still hold it).
@@ -1302,12 +1318,7 @@ class TaskWorker(threading.Thread):
                 app_port = VITE_DEV_PORT
                 shell("npm install --no-audit --no-fund --loglevel=error",
                       fe, "debugger", 300)
-                probe = shell(
-                    f"curl -s -o /dev/null -w '%{{http_code}}' "
-                    f"http://localhost:{VITE_DEV_PORT}/ --max-time 2",
-                    fe, "debugger", 10,
-                )
-                already_up = str(probe.get("stdout", "")).strip().startswith(("2", "3"))
+                already_up = _probe_up(VITE_DEV_PORT)
                 if not already_up:
                     # Launch detached — the dev server outlives the daemon AND
                     # every WebSocket client.
