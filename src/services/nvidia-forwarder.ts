@@ -185,25 +185,74 @@ export async function* forwardToNvidia(
   const hasBody =
     bodyString && method.toUpperCase() !== "GET" && method.toUpperCase() !== "HEAD";
 
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: method.toUpperCase(),
-      headers: outboundHeaders,
-      body: hasBody ? bodyString : undefined,
-      // 15 min cap — Nemotron-3.5-lightning is a reasoning model; a 16384-token
-      // developer-phase generation (full app as JSON) takes ~6-10 min once
-      // reasoning + code are both produced. The previous 5-min cap aborted
-      // mid-stream, the VM retried, and every retry hit the same 5-min wall —
-      // the generation never completed. 15 min gives the reasoning model room
-      // to finish without the backend killing the fetch.
-      signal: AbortSignal.timeout(900_000),
-    });
-  } catch (err) {
+  // Retry connect-level failures ("fetch failed" — DNS blips, TLS
+  // handshake timeouts, TCP resets). integrate.api.nvidia.com regularly
+  // takes 10s+ even for tiny completions and intermittently fails the
+  // FIRST connect attempt from Render; a single transient failure used
+  // to abort the whole in-VM generation (surfaced to users as
+  // "reverse-tunnel: NVIDIA upstream unreachable: fetch failed").
+  // Safe because we retry ONLY before any chunk is yielded — the caller
+  // has received nothing yet, so re-sending the request cannot
+  // duplicate output. Non-2xx responses are NOT retried (those are the
+  // upstream's real answer — quota/auth/model errors must surface).
+  const CONNECT_ATTEMPTS = 3;
+  const BACKOFF_MS = [750, 2_000];
+
+  /** Extract undici's real failure reason from err.cause (the old code
+   *  logged only "fetch failed", hiding the actual errno and making
+   *  incidents undiagnosable). */
+  const causeMessage = (err: unknown): string => {
+    const cause = (err as { cause?: unknown } | null)?.cause;
+    if (cause instanceof Error) {
+      const code = (cause as { code?: unknown }).code;
+      return code ? `${cause.message} (${String(code)})` : cause.message;
+    }
+    return cause !== undefined ? String(cause) : "";
+  };
+
+  let response: Response | null = null;
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+    try {
+      response = await fetch(url, {
+        method: method.toUpperCase(),
+        headers: outboundHeaders,
+        body: hasBody ? bodyString : undefined,
+        // 15 min cap — Nemotron-3.5-lightning is a reasoning model; a 16384-token
+        // developer-phase generation (full app as JSON) takes ~6-10 min once
+        // reasoning + code are both produced. The previous 5-min cap aborted
+        // mid-stream, the VM retried, and every retry hit the same 5-min wall —
+        // the generation never completed. 15 min gives the reasoning model room
+        // to finish without the backend killing the fetch.
+        signal: AbortSignal.timeout(900_000),
+      });
+      break; // connect + status line received — stop retrying
+    } catch (err) {
+      lastErr = err;
+      const message = err instanceof Error ? err.message : "unknown fetch failure";
+      const causeMsg = causeMessage(err);
+      if (attempt < CONNECT_ATTEMPTS) {
+        logger.warn(
+          { err: message, cause: causeMsg, url, method, attempt, nextRetryInMs: BACKOFF_MS[attempt - 1] },
+          "nvidia-forwarder: connect failed — retrying",
+        );
+        await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt - 1]));
+      } else {
+        logger.warn(
+          { err: message, cause: causeMsg, url, method, attempt },
+          "nvidia-forwarder: fetch failed (all attempts exhausted)",
+        );
+      }
+    }
+  }
+
+  if (!response) {
     const message =
-      err instanceof Error ? err.message : "unknown fetch failure";
-    logger.warn({ err: message, url, method }, "nvidia-forwarder: fetch failed");
-    throw new Error(`NVIDIA upstream unreachable: ${message}`);
+      lastErr instanceof Error ? lastErr.message : "unknown fetch failure";
+    const causeMsg = causeMessage(lastErr);
+    throw new Error(
+      `NVIDIA upstream unreachable: ${message}${causeMsg ? ` (cause: ${causeMsg})` : ""}`,
+    );
   }
 
   // Non-2xx: throw before yielding head. The caller will send an
