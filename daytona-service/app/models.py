@@ -238,7 +238,7 @@ class AgentLlmConfig(BaseModel):
     """
     url: str = Field(default="", description="OpenAI-compatible chat-completions URL")
     key: str = Field(default="", description="API key (Bearer)")
-    model: str = Field(default="llama-3.3-70b-versatile", description="Model id")
+    model: str = Field(default="openai/gpt-oss-120b", description="Model id")
 
 
 class SkillInstruction(BaseModel):

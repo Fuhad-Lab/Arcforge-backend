@@ -91,7 +91,7 @@ class AgentInstaller:
         llm = {
             "url": (llm_config or {}).get("url", ""),
             "key": (llm_config or {}).get("key", ""),
-            "model": (llm_config or {}).get("model", "llama-3.3-70b-versatile"),
+            "model": (llm_config or {}).get("model", "openai/gpt-oss-120b"),
         }
         result: dict[str, Any] = {
             "installed": False,

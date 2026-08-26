@@ -168,16 +168,20 @@ export type ProjectState = {
 // GROQ MIGRATION (2026-08-27, user mandate): NVIDIA integrate.api.nvidia.com
 // measured 10s+ per completion with frequent connect blips — the whole
 // pipeline felt slow. Groq serves the same OpenAI-compatible shape at
-// ~10-30x the tokens/sec. Per the user's instruction the code models are
-// Llama-3-70B-class (llama-3.3-70b-versatile) with Qwen-32B as the env-
-// overridable alternate (qwen/qwen3-32b). Both support JSON mode on Groq.
-// Env overrides keep the NVIDIA_* names so existing Render config keeps
-// working; only the defaults changed.
+// ~10-30x the tokens/sec (live-measured 0.85s round-trips via the backend
+// proxy). The user asked for "Llama 3 70B or Qwen 32B" — PROBED LIVE:
+// this Groq account has BOTH lines decommissioned/unavailable
+// (llama-3.3-70b-versatile/qwen3-32b -> model_not_found,
+// llama-3.3-70b-specdec/r1-distill-70b -> model_decommissioned). Best
+// available code model: openai/gpt-oss-120b (120B MoE, JSON-mode capable,
+// reasoning isolated to a separate field so content stays clean); fast
+// alternate openai/gpt-oss-20b. Env overrides keep the NVIDIA_* names so
+// existing Render config keeps working; only the defaults changed.
 const DEFAULT_MODELS: Record<Role, string> = {
-  leader: process.env.NVIDIA_LEADER_MODEL ?? "llama-3.3-70b-versatile",
-  backend: process.env.NVIDIA_BACKEND_MODEL ?? "llama-3.3-70b-versatile",
-  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "qwen/qwen3-32b",
-  debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "llama-3.3-70b-versatile",
+  leader: process.env.NVIDIA_LEADER_MODEL ?? "openai/gpt-oss-120b",
+  backend: process.env.NVIDIA_BACKEND_MODEL ?? "openai/gpt-oss-120b",
+  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "openai/gpt-oss-120b",
+  debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "openai/gpt-oss-20b",
 };
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -185,9 +189,11 @@ const DEFAULT_MODELS: Record<Role, string> = {
 // ──────────────────────────────────────────────────────────────────────────
 // The single-agent ("Solo") mode — the config that powers the In-VM sidecar
 // pipeline (handed to the orchestrator daemon at sandbox creation via
-// daytona-workspace) — runs on Groq per the user's mandate: "Llama 3 70B or
-// Qwen 32B" for code. Primary = llama-3.3-70b-versatile (Llama-3-70B class,
-// JSON-mode capable, very fast); alternate = qwen/qwen3-32b via env.
+// daytona-workspace) — runs on Groq per the user's mandate (speed). The
+// requested "Llama 3 70B / Qwen 32B" ids are NOT served by this Groq
+// account (probed live: model_not_found / model_decommissioned), so the
+// best available code model wins: openai/gpt-oss-120b (JSON-mode capable,
+// reasoning isolated, 32k output budget verified). Alternate: gpt-oss-20b.
 //
 // Groq is OpenAI-compatible (same /v1/chat/completions shape NVIDIA used),
 // so every call path (host pipeline + reverse-tunnel forwarder) is unchanged
@@ -197,7 +203,7 @@ const DEFAULT_MODELS: Record<Role, string> = {
 //   SINGLE_MODE_MODEL       = llama-3.3-70b-versatile         (default)
 // Legacy NVIDIA keys are kept as last-resort fallbacks for stale dev envs.
 export const SINGLE_MODE_MODEL =
-  process.env.SINGLE_MODE_MODEL ?? "llama-3.3-70b-versatile";
+  process.env.SINGLE_MODE_MODEL ?? "openai/gpt-oss-120b";
 const SINGLE_MODE_API_URL =
   process.env.SINGLE_MODE_API_URL ??
   (process.env.GROQ_BASE_URL
