@@ -191,9 +191,13 @@ export async function* forwardToNvidia(
       method: method.toUpperCase(),
       headers: outboundHeaders,
       body: hasBody ? bodyString : undefined,
-      // 5 min cap — NVIDIA streaming can run long, but a hung socket
-      // must not pin a tunnel connection forever.
-      signal: AbortSignal.timeout(300_000),
+      // 15 min cap — Nemotron-3.5-lightning is a reasoning model; a 16384-token
+      // developer-phase generation (full app as JSON) takes ~6-10 min once
+      // reasoning + code are both produced. The previous 5-min cap aborted
+      // mid-stream, the VM retried, and every retry hit the same 5-min wall —
+      // the generation never completed. 15 min gives the reasoning model room
+      // to finish without the backend killing the fetch.
+      signal: AbortSignal.timeout(900_000),
     });
   } catch (err) {
     const message =

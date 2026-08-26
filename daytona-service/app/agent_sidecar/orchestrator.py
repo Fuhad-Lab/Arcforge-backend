@@ -136,7 +136,7 @@ if not LLM_USE_REVERSE_TUNNEL:
         LLM_URL = f"{LLM_URL}/chat/completions"
 LLM_KEY = os.environ.get("ORCH_LLM_KEY", "tunnel-injected")
 LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "glm-5.2")
-LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "300"))
+LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "900"))
 # Region-aware readiness flag (written by the installer after probing the
 # LLM routes from inside the VM). 0 = this VM's egress cannot reach any LLM
 # endpoint (eu blocks NVIDIA) — clients then route generation host-side.

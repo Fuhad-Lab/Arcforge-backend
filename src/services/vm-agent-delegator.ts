@@ -49,8 +49,12 @@ const AGENT_ALIVE_TIMEOUT_MS = 90_000;
 const TUNNEL_READY_TIMEOUT_MS = 40_000;
 /** Poll interval for /status while the orchestrator runs the pipeline. */
 const STATUS_POLL_INTERVAL_MS = 2_000;
-/** How long to wait for the orchestrator's pipeline to complete. */
-const PIPELINE_TIMEOUT_MS = 240_000;  // 4 min — architect + developer + debugger via Nemotron
+/** How long to wait for the orchestrator's pipeline to complete. Nemotron-3.5-
+ * lightning is a reasoning model; the developer phase (16384 max_tokens, full
+ * app as JSON) takes ~6-10 min once reasoning + code are produced. 15 min
+ * matches the nvidia-forwarder fetch cap + gives the full pipeline (architect
+ * ~20s + developer ~6-10min + debugger ~30s) room to complete. */
+const PIPELINE_TIMEOUT_MS = 900_000;  // 15 min
 /** HTTP timeout for each individual call to the VM's orchestrator. */
 const VM_HTTP_TIMEOUT_MS = 15_000;
 
