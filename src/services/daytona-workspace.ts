@@ -439,18 +439,25 @@ export async function ensureProjectSandbox(
 
   // 2. Provision a fresh, scaffolded sandbox labeled with user + project ids.
   //    The In-VM agent sidecar receives the single-mode LLM config so its
-  //    pipeline runs autonomously inside the VM (In-VM Sidecar pattern), and
-  //    the platform's 17-skill catalog so the in-VM prompts carry the same
-  //    mandatory skills the host-side pipeline always injected.
+  //    pipeline runs autonomously inside the VM (In-VM Sidecar pattern).
+  //    SKILLS FILTER (2026-08-27): connection-backed skills (Linear, Figma,
+  //    Postgres, Sentry, GitHub, Slack, Brave…) describe tools the VM does
+  //    NOT have — injecting them produced rhetorical compliance and burned
+  //    ~600 tokens of the 8k Groq request floor. Only self-contained skills
+  //    ship to the VM; the full catalog stays available to host-side swarm
+  //    mode (god-mode-protocol) where those connections can actually exist.
+  const vmSkills = PLATFORM_SKILLS
+    .filter((s) => !s.requiresConnection)
+    .map((s) => ({
+      name: s.name,
+      instruction: s.instruction,
+    }));
   const init = await initWorkspace({
     project_id: row.id,
     user_id: row.user_id,
     language: options.language,
     agent_llm: buildAgentLlmConfig(),
-    skills: PLATFORM_SKILLS.map((s) => ({
-      name: s.name,
-      instruction: s.instruction,
-    })),
+    skills: vmSkills,
   });
   const sandboxId = init.sandbox_id;
 

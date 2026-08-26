@@ -79,6 +79,7 @@ import subprocess
 import threading
 import time
 import uuid
+import shlex
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from urllib import request as urllib_request
@@ -203,23 +204,220 @@ if SKILLS:
     log.info("loaded %d platform skills from skills.json", len(SKILLS))
 
 def skills_prompt_block() -> str:
-    """Render the mandatory-skills section injected into generation prompts."""
-    if not SKILLS:
-        return ""
-    lines = [
-        f"## MANDATORY PLATFORM SKILLS ({len(SKILLS)} active — apply while building):"
-    ]
-    for i, s in enumerate(SKILLS, 1):
-        instr = s["instruction"]
-        if len(instr) > 400:
-            instr = instr[:397] + "..."
-        lines.append(f"{i}. {s['name']}: {instr}")
-    lines.append(
-        "- Honour these skills in every file you write (structure, quality, "
-        "security, and completeness they demand). Do not claim a skill was "
-        "applied unless its instruction genuinely shaped the output."
+    """Render the ENGINEERING STANDARDS injected into generation prompts.
+
+    HISTORY (why this is not the 17-skill list anymore): the old block
+    injected 17 one-line skill instructions (~2,000 chars ≈ 600 tokens) into
+    every generation call — while the Groq free-tier floor caps a WHOLE
+    request at 8k tokens. The skills were eating the code budget, and most
+    described tools the VM does not have (Linear/Figma/Postgres/Sentry/
+    GitHub/Slack/Brave — connection-backed MCPs), so the model could only
+    "comply" rhetorically. The block below is the applicable subset of the
+    same catalog (ui-ux-pro-max, filesystem, sequential-thinking, git,
+    memory) distilled into CONCRETE, verifiable standards. The full catalog
+    still ships as skills.json and is reported in /status for the UI.
+    """
+    return (
+        "## ENGINEERING STANDARDS (mandatory, verifiable):\n"
+        "- STRUCTURE: multiple focused files (components/, lib/); no monolith "
+        "page; shared helpers extracted to lib/.\n"
+        "- UI: clear type hierarchy; consistent 8px spacing; real hover/focus/"
+        "disabled states; responsive flex/grid that works at 375px; dark bg "
+        "#0a0a0a with accessible contrast; NO lorem ipsum — plausible real "
+        "copy/mock data; every list has an empty state.\n"
+        "- CODE: typed props/interfaces; named-by-intent handlers; no dead "
+        "code/TODOs; data lives in lib/ (fetched or mocked), not inlined JSX.\n"
+        "- RESILIENCE: async UI has loading + error states; forms validate "
+        "before acting.\n"
+        "- SECURITY: never inline secrets; treat rendered user input as unsafe.\n"
+        "- WORKFLOW: you edit a REAL git repo — keep changes minimal; never "
+        "delete working features when modifying."
     )
+
+
+# ---------------------------------------------------------------------------
+# v2 AGENT LOOP — scaffold, workspace context, git checkpoints
+# (2026-08-27 overhaul: the model must spend tokens on the APP, see the code
+# it is modifying, and get its errors fed back to it. See Task 24 worklog.)
+# ---------------------------------------------------------------------------
+
+_SRC_EXTS = (".tsx", ".ts", ".jsx", ".js", ".py", ".mjs", ".cjs")
+_SKIP_DIRS = {"node_modules", ".next", ".git", ".system", "__pycache__", ".venv", "dist", "build"}
+
+# The pinned Next.js 14 skeleton the daemon writes BEFORE the developer
+# phase. Every token the model does NOT spend on package.json/tsconfig/
+# next.config/layout is a token spent on the actual app. (Deps are the exact
+# pins the old prompt demanded — proven to install+run in this VM image.)
+SCAFFOLD_FILES: Dict[str, str] = {
+    "frontend/package.json": (
+        '{"name":"arcforge-app","version":"0.1.0","private":true,'
+        '"scripts":{"dev":"next dev","build":"next build","start":"next start"},'
+        '"dependencies":{"next":"14.2.35","react":"18.3.1","react-dom":"18.3.1"},'
+        '"devDependencies":{"typescript":"5.5.4","@types/node":"20.14.9",'
+        '"@types/react":"18.3.3","@types/react-dom":"18.3.0"}}\n'
+    ),
+    "frontend/tsconfig.json": (
+        '{"compilerOptions":{"lib":["dom","dom.iterable","esnext"],'
+        '"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,'
+        '"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler",'
+        '"resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve",'
+        '"incremental":true,"plugins":[{"name":"next"}],'
+        '"paths":{"@/*":["./*"]}},'
+        '"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],'
+        '"exclude":["node_modules"]}\n'
+    ),
+    "frontend/next.config.mjs": (
+        "/** @type {import('next').NextConfig} */\n"
+        "const nextConfig = {}\nexport default nextConfig\n"
+    ),
+    "frontend/app/layout.tsx": (
+        "import type { ReactNode } from 'react'\n"
+        "export const metadata = { title: 'ArcForge App', description: 'Built with ArcForge' }\n"
+        "export default function RootLayout({ children }: { children: ReactNode }) {\n"
+        "  return (\n"
+        "    <html lang=\"en\">\n"
+        "      <head>\n"
+        "        <style>{`*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#0a0a0a;color:#fafafa}`}</style>\n"
+        "      </head>\n"
+        "      <body>{children}</body>\n"
+        "    </html>\n"
+        "  )\n"
+        "}\n"
+    ),
+    "frontend/.gitignore": "node_modules/\n.next/\n", 
+    ".gitignore": "**/node_modules/\n**/.next/\n**/__pycache__/\n*.log\n",
+}
+
+
+def seed_scaffold(task_id: Optional[str] = None) -> bool:
+    """Write the pinned Next.js skeleton (only missing files) and kick off a
+    BACKGROUND `npm install` so deps download while the LLM generates. The
+    later verify-phase install becomes a fast no-op. Returns True if the
+    frontend skeleton was freshly seeded (first generation)."""
+    fe = os.path.join(WORKSPACE, "frontend")
+    seeded = False
+    for rel, content in SCAFFOLD_FILES.items():
+        dest = os.path.join(WORKSPACE, rel)
+        if os.path.exists(dest):
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        seeded = True
+        if task_id:
+            upsert_file(dest, task_id, "create")
+    if seeded and not os.path.exists(os.path.join(fe, "node_modules")):
+        try:
+            subprocess.Popen(
+                ["nohup", "npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
+                cwd=fe, stdout=open("/tmp/scaffold-install.log", "w"),
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            log.info("scaffold: background npm install launched")
+        except Exception as exc:  # noqa: BLE001 — scaffold install is best-effort
+            log.warning("scaffold: background npm install failed to start: %s", exc)
+    return seeded
+
+
+def _iter_source_files() -> List[str]:
+    """All source files under frontend/ + backend/, excluding junk dirs."""
+    out: List[str] = []
+    for root_name in ("frontend", "backend"):
+        base = os.path.join(WORKSPACE, root_name)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fn in sorted(filenames):
+                if fn.endswith(_SRC_EXTS) or fn in ("package.json", "requirements.txt"):
+                    out.append(os.path.relpath(os.path.join(dirpath, fn), WORKSPACE))
+    return sorted(out)
+
+
+def workspace_has_source() -> bool:
+    """True once a generation has produced app code (follow-up territory).
+    Scaffold files (package.json, tsconfig, next.config.mjs, app/layout.tsx,
+    .gitignore) do NOT count — otherwise every first generation over the
+    seeded skeleton would be misrouted to the edit path."""
+    scaffold = set(SCAFFOLD_FILES.keys())
+    for rel in _iter_source_files():
+        if rel in scaffold or rel.endswith("app/layout.tsx"):
+            continue
+        if rel.endswith((".tsx", ".ts", ".jsx", ".py", ".js", ".mjs", ".cjs")):
+            return True
+    return False
+
+
+def workspace_tree_text() -> str:
+    files = _iter_source_files()
+    if not files:
+        return "(empty — no app code yet)"
+    return "\n".join(files[:60])
+
+
+def workspace_context_text(char_budget: int = 5000) -> str:
+    """File tree + the contents of the most important source files, capped.
+    Priority: frontend/app/page.tsx, then components, then lib, then backend."""
+    lines = ["CURRENT WORKSPACE FILES:", workspace_tree_text()]
+    pri = ["frontend/app/page.tsx"]
+    files = _iter_source_files()
+    ordered = [f for f in pri if f in files] + \
+              [f for f in files if f not in pri and "/app/" in f] + \
+              [f for f in files if f.startswith("frontend/components/")] + \
+              [f for f in files if f.startswith("frontend/lib/")] + \
+              [f for f in files if f.startswith("backend/")]
+    spent = 0
+    for rel in ordered:
+        if spent >= char_budget:
+            lines.append("(context budget reached — remaining files omitted)")
+            break
+        try:
+            with open(os.path.join(WORKSPACE, rel), "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        if len(content) > 4000:
+            content = content[:4000] + "\n/* ...TRUNCATED... */"
+        lines.append(f"\n----- {rel} -----\n{content}")
+        spent += len(content)
     return "\n".join(lines)
+
+
+def read_file_for_edit(rel: str, cap: int = 6000) -> str:
+    """Current content of one file for the per-file edit prompt."""
+    try:
+        with open(os.path.join(WORKSPACE, rel), "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except OSError:
+        return "(file does not exist yet — create it)"
+    if len(content) > cap:
+        return content[:cap] + "\n/* ...TRUNCATED — reconstruct the tail coherently... */"
+    return content
+
+
+def git_checkpoint(label: str) -> Optional[str]:
+    """Best-effort git checkpoint at /workspace (rollback support). NEVER
+    raises — a missing git binary or a repo problem must not fail a task."""
+    try:
+        def g(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", WORKSPACE, *args], capture_output=True, text=True, timeout=30)
+        if not os.path.isdir(os.path.join(WORKSPACE, ".git")):
+            r = g("init", "-q")
+            if r.returncode != 0:
+                return None
+            g("config", "user.email", "agent@arcforge.local")
+            g("config", "user.name", "ArcForge Agent")
+        g("add", "-A")
+        r = g("commit", "-q", "--no-verify", "-m", label)
+        if r.returncode == 0:
+            return label
+        # Nothing to commit (no changes) is fine.
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("git checkpoint failed (non-fatal): %s", exc)
+        return None
 
 # ---------------------------------------------------------------------------
 # SQLite state store
@@ -564,20 +762,45 @@ rt_mux = ReverseTunnelMultiplexer()
 # ---------------------------------------------------------------------------
 
 
-# Track when the last LLM call finished, for TPM pacing (see llm_chat
-# docstring). Simple module-global — the worker thread is the only caller.
+# Track when the last LLM call finished + how big it was, for TPM pacing
+# (see llm_chat docstring). Simple module-globals — the worker thread is
+# the only caller.
 _last_llm_done_ts = 0.0
-TPM_GAP_S = 65.0  # Groq's token budget window is per-minute; 65s is safe.
+_last_llm_cost_tokens = 0.0
+TPM_GAP_S = 65.0      # full-window cooling (a max-size request)
+TPM_MIN_GAP_S = 2.5   # after a tiny call
+TPM_FLOOR_TOKENS = 8000.0  # Groq free-tier per-request/minute floor
 
 
-def pace_for_tpm(gap_s: float = TPM_GAP_S) -> None:
-    """Block until the previous LLM call is ≥ gap_s ago (the TPM budget is
-    per-minute; small chained calls need ~30s spacing, max-size calls need
-    a fully cold window). No-op on a cold clock."""
-    global _last_llm_done_ts
+def _estimate_cost_tokens(messages: List[Dict[str, str]], max_tokens: int) -> float:
+    """What Groq's pre-check counts against the minute: prompt tokens + the
+    RESERVED max_tokens (worst case), not the actual completion."""
+    prompt_chars = sum(len(m.get("content", "")) for m in messages)
+    return prompt_chars / 4.0 + max_tokens
+
+
+def pace_for_tpm(gap_s: Optional[float] = None) -> None:
+    """PROPORTIONAL TPM pacing (v2). The old code slept a flat 65s before
+    EVERY call — architect→developer alone burned a minute of dead time.
+    Groq's pre-check counts prompt+max_tokens (reserved) against the
+    rolling minute, so the gap only needs to be proportional to the
+    PREVIOUS call's reserved size:
+
+        small call (~1.5k reserved)  ->  ~12s
+        full-window call (~8k)       ->  65s (fully cold window)
+
+    Callers may still force a gap (the chunked path uses 30s).
+    No-op on a cold clock."""
+    global _last_llm_done_ts, _last_llm_cost_tokens
+    if gap_s is None:
+        gap_s = max(
+            TPM_MIN_GAP_S,
+            TPM_GAP_S * min(1.0, _last_llm_cost_tokens / TPM_FLOOR_TOKENS),
+        )
     wait = _last_llm_done_ts + gap_s - time.time()
     if wait > 0:
-        log.info("tpm pacing: sleeping %.1fs before the next LLM call", wait)
+        log.info("tpm pacing: sleeping %.1fs before the next LLM call "
+                 "(previous call reserved ~%.0f tokens)", wait, _last_llm_cost_tokens)
         time.sleep(wait)
 
 
@@ -645,8 +868,9 @@ def llm_chat(
             content = payload["choices"][0]["message"]["content"]
             if not isinstance(content, str) or not content.strip():
                 raise RuntimeError("LLM returned an empty message")
-            global _last_llm_done_ts
+            global _last_llm_done_ts, _last_llm_cost_tokens
             _last_llm_done_ts = time.time()
+            _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
             return content
         except HTTPError as exc:
             # 429 -> retry with backoff (free-tier rate limits); others raise.
@@ -776,7 +1000,9 @@ def _llm_chat_via_reverse_tunnel(
         content = payload["choices"][0]["message"]["content"]
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("LLM returned an empty message")
+        global _last_llm_done_ts, _last_llm_cost_tokens
         _last_llm_done_ts = time.time()
+        _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
         return content
 
     raise RuntimeError(f"reverse-tunnel LLM failed after retries: {last_err}")
@@ -944,33 +1170,63 @@ class TaskWorker(threading.Thread):
             emit({"type": "status", "status": get_status("active")})
 
         try:
+            # ── Phase 0: GIT CHECKPOINT (rollback point before touching code)
+            follow_up = workspace_has_source()
+            if follow_up:
+                git_checkpoint(f"checkpoint before: {prompt[:100]}")
+
             # ── Phase 1: ARCHITECT ─────────────────────────────────────────
             set_active("architect", "Planning the build")
             activity("Planning", "active")
-            plan = self._architect(prompt)
+            plan = self._architect(prompt, follow_up)
             activity("Planning", "done", str(plan.get("summary", ""))[:200])
+
+            # ── Phase 1.5: SCAFFOLD — the daemon writes the pinned Next.js
+            # skeleton itself (first generation only) so the model's entire
+            # token budget goes to the APP, not boilerplate. A background
+            # npm install starts downloading deps while the LLM works.
+            if not follow_up:
+                seed_scaffold(task_id)
 
             # ── Phase 2: DEVELOPER ────────────────────────────────────────
             set_active("developer", "Writing code")
             activity("Writing code", "active")
-            files = self._developer(prompt, plan)
+            files, deletes = self._developer(prompt, plan, follow_up)
             written = self._write_files(files, task_id)
-            emit({"type": "files", "task_id": task_id, "files": written})
+            deleted = self._delete_files(deletes, task_id)
+            all_changes = written + deleted
+            emit({"type": "files", "task_id": task_id, "files": all_changes})
             activity("Writing code", "done", f"{len(written)} files")
 
-            # ── Phase 3: DEBUGGER ─────────────────────────────────────────
+            # ── Phase 3: VERIFY + REPAIR LOOP ─────────────────────────────
+            #    The old "debugger" never involved the LLM: when checks
+            #    failed, the run just ended with ok=false. Now failures are
+            #    fed BACK to the model with real command output, it patches
+            #    the files, and verification re-runs — up to N rounds.
             set_active("debugger", "Verifying the build")
             activity("Verifying", "active")
             debug = self._debugger(written, task_id)
+            repairs: Dict[str, Any] = {"rounds": 0, "diagnoses": []}
+            if not debug["ok"]:
+                activity("Verifying", "done", "issues found — self-repairing")
+                debug, repairs = self._repair_loop(task_id, debug, written)
             activity("Verifying", "done",
                      "all checks passed" if debug["ok"] else f"issues: {debug['issues'][:200]}")
 
             # ── Complete ──────────────────────────────────────────────────
             summary = plan.get("summary") or "Build finished."
+            if repairs["rounds"]:
+                if debug["ok"]:
+                    summary += (f" (self-repaired {repairs['rounds']} round(s): "
+                                + "; ".join(repairs["diagnoses"])[:300] + ")")
+                else:
+                    summary += (f" (attempted {repairs['rounds']} self-repair round(s); "
+                                "some issues remain — see checks)")
             result = {
                 "summary": summary,
                 "files": [f["path"] for f in written],
                 "checks": {"ok": debug["ok"], "issues": debug["issues"]},
+                "repairs": repairs,
                 "duration_ms": int((time.time() - started) * 1000),
                 "model": LLM_MODEL,
                 # Port the app dev-server is serving on (null when none) —
@@ -988,16 +1244,23 @@ class TaskWorker(threading.Thread):
             emit({"type": "task_done", "task_id": task_id, "result": result})
             set_active("idle")
             emit({"type": "status", "status": get_status("active")})
-            log.info("task %s done in %.1fs (%d files)", task_id,
-                     time.time() - started, len(written))
+            # Post-task checkpoint — every successful generation is a
+            # rollback point (git log / git checkout in the terminal).
+            git_checkpoint(f"arcforge: {prompt[:100]}")
+            log.info("task %s done in %.1fs (%d files, %d repair rounds)", task_id,
+                     time.time() - started, len(written), repairs["rounds"])
         except Exception as exc:
             log.exception("task %s failed", task_id)
             self._mark_failed(task_id, str(exc))
 
     # ── pipeline phases ─────────────────────────────────────────────────────
 
-    def _architect(self, prompt: str) -> Dict[str, Any]:
-        """Phase 1 — produce a compact build plan."""
+    def _architect(self, prompt: str, follow_up: bool = False) -> Dict[str, Any]:
+        """Phase 1 — produce a compact build plan.
+
+        v2: the architect now SEES the workspace (tree + recent history) and
+        knows whether this is a first generation or a follow-up, so plans
+        build on what exists instead of silently rewriting from scratch."""
         history = recent_chat(20)
         convo = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in history[-8:])
         system = (
@@ -1016,114 +1279,122 @@ class TaskWorker(threading.Thread):
         if skills:
             system += "\n\n" + skills
         user = f"Conversation so far:\n{convo}\n\nNew request: {prompt}"
+        if follow_up:
+            user += (
+                "\n\nIMPORTANT: this is a FOLLOW-UP on an EXISTING app. Current "
+                f"workspace files:\n{workspace_tree_text()}\n"
+                "The plan must PRESERVE existing behaviour and extend/modify it — "
+                "not rewrite the app."
+            )
         try:
             reply = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                json_mode=True,
+                json_mode=True, max_tokens=1000,  # tiny reply — keeps TPM pacing short
             )
             return _extract_json(reply)
         except Exception as exc:
             append_log(None, "architect", "warn", f"planning degraded: {exc}")
             return {"summary": f"Building: {prompt[:200]}", "components": [], "stack": {}}
 
-    def _developer(self, prompt: str, plan: Dict[str, Any]) -> Dict[str, str]:
-        """Phase 2 — generate the full file set as {path: content}.
+    def _developer(self, prompt: str, plan: Dict[str, Any],
+                   follow_up: bool = False) -> tuple[Dict[str, str], List[str]]:
+        """Phase 2 — produce the file set as ({path: content}, [paths to delete]).
 
-        PLATFORM MANDATE (2026-08-27): the frontend is ALWAYS a Next.js
-        (App Router, TypeScript) app under "frontend/"; the model picks the
-        BACKEND language/framework itself when the app needs one.
+        v2 (2026-08-27) — two paths, chosen by workspace state:
+
+        FIRST GENERATION (no app code on disk yet):
+          The daemon has already seeded the pinned Next.js skeleton
+          (package.json / tsconfig / next.config / app/layout.tsx) — the
+          model is told NOT to emit boilerplate, so its whole budget goes
+          to the app itself. One lean one-shot (fast), chunked fallback.
+
+        FOLLOW-UP (app code exists):
+          The OLD code regenerated blind: the developer never saw the
+          existing files, so "polish it" produced a from-scratch rewrite
+          that silently dropped previous work. Now the model gets the
+          file tree + key file contents, lists exactly which files to
+          create/modify, and each modified file is generated WITH its
+          current content in the prompt (targeted whole-file edit).
 
         GROQ TPM REALITY (live-measured): this tier's FLOOR is 8,000 tokens
-        per request (prompt + max_tokens) — the on-demand TPM sometimes
-        flexes higher, but a request larger than the floor is rejected
-        (HTTP 413 `rate_limit_expired`) whenever it isn't. So every request
-        this phase makes stays under 8k:
-
-          FAST PATH — ONE lean shot (max_tokens 6800): a compact, complete
-          Next.js app fits. ~15-25s at Groq's ~450 tok/s.
-
-          CHUNKED FALLBACK — a small manifest call lists the files, then
-          one small call per file (max_tokens 6000 each, ~30s pacing).
-          Immune to the TPM floor and to truncation.
+        per request (prompt + max_tokens) — every request stays under 8k.
         """
-        fast_sys = (
-            "You are the Developer of ArcForge. Implement the planned app "
-            "COMPLETELY but COMPACTLY — token budget is tight. Reply with "
-            "ONLY a JSON object: "
-            '{"summary": "<user-facing summary of what was built and how to run it>", '
-            '"backend": {"<path>": "<full file content>"}, '
-            '"frontend": {"<path>": "<full file content>"}}. '
-            "Paths are relative and MUST live under frontend/ or backend/. "
-            "FRONTEND (MANDATORY): a complete but LEAN Next.js 14 App Router "
-            "app in TypeScript under \"frontend\" — package.json with EXACTLY "
-            "these deps: next 14.2.35, react 18.3.1, react-dom 18.3.1, "
-            "typescript 5.5.4, @types/node 20.14.9, @types/react 18.3.3, "
-            "@types/react-dom 18.3.0 (scripts dev=\"next dev\"); "
-            "tsconfig.json (Next 14 standard JSX setup — REQUIRED, its "
-            "absence crashes next dev); next.config.mjs; app/layout.tsx; "
-            "app/page.tsx; and at most 3-4 additional component/lib files. "
-            "STYLES: do NOT create any .css file and do NOT import css — "
-            "put ALL global styles in ONE <style> tag inside "
-            "app/layout.tsx's <head> and use inline style props in "
-            "components (the css pipeline is deliberately bypassed). "
-            "EVERY file that uses React hooks (useState/useEffect) or "
-            "event handlers MUST begin with the directive \"use client\" "
-            "as its first line (App Router requirement — pages without it "
-            "are Server Components and 500 on hooks). Next 14 <Link> "
-            "takes NO nested <a> child — write <Link href=...>text</Link> "
-            "directly (nested <a> throws at runtime). "
-            "NO comments, NO blank-line "
-            "padding — every line must carry code. NO create-react-app, NO "
-            "Vite, NO index.html — Next.js only. "
-            "BACKEND (YOUR CHOICE): only if the app truly needs a server, "
-            "pick ONE language (e.g. Python Flask with requirements.txt, or "
-            "Node Express with backend/package.json + server.js) under "
-            "\"backend\"; keep it minimal. If the frontend alone suffices, "
-            "omit backend. Write REAL, complete, runnable code."
+        standards = skills_prompt_block()
+
+        # ── FIRST GENERATION: one lean one-shot over the seeded scaffold ──
+        if not follow_up:
+            fast_sys = (
+                "You are the Developer of ArcForge. The pinned Next.js 14 "
+                "scaffold ALREADY EXISTS on disk (frontend/package.json, "
+                "tsconfig.json, next.config.mjs, app/layout.tsx, .gitignore) "
+                "with deps next 14.2.35 / react 18.3.1 / typescript 5.5.4 — "
+                "do NOT emit those files. Spend your ENTIRE budget on the "
+                "APP. Reply with ONLY a JSON object: "
+                '{"summary": "<user-facing summary of what was built>", '
+                '"frontend": {"<path>": "<full file content>"}, '
+                '"backend": {"<path>": "<full file content>"}, '
+                '"delete": ["<path to remove>", ...]}. '
+                "Paths are relative under frontend/ or backend/. Write "
+                "app/page.tsx plus focused components/ and lib/ files "
+                "(typically 4-8 files). STYLES: no .css files, no css "
+                "imports — inline style props and a <style> tag only. "
+                "EVERY file using hooks/event handlers MUST start with "
+                '"use client". Next 14 <Link> takes NO nested <a>. '
+                "NO comments, NO blank-line padding — every line is code. "
+                "NO create-react-app, NO Vite, NO index.html. "
+                "BACKEND only if the app truly needs a server (pick ONE "
+                "language: Python Flask w/ requirements.txt, or Node "
+                "Express w/ backend/package.json + server.js)."
+            )
+            user = (
+                f"Plan: {json.dumps(plan, ensure_ascii=False)}\n\n"
+                f"Original request: {prompt}\n\nProduce the app files now."
+            )
+            try:
+                pace_for_tpm()
+                reply = llm_chat(
+                    [{"role": "system", "content": fast_sys + "\n\n" + standards},
+                     {"role": "user", "content": user}],
+                    json_mode=True, max_tokens=6800,
+                )
+                files, summary, deletes = self._parse_dev_reply(reply)
+                if files:
+                    plan["summary"] = summary or plan.get("summary")
+                    append_log(None, "developer", "info",
+                               f"fast path produced {len(files)} files in one shot "
+                               "(scaffold pre-seeded)")
+                    return files, deletes
+                raise RuntimeError("fast path yielded no files")
+            except Exception as exc:
+                append_log(None, "developer", "warn",
+                           f"one-shot developer path failed ({str(exc)[:180]}) — "
+                           "falling back to chunked per-file generation")
+
+        # ── TARGETED EDIT PATH (follow-ups; also the first-gen fallback) ──
+        # Manifest: which files to create/modify/delete. Then one small call
+        # per file, WITH the current content when modifying.
+        manifest_sys = (
+            "You are the Developer of ArcForge planning precise file changes. "
+            "The frontend is Next.js 14 App Router (TypeScript; tsconfig + "
+            "pinned deps already on disk; NO .css files — inline styles/"
+            "<style> tags only; files using hooks need \"use client\"). "
+            "Reply with ONLY a JSON object: "
+            '{"summary": "<one line>", "files": ['
+            '{"path": "frontend/app/page.tsx", "action": "modify", '
+            '"purpose": "<exactly what changes and why, precisely>"}'
+            "], \"delete\": [\"frontend/old.tsx\"]}. List ONLY files that must "
+            "change — untouched files stay as-is on disk. Be surgical: modify "
+            "the fewest files that fully implement the request."
         )
-        skills = skills_prompt_block()
+        ctx = workspace_context_text(5000 if follow_up else 800)
         user = (
             f"Plan: {json.dumps(plan, ensure_ascii=False)}\n\n"
-            f"Original request: {prompt}\n\nProduce the complete file set."
-        )
-
-        # ── FAST PATH: one lean one-shot (prompt ~1k + 6800 ≤ TPM floor) ──
-        try:
-            pace_for_tpm()
-            reply = llm_chat(
-                [{"role": "system", "content": fast_sys + ("\n\n" + skills if skills else "")},
-                 {"role": "user", "content": user}],
-                json_mode=True, max_tokens=6800,
-            )
-            files, summary = self._parse_dev_reply(reply)
-            if files:
-                plan["summary"] = summary or plan.get("summary")
-                append_log(None, "developer", "info",
-                           f"fast path produced {len(files)} files in one shot")
-                return files
-            raise RuntimeError("fast path yielded no files")
-        except Exception as exc:
-            append_log(None, "developer", "warn",
-                       f"one-shot developer path failed ({str(exc)[:180]}) — "
-                       "falling back to chunked per-file generation")
-
-        # ── CHUNKED PATH: manifest, then one small call per file ──────────
-        manifest_sys = (
-            "You are the Developer of ArcForge planning file layout. The "
-            "frontend MUST be Next.js 14 App Router (TypeScript, tsconfig.json "
-            "REQUIRED, deps pinned next 14.2.35 / react 18.3.1 / typescript "
-            "5.5.4, NO .css files — all styles inline/<style>-tag only) "
-            "under 'frontend/'; the backend language is YOUR choice "
-            "when needed (under 'backend/'). Reply with ONLY a JSON object: "
-            '{"summary": "<one line>", "files": ['
-            '{"path": "frontend/app/page.tsx", "purpose": "<what it contains, precisely>"}'
-            "]} — list EVERY file the app needs (8-14 files), each with a "
-            "purpose precise enough that another engineer could write the "
-            "file from it alone."
+            f"Request: {prompt}\n\n{ctx}\n\n"
+            "List the files to create/modify/delete."
         )
         pace_for_tpm()
         manifest_reply = llm_chat(
-            [{"role": "system", "content": manifest_sys + ("\n\n" + skills if skills else "")},
+            [{"role": "system", "content": manifest_sys + "\n\n" + standards},
              {"role": "user", "content": user}],
             json_mode=True, max_tokens=1500,
         )
@@ -1134,14 +1405,22 @@ class TaskWorker(threading.Thread):
             raise RuntimeError("the developer manifest produced no files")
 
         files: Dict[str, str] = {}
+        deletes: List[str] = [str(p) for p in (manifest.get("delete") or [])
+                              if isinstance(p, str) and p.strip()]
         for i, spec in enumerate(specs, 1):
             rel = str(spec["path"]).strip().lstrip("/")
             purpose = str(spec.get("purpose") or "")[:400]
+            action = str(spec.get("action") or ("modify" if follow_up else "create"))
+            exists = os.path.exists(os.path.join(WORKSPACE, rel))
             append_log(None, "developer", "info",
-                       f"generating file {i}/{len(specs)}: {rel}")
+                       f"generating file {i}/{len(specs)}: {rel} ({action})")
+            current = read_file_for_edit(rel) if (exists and action == "modify") else ""
             for attempt in range(3):
                 pace_for_tpm(30.0)
                 try:
+                    cur_block = (f"\nCURRENT CONTENT of {rel}:\n```\n{current}\n```\n"
+                                 "Rewrite the COMPLETE file implementing the change "
+                                 "(keep everything else intact).\n") if current else ""
                     r = llm_chat(
                         [{"role": "system", "content": (
                             "You are the Developer of ArcForge. Write the "
@@ -1152,7 +1431,7 @@ class TaskWorker(threading.Thread):
                             "explanations.")},
                          {"role": "user", "content":
                           f"Project: {prompt}\nFile: {rel}\nPurpose: {purpose}\n"
-                          f"Write the complete {rel} now."}],
+                          f"{cur_block}Write the complete {rel} now."}],
                         json_mode=True, max_tokens=6000,
                     )
                     data = _extract_json(r)
@@ -1171,26 +1450,42 @@ class TaskWorker(threading.Thread):
             raise RuntimeError("the chunked developer phase produced no files")
         plan["summary"] = manifest.get("summary") or plan.get("summary")
         append_log(None, "developer", "info",
-                   f"chunked path produced {len(files)}/{len(specs)} files")
-        return files
+                   f"edit path produced {len(files)}/{len(specs)} files "
+                   f"(+{len(deletes)} deletions)")
+        return files, deletes
 
-    def _parse_dev_reply(self, reply: str) -> tuple[Dict[str, str], str]:
-        """Parse a one-shot developer JSON reply into ({path: content}, summary)."""
+    def _parse_dev_reply(self, reply: str) -> tuple[Dict[str, str], str, List[str]]:
+        """Parse a one-shot developer JSON reply into
+        ({path: content}, summary, [paths to delete]).
+
+        GROUP-RELATIVE PATH FIX (caught by the v2 integration test): the
+        reply schema groups files under "frontend"/"backend", and models
+        legitimately use group-relative keys ("app.py" inside the backend
+        group). The old writer dumped those under frontend/ — a silent
+        misroute that starved pip of requirements.txt and py-checked files
+        in the wrong tree. Keys are now normalized into their group."""
         data = _extract_json(reply)
         files: Dict[str, str] = {}
         for group in ("backend", "frontend"):
             blob = data.get(group)
             if isinstance(blob, dict):
                 for path, content in blob.items():
-                    if isinstance(path, str) and isinstance(content, str) and content.strip():
-                        files[path.strip().lstrip("/")] = _repair_double_escaped(content)
+                    if not (isinstance(path, str) and isinstance(content, str)
+                            and content.strip()):
+                        continue
+                    rel = path.strip().lstrip("/")
+                    if not rel.startswith(("frontend/", "backend/", "git/")):
+                        rel = f"{group}/{rel}"
+                    files[rel] = _repair_double_escaped(content)
         flat = data.get("files")
         if isinstance(flat, dict) and not files:
             for path, content in flat.items():
                 if isinstance(path, str) and isinstance(content, str) and content.strip():
                     files[path.strip().lstrip("/")] = _repair_double_escaped(content)
+        deletes = [str(p).strip().lstrip("/") for p in (data.get("delete") or [])
+                   if isinstance(p, str) and p.strip()]
         summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
-        return files, summary
+        return files, summary, deletes
 
     def _write_files(self, files: Dict[str, str], task_id: str) -> List[Dict[str, str]]:
         """Native writes into /workspace — instant inotify for dev-server HMR."""
@@ -1213,6 +1508,24 @@ class TaskWorker(threading.Thread):
             append_log(task_id, "developer", "info",
                        f"wrote {dest} ({len(content)} bytes)")
         return written
+
+    def _delete_files(self, deletes: List[str], task_id: str) -> List[Dict[str, str]]:
+        """Remove files the model explicitly asked to delete (v2)."""
+        removed: List[Dict[str, str]] = []
+        for rel in deletes or []:
+            rel = rel.strip().lstrip("/")
+            if not rel or ".." in rel or rel.startswith((".system", ".git")):
+                continue
+            dest = os.path.join(WORKSPACE, rel)
+            if os.path.isfile(dest):
+                try:
+                    os.remove(dest)
+                    upsert_file(dest, task_id, "delete")
+                    removed.append({"path": dest, "action": "delete"})
+                    append_log(task_id, "developer", "info", f"deleted {dest}")
+                except OSError as exc:
+                    append_log(task_id, "developer", "warn", f"delete failed {dest}: {exc}")
+        return removed
 
     def _debugger(self, written: List[Dict[str, str]], task_id: str) -> Dict[str, Any]:
         """Phase 3 — syntax checks, dependency install, dev-server launch."""
@@ -1321,6 +1634,40 @@ class TaskWorker(threading.Thread):
                     )
                     if str(warm.get("stdout", "")).strip().startswith(("2", "3")):
                         break
+                # v2: RUNTIME VERIFICATION — an HTTP 200 from Next dev does
+                # NOT prove the app renders (error pages also answer 200).
+                # Fetch the actual HTML and look for the dev-overlay/runtime
+                # error markers; any hit becomes repair-loop input.
+                probe = shell(
+                    f"curl -s http://localhost:{NEXT_DEV_PORT}/ --max-time 20",
+                    fe, "debugger", 30,
+                )
+                html = str(probe.get("stdout", ""))
+                err_markers = (
+                    "Application error", "__next_error__",
+                    "Unhandled Runtime", "Missing required error pages",
+                    "Module not found", "Cannot find module",
+                    "SyntaxError", "TypeError",
+                )
+                hits = [m for m in err_markers if m in html]
+                if hits:
+                    ok = False
+                    snippet = html[max(0, html.find(hits[0]) - 120):
+                                   html.find(hits[0]) + 380].replace("\n", " ")
+                    issues.append(
+                        f"runtime error on / (markers: {', '.join(hits[:3])}): {snippet}")
+                # The dev-server log is even richer than the HTML — surface
+                # compile/runtime errors from the tail.
+                logtail = shell("tail -n 40 /tmp/frontend-dev.log 2>/dev/null",
+                                fe, "debugger", 15)
+                logtxt = str(logtail.get("stdout", "")) + str(logtail.get("stderr", ""))
+                for marker in ("Failed to compile", "SyntaxError", "Module not found",
+                               "Unhandled Runtime", "TypeError:"):
+                    if marker in logtxt:
+                        line = next((l for l in logtxt.splitlines() if marker in l), "")
+                        issues.append(f"next dev log: {line[:300]}")
+                        ok = False
+                        break
             else:
                 # Legacy Vite app — serve on the Vite port as before.
                 app_port = VITE_DEV_PORT
@@ -1372,6 +1719,19 @@ class TaskWorker(threading.Thread):
                     be, "debugger", 20,
                 )
                 break
+        # v2: backend crash detection — a Python backend that dies on boot
+        # writes a Traceback; surface it as repair-loop input instead of
+        # silently pretending the backend is up.
+        if os.path.exists("/tmp/backend-dev.log"):
+            time.sleep(2)
+            bt = shell("tail -n 25 /tmp/backend-dev.log 2>/dev/null",
+                       be, "debugger", 15)
+            btxt = str(bt.get("stdout", ""))
+            if "Traceback (most recent call last)" in btxt:
+                ok = False
+                tail_lines = [l for l in btxt.splitlines() if l.strip()][-6:]
+                issues.append(
+                    "python backend crashed at boot: " + " | ".join(tail_lines)[:400])
 
         # 4) Publish the app-server state — the frontend re-fetches
         #    agent-info on task_done and gets a SIGNED preview URL for this
@@ -1382,6 +1742,114 @@ class TaskWorker(threading.Thread):
 
         return {"ok": ok, "issues": "; ".join(issues)[:1000], "commands": ran,
                 "app_port": app_port}
+
+    # ── v2 REPAIR LOOP ────────────────────────────────────────────────────
+
+    def _repair_loop(self, task_id: str, report: Dict[str, Any],
+                     written: List[Dict[str, str]],
+                     max_rounds: int = 3) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """THE missing agent step (2026-08-27).
+
+        The old pipeline ENDED when checks failed — the model never learned
+        its build was broken. Now each round feeds the REAL failures
+        (command output, dev-server log lines, runtime HTML markers) plus
+        the relevant source files back to the LLM; it returns patched file
+        contents; verification re-runs. Converges or honestly reports the
+        remaining issues after max_rounds.
+
+        Token budget per repair call (Groq 8k floor): issues ≤1,500 chars +
+        ≤2 files ×3,000 chars + max_tokens 5,000 → prompt ≈2,400 tokens.
+        """
+        diagnoses: List[str] = []
+        rounds_used = 0
+
+        def _relevant_files(report_issues: str) -> List[str]:
+            """Files written this task, prioritized by mention in the errors."""
+            rels = [os.path.relpath(f["path"], WORKSPACE) for f in written
+                    if f["path"].endswith(_SRC_EXTS)]
+            mentioned = [r for r in rels if r in report_issues]
+            # Last-written first: later files depend on earlier ones, so the
+            # culprit for a compile failure is usually the most recent edit.
+            others = list(reversed([r for r in rels if r not in mentioned]))
+            return (mentioned + others)[:2]
+
+        for round_no in range(1, max_rounds + 1):
+            if report.get("ok"):
+                break
+            rounds_used = round_no
+            set_status("active", {"state": "repair", "detail":
+                                  f"self-repair round {round_no}", "task_id": task_id})
+            emit({"type": "status", "status": get_status("active")})
+            activity_detail = f"self-repair round {round_no}"
+            append_log(task_id, "repair", "info",
+                       f"{activity_detail} — issues: {report.get('issues', '')[:300]}")
+
+            # Assemble evidence: failing commands + outputs, then files.
+            evidence: List[str] = [f"ISSUES:\n{report.get('issues', '')}"]
+            for cmd in (report.get("commands") or []):
+                if cmd.get("exit_code") not in (0, None):
+                    evidence.append(
+                        f"$ {cmd.get('command', '')}\nexit {cmd.get('exit_code')}\n"
+                        f"{str(cmd.get('stderr') or '')[:700]}"
+                        f"{str(cmd.get('stdout') or '')[:500]}")
+            file_blocks: List[str] = []
+            for rel in _relevant_files(report.get("issues", "")):
+                content = read_file_for_edit(rel, cap=3000)
+                file_blocks.append(f"----- {rel} -----\n{content}")
+
+            try:
+                pace_for_tpm()
+                reply = llm_chat(
+                    [{"role": "system", "content": (
+                        "You are the Debugger of ArcForge, an autonomous "
+                        "in-VM agent. A build you are responsible for FAILED "
+                        "verification. Diagnose the ROOT CAUSE from the real "
+                        "command output, then return corrected FULL file "
+                        "contents. Reply with ONLY a JSON object: "
+                        '{"diagnosis": "<one sentence root cause>", '
+                        '"files": {"<path>": "<full corrected file content>"}, '
+                        '"delete": ["<path>"]}. Only include files that must '
+                        "change. Keep every working part of each file "
+                        "byte-identical where possible.")},
+                     {"role": "user", "content": (
+                         "\n\n".join(evidence + file_blocks)[:6000]
+                         + "\n\nFix the build.")}],
+                    json_mode=True, max_tokens=5000,
+                )
+                data = _extract_json(reply)
+                diagnosis = str(data.get("diagnosis") or "")[:200]
+                patches = {str(p).strip().lstrip("/"): _repair_double_escaped(c)
+                           for p, c in (data.get("files") or {}).items()
+                           if isinstance(p, str) and isinstance(c, str) and c.strip()}
+                if not patches:
+                    append_log(task_id, "repair", "warn",
+                               f"round {round_no}: model returned no patches "
+                               f"(diagnosis: {diagnosis or 'none'}) — stopping")
+                    diagnoses.append(diagnosis or "no patch produced")
+                    break
+                diagnoses.append(diagnosis or f"round {round_no} patch")
+                patched = self._write_files(patches, task_id)
+                deleted = self._delete_files(
+                    [str(p) for p in (data.get("delete") or []) if isinstance(p, str)],
+                    task_id)
+                written.extend(patched)
+                emit({"type": "files", "task_id": task_id,
+                      "files": patched + deleted})
+                append_log(task_id, "repair", "info",
+                           f"round {round_no}: applied {len(patched)} patch(es) "
+                           f"({', '.join(os.path.relpath(p['path'], WORKSPACE) for p in patched)})")
+                # Re-verify with the same debugger.
+                report = self._debugger(patched, task_id)
+                append_log(task_id, "repair", "info",
+                           f"round {round_no} re-verify: "
+                           + ("PASS" if report["ok"] else f"still failing — {report['issues'][:200]}"))
+            except Exception as exc:  # noqa: BLE001 — repair is best-effort
+                append_log(task_id, "repair", "warn",
+                           f"round {round_no} failed: {str(exc)[:200]}")
+                diagnoses.append(f"repair error: {str(exc)[:120]}")
+                break
+
+        return report, {"rounds": rounds_used, "diagnoses": diagnoses}
 
 
 # ---------------------------------------------------------------------------
