@@ -570,11 +570,12 @@ _last_llm_done_ts = 0.0
 TPM_GAP_S = 65.0  # Groq's token budget window is per-minute; 65s is safe.
 
 
-def pace_for_tpm() -> None:
-    """Block until the previous LLM call is ≥ TPM_GAP_S ago (big requests
-    only pass the TPM pre-check on a cold window). No-op on a cold clock."""
+def pace_for_tpm(gap_s: float = TPM_GAP_S) -> None:
+    """Block until the previous LLM call is ≥ gap_s ago (the TPM budget is
+    per-minute; small chained calls need ~30s spacing, max-size calls need
+    a fully cold window). No-op on a cold clock."""
     global _last_llm_done_ts
-    wait = _last_llm_done_ts + TPM_GAP_S - time.time()
+    wait = _last_llm_done_ts + gap_s - time.time()
     if wait > 0:
         log.info("tpm pacing: sleeping %.1fs before the next LLM call", wait)
         time.sleep(wait)
@@ -1030,47 +1031,135 @@ class TaskWorker(threading.Thread):
 
         PLATFORM MANDATE (2026-08-27): the frontend is ALWAYS a Next.js
         (App Router, TypeScript) app under "frontend/"; the model picks the
-        BACKEND language/framework itself when the app needs one. The
-        developer-phase output budget is 28000 tokens so a complete Next.js
-        app fits in one JSON reply (within Groq free-tier TPM on a cold window).
+        BACKEND language/framework itself when the app needs one.
+
+        GROQ TPM REALITY (live-measured): this tier's FLOOR is 8,000 tokens
+        per request (prompt + max_tokens) — the on-demand TPM sometimes
+        flexes higher, but a request larger than the floor is rejected
+        (HTTP 413 `rate_limit_expired`) whenever it isn't. So every request
+        this phase makes stays under 8k:
+
+          FAST PATH — ONE lean shot (max_tokens 6800): a compact, complete
+          Next.js app fits. ~15-25s at Groq's ~450 tok/s.
+
+          CHUNKED FALLBACK — a small manifest call lists the files, then
+          one small call per file (max_tokens 6000 each, ~30s pacing).
+          Immune to the TPM floor and to truncation.
         """
-        system = (
+        fast_sys = (
             "You are the Developer of ArcForge. Implement the planned app "
-            "COMPLETELY. Reply with ONLY a JSON object: "
+            "COMPLETELY but COMPACTLY — token budget is tight. Reply with "
+            "ONLY a JSON object: "
             '{"summary": "<user-facing summary of what was built and how to run it>", '
             '"backend": {"<path>": "<full file content>"}, '
             '"frontend": {"<path>": "<full file content>"}}. '
             "Paths are relative and MUST live under frontend/ or backend/. "
-            "FRONTEND (MANDATORY): a complete Next.js 14 App Router app in "
-            "TypeScript under \"frontend/\" — package.json (next@14, react, "
-            "react-dom, scripts dev=\"next dev\"), next.config.mjs, tsconfig.json, "
-            "app/layout.tsx, app/page.tsx, app/globals.css, plus every route, "
-            "component and lib file the app needs. Use Tailwind ONLY if you "
-            "also include its config+postcss files; plain CSS modules or "
-            "globals.css are safer. NO create-react-app, NO Vite, NO "
-            "index.html — Next.js only. "
-            "BACKEND (YOUR CHOICE): if the app needs a server/API, pick ONE "
-            "language+framework (e.g. Python Flask with requirements.txt, or "
-            "Node Express with backend/package.json + server.js) and write "
-            "complete runnable code under \"backend/\" with clear instructions "
-            "in the summary. If the frontend alone suffices, omit backend. "
-            "Write REAL, complete, runnable code — no placeholders, no TODOs."
+            "FRONTEND (MANDATORY): a complete but LEAN Next.js 14 App Router "
+            "app in TypeScript under \"frontend\" — package.json (next@14, "
+            "react, react-dom, dev=\"next dev\"), next.config.mjs, "
+            "app/layout.tsx, app/page.tsx, app/globals.css, and at most 3-4 "
+            "additional component/lib files. NO comments, NO blank-line "
+            "padding — every line must carry code. NO create-react-app, NO "
+            "Vite, NO index.html — Next.js only. "
+            "BACKEND (YOUR CHOICE): only if the app truly needs a server, "
+            "pick ONE language (e.g. Python Flask with requirements.txt, or "
+            "Node Express with backend/package.json + server.js) under "
+            "\"backend\"; keep it minimal. If the frontend alone suffices, "
+            "omit backend. Write REAL, complete, runnable code."
         )
         skills = skills_prompt_block()
-        if skills:
-            system += "\n\n" + skills
         user = (
             f"Plan: {json.dumps(plan, ensure_ascii=False)}\n\n"
             f"Original request: {prompt}\n\nProduce the complete file set."
         )
-        # TPM pacing: this is the BIG call (prompt+max_tokens ~29k). It only
-        # passes Groq's per-minute pre-check on a cold window — the architect
-        # call just ran, so sleep out the remainder of the window first.
-        pace_for_tpm()
-        reply = llm_chat(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            json_mode=True, max_tokens=28000,
+
+        # ── FAST PATH: one lean one-shot (prompt ~1k + 6800 ≤ TPM floor) ──
+        try:
+            pace_for_tpm()
+            reply = llm_chat(
+                [{"role": "system", "content": fast_sys + ("\n\n" + skills if skills else "")},
+                 {"role": "user", "content": user}],
+                json_mode=True, max_tokens=6800,
+            )
+            files, summary = self._parse_dev_reply(reply)
+            if files:
+                plan["summary"] = summary or plan.get("summary")
+                append_log(None, "developer", "info",
+                           f"fast path produced {len(files)} files in one shot")
+                return files
+            raise RuntimeError("fast path yielded no files")
+        except Exception as exc:
+            append_log(None, "developer", "warn",
+                       f"one-shot developer path failed ({str(exc)[:180]}) — "
+                       "falling back to chunked per-file generation")
+
+        # ── CHUNKED PATH: manifest, then one small call per file ──────────
+        manifest_sys = (
+            "You are the Developer of ArcForge planning file layout. The "
+            "frontend MUST be Next.js 14 App Router (TypeScript) under "
+            "'frontend/'; the backend language is YOUR choice when needed "
+            "(under 'backend/'). Reply with ONLY a JSON object: "
+            '{"summary": "<one line>", "files": ['
+            '{"path": "frontend/app/page.tsx", "purpose": "<what it contains, precisely>"}'
+            "]} — list EVERY file the app needs (8-14 files), each with a "
+            "purpose precise enough that another engineer could write the "
+            "file from it alone."
         )
+        pace_for_tpm()
+        manifest_reply = llm_chat(
+            [{"role": "system", "content": manifest_sys + ("\n\n" + skills if skills else "")},
+             {"role": "user", "content": user}],
+            json_mode=True, max_tokens=1500,
+        )
+        manifest = _extract_json(manifest_reply)
+        specs = [f for f in (manifest.get("files") or [])
+                 if isinstance(f, dict) and f.get("path")]
+        if not specs:
+            raise RuntimeError("the developer manifest produced no files")
+
+        files: Dict[str, str] = {}
+        for i, spec in enumerate(specs, 1):
+            rel = str(spec["path"]).strip().lstrip("/")
+            purpose = str(spec.get("purpose") or "")[:400]
+            append_log(None, "developer", "info",
+                       f"generating file {i}/{len(specs)}: {rel}")
+            for attempt in range(3):
+                pace_for_tpm(30.0)
+                try:
+                    r = llm_chat(
+                        [{"role": "system", "content": (
+                            "You are the Developer of ArcForge. Write the "
+                            "COMPLETE content of one file. Reply with ONLY "
+                            "a JSON object: "
+                            '{"path": "<the path>", "content": "<full file '
+                            'content>"}. No placeholders, no TODOs, no '
+                            "explanations.")},
+                         {"role": "user", "content":
+                          f"Project: {prompt}\nFile: {rel}\nPurpose: {purpose}\n"
+                          f"Write the complete {rel} now."}],
+                        json_mode=True, max_tokens=6000,
+                    )
+                    data = _extract_json(r)
+                    content = data.get("content")
+                    if isinstance(content, str) and content.strip():
+                        files[rel] = _repair_double_escaped(content)
+                        break
+                    raise RuntimeError("empty content")
+                except Exception as exc:
+                    if attempt == 2:
+                        append_log(None, "developer", "warn",
+                                   f"giving up on {rel}: {str(exc)[:150]}")
+                    else:
+                        time.sleep(10)
+        if not files:
+            raise RuntimeError("the chunked developer phase produced no files")
+        plan["summary"] = manifest.get("summary") or plan.get("summary")
+        append_log(None, "developer", "info",
+                   f"chunked path produced {len(files)}/{len(specs)} files")
+        return files
+
+    def _parse_dev_reply(self, reply: str) -> tuple[Dict[str, str], str]:
+        """Parse a one-shot developer JSON reply into ({path: content}, summary)."""
         data = _extract_json(reply)
         files: Dict[str, str] = {}
         for group in ("backend", "frontend"):
@@ -1079,18 +1168,13 @@ class TaskWorker(threading.Thread):
                 for path, content in blob.items():
                     if isinstance(path, str) and isinstance(content, str) and content.strip():
                         files[path.strip().lstrip("/")] = _repair_double_escaped(content)
-        # Some models return a flat {"files": {...}} — accept that too.
         flat = data.get("files")
         if isinstance(flat, dict) and not files:
             for path, content in flat.items():
                 if isinstance(path, str) and isinstance(content, str) and content.strip():
                     files[path.strip().lstrip("/")] = _repair_double_escaped(content)
-        if not files:
-            raise RuntimeError("the developer phase produced no files")
-        if not data.get("summary"):
-            data["summary"] = "Build finished."
-        plan["summary"] = data["summary"] or plan.get("summary")
-        return files
+        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        return files, summary
 
     def _write_files(self, files: Dict[str, str], task_id: str) -> List[Dict[str, str]]:
         """Native writes into /workspace — instant inotify for dev-server HMR."""
