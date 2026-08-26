@@ -564,6 +564,22 @@ rt_mux = ReverseTunnelMultiplexer()
 # ---------------------------------------------------------------------------
 
 
+# Track when the last LLM call finished, for TPM pacing (see llm_chat
+# docstring). Simple module-global — the worker thread is the only caller.
+_last_llm_done_ts = 0.0
+TPM_GAP_S = 65.0  # Groq's token budget window is per-minute; 65s is safe.
+
+
+def pace_for_tpm() -> None:
+    """Block until the previous LLM call is ≥ TPM_GAP_S ago (big requests
+    only pass the TPM pre-check on a cold window). No-op on a cold clock."""
+    global _last_llm_done_ts
+    wait = _last_llm_done_ts + TPM_GAP_S - time.time()
+    if wait > 0:
+        log.info("tpm pacing: sleeping %.1fs before the next LLM call", wait)
+        time.sleep(wait)
+
+
 def llm_chat(
     messages: List[Dict[str, str]],
     json_mode: bool = False,
@@ -572,10 +588,21 @@ def llm_chat(
     """Call the configured OpenAI-compatible endpoint. Raises RuntimeError
     with a readable message on failure (the worker catches and degrades).
 
+    GROQ TPM NOTE (live-measured 2026-08-27): this account's tier enforces
+    ~8k tokens/min. The pre-check rejects prompt+max_tokens that exceed
+    the CURRENT minute's remaining budget — so a big request passes on a
+    cold minute but 413s (`rate_limit_exceeded`, code `tokens`) when it
+    follows another call too closely. Empirically a cold-minute burst of
+    12k max_tokens + ~5k real completion streams fine and fast (~450
+    tok/s). llm_chat therefore: (a) records the time of every successful
+    call, (b) exposes pace_for_tpm() so the pipeline can space a big call
+    at least TPM_GAP_S after the previous one, and (c) retries 429/413
+    rate-limit responses after sleeping out the window.
+
     Dispatches on the ORCH_LLM_URL scheme:
       - "reverse-tunnel://"  →  send a `req` frame over the inbound
         /reverse-tunnel WS to the backend; the backend injects the real
-        NVIDIA key server-side and streams res/chunk/done back.
+        provider key server-side and streams res/chunk/done back.
       - "http(s)://..."       →  legacy urllib POST (used in non-Daytona
         environments or where the egress filter isn't blocking).
     """
@@ -617,6 +644,8 @@ def llm_chat(
             content = payload["choices"][0]["message"]["content"]
             if not isinstance(content, str) or not content.strip():
                 raise RuntimeError("LLM returned an empty message")
+            global _last_llm_done_ts
+            _last_llm_done_ts = time.time()
             return content
         except HTTPError as exc:
             # 429 -> retry with backoff (free-tier rate limits); others raise.
@@ -648,6 +677,7 @@ def _llm_chat_via_reverse_tunnel(
     frame send + future await both happen on _LOOP (single-threaded
     by definition — no thread-safety issues on the multiplexer).
     """
+    global _last_llm_done_ts
     loop = _LOOP
     if loop is None or loop.is_closed():
         raise RuntimeError("reverse-tunnel: asyncio loop not initialized")
@@ -715,14 +745,23 @@ def _llm_chat_via_reverse_tunnel(
             raise RuntimeError(f"reverse-tunnel LLM call failed: {exc}") from exc
 
         status = entry.status or 502
-        if status == 429 and attempt < 2:
-            # NVIDIA free-tier rate limit — retry with backoff.
-            last_err = RuntimeError(f"LLM HTTP 429: rate-limited")
-            time.sleep(20 * (attempt + 1))
+        body_preview = "".join(entry.body_parts)[:600]
+        # Groq rate limits: 429 (RPM) or 413 with code `tokens`/
+        # `rate_limit_exceeded` (TPM — the request exceeded the current
+        # minute's remaining budget). Both are TRANSIENT: sleep out the
+        # window and retry. Other statuses are real errors — raise.
+        tpm_limited = status == 413 and (
+            "rate_limit_exceeded" in body_preview or "tokens per minute" in body_preview
+        )
+        if (status == 429 or tpm_limited) and attempt < 2:
+            last_err = RuntimeError(
+                f"LLM HTTP {status}: rate-limited — {body_preview[:200]}")
+            log.warning("llm rate-limited (HTTP %s) — sleeping out the window, retry %d/2",
+                        status, attempt + 1)
+            time.sleep(65)
             continue
         if status != 200:
-            body_text = "".join(entry.body_parts)[:500]
-            raise RuntimeError(f"LLM HTTP {status}: {body_text}")
+            raise RuntimeError(f"LLM HTTP {status}: {body_preview[:500]}")
 
         # Success — assemble the JSON payload the same way the urllib
         # path would: parse the body and extract choices[0].message.content.
@@ -736,6 +775,7 @@ def _llm_chat_via_reverse_tunnel(
         content = payload["choices"][0]["message"]["content"]
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("LLM returned an empty message")
+        _last_llm_done_ts = time.time()
         return content
 
     raise RuntimeError(f"reverse-tunnel LLM failed after retries: {last_err}")
@@ -991,8 +1031,8 @@ class TaskWorker(threading.Thread):
         PLATFORM MANDATE (2026-08-27): the frontend is ALWAYS a Next.js
         (App Router, TypeScript) app under "frontend/"; the model picks the
         BACKEND language/framework itself when the app needs one. The
-        developer-phase output budget is 32768 tokens so a complete Next.js
-        app fits in one JSON reply.
+        developer-phase output budget is 28000 tokens so a complete Next.js
+        app fits in one JSON reply (within Groq free-tier TPM on a cold window).
         """
         system = (
             "You are the Developer of ArcForge. Implement the planned app "
@@ -1023,9 +1063,13 @@ class TaskWorker(threading.Thread):
             f"Plan: {json.dumps(plan, ensure_ascii=False)}\n\n"
             f"Original request: {prompt}\n\nProduce the complete file set."
         )
+        # TPM pacing: this is the BIG call (prompt+max_tokens ~29k). It only
+        # passes Groq's per-minute pre-check on a cold window — the architect
+        # call just ran, so sleep out the remainder of the window first.
+        pace_for_tpm()
         reply = llm_chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            json_mode=True, max_tokens=32768,
+            json_mode=True, max_tokens=28000,
         )
         data = _extract_json(reply)
         files: Dict[str, str] = {}
