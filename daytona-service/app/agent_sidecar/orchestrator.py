@@ -709,6 +709,34 @@ async def _rt_send_and_await(req_id: str, frame: Dict[str, Any]) -> _InflightRT:
     return entry
 
 
+def _repair_double_escaped(text: str) -> str:
+    """Repair LLM file content that arrived with ONLY escaped newlines.
+
+    Observed live (2026-08-26, Nemotron-3.5-lightning "Social media" run):
+    the model double-escapes newlines in JSON file content, so app.py and
+    package.json land as a SINGLE line full of literal '\\n' two-char
+    sequences — py_compile fails on line 1 and npm dies with EJSONPARSE.
+
+    Safety: fires ONLY when the content has zero REAL newlines but at
+    least one escaped one. Any legitimately-formatted code file always
+    has real newlines, so healthy files are never touched (a literal
+    '\\n' inside a Python/JS string on a normal multi-line file stays
+    exactly as the model wrote it).
+    """
+    if not text:
+        return text
+    real_nl = text.count("\n")
+    lit_nl = text.count("\\n")
+    if real_nl == 0 and lit_nl >= 1:
+        return (
+            text.replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace('\\"', '"')
+        )
+    return text
+
+
 def _extract_json(text: str) -> Dict[str, Any]:
     """Parse the first JSON object out of an LLM reply (handles markdown
     fences and preamble prose)."""
@@ -918,13 +946,13 @@ class TaskWorker(threading.Thread):
             if isinstance(blob, dict):
                 for path, content in blob.items():
                     if isinstance(path, str) and isinstance(content, str) and content.strip():
-                        files[path.strip().lstrip("/")] = content
+                        files[path.strip().lstrip("/")] = _repair_double_escaped(content)
         # Some models return a flat {"files": {...}} — accept that too.
         flat = data.get("files")
         if isinstance(flat, dict) and not files:
             for path, content in flat.items():
                 if isinstance(path, str) and isinstance(content, str) and content.strip():
-                    files[path.strip().lstrip("/")] = content
+                    files[path.strip().lstrip("/")] = _repair_double_escaped(content)
         if not files:
             raise RuntimeError("the developer phase produced no files")
         if not data.get("summary"):
