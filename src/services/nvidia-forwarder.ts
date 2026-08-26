@@ -55,34 +55,50 @@ export interface ForwardParams {
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /**
- * Resolve the NVIDIA base URL + API key.
+ * Resolve the upstream LLM base URL + API key (GROQ since 2026-08-27;
+ * NVIDIA kept only as a legacy fallback).
  *
  * Priority:
- *  1. `NVIDIA_NIM_API_KEY` + `NVIDIA_NIM_BASE_URL` env vars (explicit
- *     tunnel-only config — lets ops point the tunnel at a different
- *     NVIDIA endpoint without touching the single-mode chat config).
- *  2. `getSingleModeLlmConfig()` from `agent-platform.ts` — the shared
+ *  1. `GROQ_API_KEY` (+ optional `GROQ_BASE_URL`, default
+ *     `https://api.groq.com/openai/v1`) — the primary provider.
+ *  2. `NVIDIA_NIM_API_KEY` + `NVIDIA_NIM_BASE_URL` env vars (legacy
+ *     tunnel-only config — kept so a stale Render env var can still
+ *     intentionally pin the old provider).
+ *  3. `getSingleModeLlmConfig()` from `agent-platform.ts` — the shared
  *     source of truth for url+key+model used by the existing
- *     `/api/llm/chat` HTTP proxy.
+ *     `/api/llm/chat` HTTP proxy (now Groq-first too).
  *
- * The single-mode URL is the FULL chat endpoint
- * (`https://integrate.api.nvidia.com/v1/chat/completions`), so we strip
- * the trailing `/chat/completions` to recover a `/v1` base. We also
+ * All provider URLs are FULL chat endpoints
+ * (`https://api.groq.com/openai/v1/chat/completions`), so we strip the
+ * trailing `/chat/completions` to recover a `/v1`-style base. We also
  * strip a trailing `/v1` so the VM-supplied `path` (which starts with
- * `/v1/...`) can be appended verbatim without double-`/v1`.
+ * `/v1/...`) can be appended verbatim without double-`/v1` — Groq's
+ * `/openai/v1` base becomes `/openai`, and `/v1/chat/completions` from
+ * the VM reconstructs exactly `https://api.groq.com/openai/v1/chat/completions`.
  */
-function resolveNvidiaEndpoint(): { baseUrl: string; key: string } {
+function resolveLlmEndpoint(): { baseUrl: string; key: string } {
   const cfg = getSingleModeLlmConfig();
 
-  const envKey = process.env.NVIDIA_NIM_API_KEY;
-  const envBase = process.env.NVIDIA_NIM_BASE_URL;
+  const groqKey = process.env.GROQ_API_KEY;
+  const nimKey = process.env.NVIDIA_NIM_API_KEY;
+  const nimBase = process.env.NVIDIA_NIM_BASE_URL;
 
-  const key = envKey || cfg.key;
-  let base = (envBase || cfg.url || "https://integrate.api.nvidia.com/v1").trim();
+  let base: string;
+  let key: string;
+  if (groqKey) {
+    key = groqKey;
+    base = (process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1").trim();
+  } else if (nimKey) {
+    key = nimKey;
+    base = (nimBase || cfg.url || "https://integrate.api.nvidia.com/v1").trim();
+  } else {
+    key = cfg.key;
+    base = (cfg.url || "https://api.groq.com/openai/v1").trim();
+  }
 
   // 1) Trim trailing slashes.
   base = base.replace(/\/+$/, "");
-  // 2) Strip a "/chat/completions" tail (the single-mode URL has it).
+  // 2) Strip a "/chat/completions" tail (single-mode URLs have it).
   base = base.replace(/\/chat\/completions$/i, "");
   // 3) Strip a trailing "/v1" so we can append the VM's "/v1/..." path
   //    verbatim without producing a double "/v1/v1/...". (If the base
@@ -171,12 +187,12 @@ export async function* forwardToNvidia(
   params: ForwardParams,
 ): AsyncGenerator<NvidiaForwardEvent, void, void> {
   const { method, path, headers, bodyString } = params;
-  const { baseUrl, key } = resolveNvidiaEndpoint();
+  const { baseUrl, key } = resolveLlmEndpoint();
 
   if (!key) {
     throw new Error(
-      "NVIDIA API key not configured on the tunnel server " +
-        "(set NVIDIA_NIM_API_KEY or SINGLE_MODE_API_KEY).",
+      "LLM API key not configured on the tunnel server " +
+        "(set GROQ_API_KEY, or legacy NVIDIA_NIM_API_KEY/SINGLE_MODE_API_KEY).",
     );
   }
 
@@ -251,7 +267,7 @@ export async function* forwardToNvidia(
       lastErr instanceof Error ? lastErr.message : "unknown fetch failure";
     const causeMsg = causeMessage(lastErr);
     throw new Error(
-      `NVIDIA upstream unreachable: ${message}${causeMsg ? ` (cause: ${causeMsg})` : ""}`,
+      `LLM upstream unreachable: ${message}${causeMsg ? ` (cause: ${causeMsg})` : ""}`,
     );
   }
 
@@ -269,9 +285,9 @@ export async function* forwardToNvidia(
     }
     logger.warn(
       { status: response.status, url, method, detailPreview: detail.slice(0, 200) },
-      "nvidia-forwarder: upstream non-2xx",
+      "llm-forwarder: upstream non-2xx",
     );
-    throw new Error(`NVIDIA upstream HTTP ${response.status}: ${detail}`);
+    throw new Error(`LLM upstream HTTP ${response.status}: ${detail}`);
   }
 
   // 2xx — yield the head (status + headers) first.

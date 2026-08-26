@@ -181,7 +181,7 @@ router.get("/agent-info/:projectId", async (req: Request, res: Response, next: N
 
     // No sandbox provisioned yet — nothing to probe.
     if (!row?.sandbox_id) {
-      res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false });
+      res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false, app_url: null, app_port: null });
       return;
     }
 
@@ -194,7 +194,7 @@ router.get("/agent-info/:projectId", async (req: Request, res: Response, next: N
       alive = false;
     }
     if (!alive) {
-      res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false });
+      res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false, app_url: null, app_port: null });
       return;
     }
 
@@ -222,7 +222,7 @@ router.get("/agent-info/:projectId", async (req: Request, res: Response, next: N
       { projectId: req.params.projectId, err: error instanceof Error ? error.message : error },
       "agent-info probe failed — frontend will use host-side SSE",
     );
-    res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false });
+    res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false, app_url: null, app_port: null });
   }
 });
 

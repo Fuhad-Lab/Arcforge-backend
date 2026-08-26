@@ -8,6 +8,7 @@
  */
 import { logger } from "../lib/logger";
 import { getSingleModeLlmConfig } from "./agent-platform";
+import { PLATFORM_SKILLS } from "./skill-registry";
 
 // Generous timeouts — the Render-hosted daytona-service may cold-start.
 const TIMEOUTS = {
@@ -159,7 +160,13 @@ export type DaytonaWorkspaceInitResult = {
 };
 
 /** Connection info for the in-VM agent orchestrator sidecar, probed live
- * from the daytona-service (which reads the token from inside the VM). */
+ * from the daytona-service (which reads the token from inside the VM).
+ *
+ * `app_url`/`app_port`: a SIGNED Daytona preview URL for the port the
+ * generated app's dev server is listening on (3000 for the mandated
+ * Next.js frontend, 5173 for legacy Vite apps). Null until the debugger
+ * phase actually brings a server up — the studio Preview tab iframes it
+ * for a REAL live preview of the running app. */
 export type AgentSidecarInfo = {
   installed: boolean;
   port: number;
@@ -167,6 +174,8 @@ export type AgentSidecarInfo = {
   token: string | null;
   launcher: string | null;
   alive: boolean;
+  app_url?: string | null;
+  app_port?: number | null;
 };
 
 /** LLM config handed to the in-VM orchestrator daemon at sandbox creation
@@ -195,12 +204,18 @@ function buildAgentLlmConfig(): AgentLlmConfig | undefined {
  * Create (and scaffold) a project workspace VM via the daytona-service.
  * The sandbox is labeled with {user_id, project_id, type:"workspace"} and
  * scaffolded with /workspace/{git,frontend,backend} + /workspace/logo.png.
+ *
+ * `skills` (the platform's 17-skill catalog) rides along so the
+ * daytona-service can plant skills.json next to the sidecar — the in-VM
+ * orchestrator injects them into its generation prompts (single source of
+ * truth stays skill-registry.ts).
  */
 export async function initWorkspace(params: {
   project_id: string;
   user_id?: string;
   language?: string;
   agent_llm?: AgentLlmConfig;
+  skills?: Array<{ name: string; instruction: string }>;
 }): Promise<DaytonaWorkspaceInitResult> {
   const result = await proxyToDaytona("/init", {
     method: "POST",
@@ -209,6 +224,7 @@ export async function initWorkspace(params: {
       user_id: params.user_id ?? null,
       language: normalizeLanguage(params.language),
       ...(params.agent_llm ? { agent_llm: params.agent_llm } : {}),
+      ...(params.skills?.length ? { skills: params.skills } : {}),
     },
     timeoutMs: TIMEOUTS.init,
   });
@@ -423,12 +439,18 @@ export async function ensureProjectSandbox(
 
   // 2. Provision a fresh, scaffolded sandbox labeled with user + project ids.
   //    The In-VM agent sidecar receives the single-mode LLM config so its
-  //    pipeline runs autonomously inside the VM (In-VM Sidecar pattern).
+  //    pipeline runs autonomously inside the VM (In-VM Sidecar pattern), and
+  //    the platform's 17-skill catalog so the in-VM prompts carry the same
+  //    mandatory skills the host-side pipeline always injected.
   const init = await initWorkspace({
     project_id: row.id,
     user_id: row.user_id,
     language: options.language,
     agent_llm: buildAgentLlmConfig(),
+    skills: PLATFORM_SKILLS.map((s) => ({
+      name: s.name,
+      instruction: s.instruction,
+    })),
   });
   const sandboxId = init.sandbox_id;
 

@@ -165,42 +165,48 @@ export type ProjectState = {
   negotiationState: NegotiationState;
 };
 
-// Defaults validated against the NVIDIA API model catalog (2026-08-23).
-// The previous defaults (deepseek-r1, qwen2.5-72b, glm4.7, qwen3-coder-480b)
-// are not served by integrate.api.nvidia.com for this account → HTTP 404.
-// Defaults validated against the NVIDIA API model catalog (2026-08-23).
-// minimax-m3 measured ~118 tok/s with strong code output; deepseek-v4-flash
-// and llama-3.3-70b are too slow on this account for a multi-call pipeline.
+// GROQ MIGRATION (2026-08-27, user mandate): NVIDIA integrate.api.nvidia.com
+// measured 10s+ per completion with frequent connect blips — the whole
+// pipeline felt slow. Groq serves the same OpenAI-compatible shape at
+// ~10-30x the tokens/sec. Per the user's instruction the code models are
+// Llama-3-70B-class (llama-3.3-70b-versatile) with Qwen-32B as the env-
+// overridable alternate (qwen/qwen3-32b). Both support JSON mode on Groq.
+// Env overrides keep the NVIDIA_* names so existing Render config keeps
+// working; only the defaults changed.
 const DEFAULT_MODELS: Record<Role, string> = {
-  leader: process.env.NVIDIA_LEADER_MODEL ?? "minimaxai/minimax-m3",
-  backend: process.env.NVIDIA_BACKEND_MODEL ?? "minimaxai/minimax-m3",
-  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "minimaxai/minimax-m3",
-  debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "minimaxai/minimax-m3",
+  leader: process.env.NVIDIA_LEADER_MODEL ?? "llama-3.3-70b-versatile",
+  backend: process.env.NVIDIA_BACKEND_MODEL ?? "llama-3.3-70b-versatile",
+  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "qwen/qwen3-32b",
+  debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "llama-3.3-70b-versatile",
 };
 
 // ──────────────────────────────────────────────────────────────────────────
-// GLM 5.2 ROUTING FOR SINGLE ("SOLO") MODE
+// GROQ ROUTING FOR SINGLE ("SOLO") MODE
 // ──────────────────────────────────────────────────────────────────────────
-// The user explicitly requires the single-agent ("Solo", labelled "GLM-5.2"
-// in the UI) mode to be powered by GLM 5.2. Swarm mode keeps the multi-agent
-// DEFAULT_MODELS setup above.
+// The single-agent ("Solo") mode — the config that powers the In-VM sidecar
+// pipeline (handed to the orchestrator daemon at sandbox creation via
+// daytona-workspace) — runs on Groq per the user's mandate: "Llama 3 70B or
+// Qwen 32B" for code. Primary = llama-3.3-70b-versatile (Llama-3-70B class,
+// JSON-mode capable, very fast); alternate = qwen/qwen3-32b via env.
 //
-// The single-mode endpoint is OpenAI-compatible (same /v1/chat/completions
-// shape NVIDIA uses), so it reuses `nvidiaCallModelRaw` with an explicit
-// `apiUrl` / `apiKey` override. On Render, set:
-//   SINGLE_MODE_MODEL       = minimaxai/minimax-m3 (any NVIDIA-hosted model id)
-//   SINGLE_MODE_API_URL     = https://open.bigmodel.cn/api/paas/v4/chat/completions
-//   SINGLE_MODE_API_KEY     = <Zhipu / OpenAI-compatible key>
-// If unset, single mode falls back to the NVIDIA endpoint + key so the
-// pipeline still works in dev/test without extra configuration.
+// Groq is OpenAI-compatible (same /v1/chat/completions shape NVIDIA used),
+// so every call path (host pipeline + reverse-tunnel forwarder) is unchanged
+// apart from URL/key/model. On Render, set:
+//   GROQ_API_KEY            = gsk_...                         (required)
+//   GROQ_BASE_URL           = https://api.groq.com/openai/v1  (default)
+//   SINGLE_MODE_MODEL       = llama-3.3-70b-versatile         (default)
+// Legacy NVIDIA keys are kept as last-resort fallbacks for stale dev envs.
 export const SINGLE_MODE_MODEL =
-  process.env.SINGLE_MODE_MODEL ?? "nvidia/nemotron-3.5-lightning-30b-a3b";
+  process.env.SINGLE_MODE_MODEL ?? "llama-3.3-70b-versatile";
 const SINGLE_MODE_API_URL =
   process.env.SINGLE_MODE_API_URL ??
-  process.env.NVIDIA_API_URL ??
-  "https://integrate.api.nvidia.com/v1/chat/completions";
+  (process.env.GROQ_BASE_URL
+    ? `${process.env.GROQ_BASE_URL.replace(/\/+$/, "")}/chat/completions`
+    : "https://api.groq.com/openai/v1/chat/completions");
 const SINGLE_MODE_API_KEY =
-  process.env.SINGLE_MODE_API_KEY ?? process.env.NVIDIA_API_KEY;
+  process.env.SINGLE_MODE_API_KEY ??
+  process.env.GROQ_API_KEY ??
+  process.env.NVIDIA_API_KEY;
 
 /**
  * Single-mode ("Solo · GLM") LLM endpoint config, exported for the In-VM
@@ -219,20 +225,14 @@ export function getSingleModeLlmConfig(): { url: string; key: string; model: str
 const MAX_CODE_BYTES = 1_000_000;
 
 // ─── PROCESS-WIDE LLM RATE LIMITER ────────────────────────────────────────
-// The NVIDIA free tier enforces ~1 request per minute per key. Concurrent
-// generations (multiple studios, SSE clients that disconnected but whose
-// backend pipeline keeps running) all share that quota — without
-// serialization they collide in 429 retry loops that starve each other
-// forever (observed live: every generation degraded to empty code while
-// each pipeline's 30s-backoff retries kept missing the 60s window).
-//
-// acquireLlmSlot() serializes EVERY NVIDIA call process-wide and spaces
-// consecutive calls MIN_CALL_SPACING_MS apart, so any number of in-flight
-// generations cooperatively share the quota. A generation needs ~2-3
-// slots (spec + codegen) → ~2-4 minutes at 1 RPM, and it ALWAYS lands.
+// Historically serialized NVIDIA's ~1-req/min free tier (the 61s spacing is
+// why old generations crawled even when the model itself was quick). Groq's
+// free tier allows ~30 req/min on llama-3.3-70b — the limiter stays (it also
+// protects against retry storms from disconnected SSE clients) but the
+// default spacing drops to 2.5s.
 let llmChain: Promise<void> = Promise.resolve();
 let lastLlmCallAt = 0;
-const MIN_CALL_SPACING_MS = Number(process.env.LLM_MIN_SPACING_MS ?? 61_000);
+const MIN_CALL_SPACING_MS = Number(process.env.LLM_MIN_SPACING_MS ?? 2_500);
 
 async function acquireLlmSlot(): Promise<() => void> {
   let release!: () => void;

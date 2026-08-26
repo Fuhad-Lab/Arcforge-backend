@@ -63,6 +63,11 @@ async def create_workspace(req: CreateWorkspaceRequest) -> WorkspaceInitResponse
                  "model": req.agent_llm.model}
                 if req.agent_llm else None
             ),
+            agent_skills=(
+                [{"name": s.name, "instruction": s.instruction}
+                 for s in req.skills]
+                if req.skills else None
+            ),
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -153,6 +158,8 @@ async def get_agent_info(sandbox_id: str) -> AgentSidecarInfo:
         token=info.get("token"),
         launcher=info.get("launcher"),
         alive=info.get("alive", False),
+        app_url=info.get("app_url"),
+        app_port=info.get("app_port"),
     )
 
 

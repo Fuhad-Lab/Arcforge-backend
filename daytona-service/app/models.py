@@ -238,7 +238,19 @@ class AgentLlmConfig(BaseModel):
     """
     url: str = Field(default="", description="OpenAI-compatible chat-completions URL")
     key: str = Field(default="", description="API key (Bearer)")
-    model: str = Field(default="glm-5.2", description="Model id")
+    model: str = Field(default="llama-3.3-70b-versatile", description="Model id")
+
+
+class SkillInstruction(BaseModel):
+    """One platform skill injected into the in-VM generation prompts.
+
+    Mirrors { name, instruction } from the Node backend's skill-registry —
+    the single source of truth. Written verbatim into skills.json next to
+    the sidecar so the orchestrator's Architect/Developer prompts carry the
+    same mandatory 17-skill catalog the host-side pipeline always used.
+    """
+    name: str = Field(min_length=1, max_length=120)
+    instruction: str = Field(default="", max_length=4000)
 
 
 class CreateWorkspaceRequest(BaseModel):
@@ -256,6 +268,14 @@ class CreateWorkspaceRequest(BaseModel):
             "Optional LLM config for the in-VM agent orchestrator sidecar. "
             "When omitted the sidecar is installed WITHOUT an LLM endpoint "
             "(daemon runs, pipeline degrades to host-side SSE)."
+        ),
+    )
+    skills: list[SkillInstruction] | None = Field(
+        default=None,
+        description=(
+            "Platform skill catalog (17 skills) to plant as skills.json "
+            "next to the sidecar — the in-VM orchestrator injects them "
+            "into its generation prompts."
         ),
     )
 
@@ -337,6 +357,19 @@ class AgentSidecarInfo(BaseModel):
     )
     alive: bool = Field(
         default=False, description="True when the daemon answers /health",
+    )
+    app_url: str | None = Field(
+        default=None,
+        description=(
+            "SIGNED Daytona preview URL for the generated app's dev-server "
+            "port (3000 Next.js / 5173 legacy Vite). Null until a server "
+            "actually answers inside the VM — the studio Preview tab "
+            "iframes it for the REAL live preview."
+        ),
+    )
+    app_port: int | None = Field(
+        default=None,
+        description="The port app_url points at (3000 or 5173), else None",
     )
 
 

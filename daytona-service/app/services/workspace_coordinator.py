@@ -75,6 +75,7 @@ class DaytonaWorkspaceManager:
         language: str = "python",
         user_id: str | None = None,
         agent_llm: dict[str, str] | None = None,
+        agent_skills: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Spawn a Daytona MicroVM and enforce the strict directory blueprint.
 
@@ -245,7 +246,9 @@ class DaytonaWorkspaceManager:
             from app.services.agent_installer import agent_installer
 
             install_task = asyncio.create_task(
-                agent_installer.install(sandbox, llm_config=agent_llm),
+                agent_installer.install(
+                    sandbox, llm_config=agent_llm, skills=agent_skills,
+                ),
             )
 
             def _log_sidecar(fut: "asyncio.Future[dict[str, Any]]") -> None:

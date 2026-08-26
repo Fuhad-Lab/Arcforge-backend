@@ -25,6 +25,7 @@ the platform falls back to the host-side SSE pipeline for that project.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -54,6 +55,12 @@ _SIDECAR_SRC_DIR = Path(__file__).resolve().parent.parent / "agent_sidecar"
 # started (see ecosystem.config.js — only agent-brain is launched).
 _PIP_DEPS = ("fastapi", "uvicorn[standard]", "aiohttp", "curl_cffi")
 
+# Ports the generated app's dev server may listen on, in probe-priority
+# order. 3000 = the mandated Next.js frontend (`next dev -p 3000`);
+# 5173 = legacy Vite apps from older generations. The orchestrator's
+# debugger phase launches the right one for the framework it detects.
+APP_PORTS = (3000, 5173)
+
 
 class AgentInstaller:
     """Install / inspect / broker the in-VM orchestrator daemon."""
@@ -66,8 +73,15 @@ class AgentInstaller:
         self,
         sandbox: Any,
         llm_config: dict[str, str] | None = None,
+        skills: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Install + launch the orchestrator inside `sandbox`.
+
+        `skills` — the platform's 17-skill catalog ({name, instruction}),
+        written verbatim to {SIDE_CAR_HOME}/skills.json. The orchestrator
+        loads it at boot and injects the skills into its Architect/
+        Developer prompts (the in-VM twin of the host pipeline's
+        god-mode-protocol skill injection).
 
         Returns {"installed", "port", "token", "launcher", "preview_url"}.
         Never raises — failures degrade to {"installed": False, ...}.
@@ -77,7 +91,7 @@ class AgentInstaller:
         llm = {
             "url": (llm_config or {}).get("url", ""),
             "key": (llm_config or {}).get("key", ""),
-            "model": (llm_config or {}).get("model", "glm-5.2"),
+            "model": (llm_config or {}).get("model", "llama-3.3-70b-versatile"),
         }
         result: dict[str, Any] = {
             "installed": False,
@@ -150,6 +164,15 @@ class AgentInstaller:
                 token.encode("utf-8"),
                 f"{SIDE_CAR_HOME}/agent_token",
             )
+            # Platform skills (the 17-skill catalog) — planted next to the
+            # daemon so its generation prompts carry the same mandatory
+            # skills the host-side pipeline injects. No secrets inside.
+            if skills:
+                await asyncio.to_thread(
+                    sandbox.fs.upload_file,
+                    json.dumps(skills, ensure_ascii=False).encode("utf-8"),
+                    f"{SIDE_CAR_HOME}/skills.json",
+                )
 
             # 3) Prepare dirs, symlink the canonical path, persist the
             #    tunnel + LLM config as the daemons' env file (mode 600).
@@ -363,6 +386,13 @@ class AgentInstaller:
         Called by the Node backend (JWT + ownership-checked) so the studio
         frontend can connect its WebSocket. The token NEVER transits any
         database — it lives only inside the VM and this broker response.
+
+        Additionally probes the generated app's dev-server ports (3000
+        Next.js / 5173 legacy Vite) from INSIDE the VM. When one answers,
+        a SIGNED Daytona preview URL is minted for it and returned as
+        app_url/app_port — the studio Preview tab iframes that URL for
+        the REAL live preview (closing the old design gap where the VM
+        flow never fed the preview surface). Null until a server is up.
         """
         info: dict[str, Any] = {
             "installed": False,
@@ -370,6 +400,8 @@ class AgentInstaller:
             "url": None,
             "token": None,
             "alive": False,
+            "app_url": None,
+            "app_port": None,
         }
         try:
             out = await asyncio.to_thread(
@@ -394,7 +426,51 @@ class AgentInstaller:
         except Exception as exc:
             logger.warning("agent-info probe failed for %s: %s",
                            getattr(sandbox, "id", "?"), exc)
+            return info
+
+        # ── App dev-server probe (best-effort; never fails the call) ────
+        app_port = await self._probe_app_port(sandbox)
+        if app_port:
+            try:
+                link = await asyncio.to_thread(
+                    sandbox.create_signed_preview_url, app_port, 86400,
+                )
+                url = getattr(link, "url", None)
+                if url:
+                    info["app_url"] = str(url)
+                    info["app_port"] = app_port
+            except Exception as exc:
+                logger.info("signed app preview link unavailable for %s: %s",
+                            getattr(sandbox, "id", "?"), exc)
         return info
+
+    async def _probe_app_port(self, sandbox: Any) -> int | None:
+        """Return the first APP_PORTS port answering HTTP inside the VM.
+
+        One shell round-trip probes every candidate port. Any HTTP status
+        OTHER than 000 (connect failure) counts as UP — a dev server that
+        answers 404 for / is still a live server worth previewing; only
+        curl's 000 (could not connect) means "nothing listens here".
+        """
+        probe = "; ".join(
+            f"printf '{port}='; curl -s -o /dev/null -w '%{{http_code}}' "
+            f"http://localhost:{port}/ --max-time 2"
+            for port in APP_PORTS
+        )
+        try:
+            out = await asyncio.to_thread(
+                sandbox.process.exec, probe, "/home/daytona", None, 12,
+            )
+            text = (getattr(out, "result", "") or "")
+        except Exception:
+            return None
+        for port in APP_PORTS:
+            marker = f"{port}="
+            if marker in text:
+                code = text.split(marker, 1)[1][:3].strip()
+                if code.isdigit() and code != "000":
+                    return port
+        return None
 
     # ------------------------------------------------------------------
     # Internals

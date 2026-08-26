@@ -146,7 +146,18 @@ LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "900"))
 LLM_READY = os.environ.get("ORCH_LLM_READY", "1") == "1"
 
 # Pipeline tuning
-DEV_SERVER_PORT = int(os.environ.get("ORCH_DEV_SERVER_PORT", "5173"))
+# ── Frontend dev-server ports (2026-08-27 mandate: Next.js-only frontends) ──
+# The platform mandate is: the AI produces a Next.js frontend and picks the
+# backend language itself. Next dev runs on 3000; 5173 is kept only for
+# legacy Vite apps (older generations / manual prompts) — the debugger
+# phase detects the framework from frontend/package.json and launches the
+# right server, and both ports are probed when brokering the preview URL.
+NEXT_DEV_PORT = int(os.environ.get("ORCH_NEXT_PORT", "3000"))
+VITE_DEV_PORT = int(os.environ.get("ORCH_VITE_PORT", "5173"))
+# Back-compat alias: older env files set ORCH_DEV_SERVER_PORT for the Vite
+# server. If present, it overrides VITE_DEV_PORT (not NEXT_DEV_PORT).
+DEV_SERVER_PORT = int(os.environ.get("ORCH_DEV_SERVER_PORT", str(VITE_DEV_PORT)))
+VITE_DEV_PORT = DEV_SERVER_PORT
 LOG_TAIL_FOR_SYNC = int(os.environ.get("ORCH_SYNC_LOG_TAIL", "50"))
 
 LOG_FILE = os.environ.get("ORCH_LOG_FILE", os.path.join(SYSTEM_DIR, "orchestrator.log"))
@@ -165,6 +176,50 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("orchestrator")
+
+# ---------------------------------------------------------------------------
+# Platform skills — planted by the host installer as skills.json next to
+# this daemon (the same 17-skill catalog the host-side pipeline injects via
+# god-mode-protocol.ts; single source of truth = skill-registry.ts on the
+# backend). Loaded once at boot and injected into the Architect/Developer
+# prompts so in-VM generations honour the mandatory skills too.
+# ---------------------------------------------------------------------------
+SKILLS: List[Dict[str, str]] = []
+try:
+    _skills_path = os.path.join(SYSTEM_DIR, "skills.json")
+    if os.path.exists(_skills_path):
+        with open(_skills_path, "r", encoding="utf-8") as _fh:
+            _raw = json.load(_fh)
+        if isinstance(_raw, list):
+            SKILLS = [
+                {"name": str(s.get("name", "")).strip(),
+                 "instruction": str(s.get("instruction", "")).strip()}
+                for s in _raw if isinstance(s, dict) and s.get("name")
+            ]
+except Exception as _exc:  # noqa: BLE001 — skills must never break the daemon
+    log.warning("skills.json present but unreadable: %s", _exc)
+
+if SKILLS:
+    log.info("loaded %d platform skills from skills.json", len(SKILLS))
+
+def skills_prompt_block() -> str:
+    """Render the mandatory-skills section injected into generation prompts."""
+    if not SKILLS:
+        return ""
+    lines = [
+        f"## MANDATORY PLATFORM SKILLS ({len(SKILLS)} active — apply while building):"
+    ]
+    for i, s in enumerate(SKILLS, 1):
+        instr = s["instruction"]
+        if len(instr) > 400:
+            instr = instr[:397] + "..."
+        lines.append(f"{i}. {s['name']}: {instr}")
+    lines.append(
+        "- Honour these skills in every file you write (structure, quality, "
+        "security, and completeness they demand). Do not claim a skill was "
+        "applied unless its instruction genuinely shaped the output."
+    )
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # SQLite state store
@@ -877,6 +932,10 @@ class TaskWorker(threading.Thread):
                 "checks": {"ok": debug["ok"], "issues": debug["issues"]},
                 "duration_ms": int((time.time() - started) * 1000),
                 "model": LLM_MODEL,
+                # Port the app dev-server is serving on (null when none) —
+                # the studio re-fetches agent-info on task_done and iframes
+                # the SIGNED preview URL for this port (the REAL preview).
+                "app_port": debug.get("app_port"),
             }
             with _db_lock, db() as conn:
                 conn.execute(
@@ -902,11 +961,19 @@ class TaskWorker(threading.Thread):
         convo = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in history[-8:])
         system = (
             "You are the Architect of ArcForge, an autonomous in-VM build agent. "
-            "Plan the requested app. Reply with ONLY a JSON object: "
+            "Plan the requested app. PLATFORM MANDATE: the frontend MUST be "
+            "Next.js (App Router, TypeScript); you CHOOSE the backend language "
+            "and framework that best serves the app (e.g. Python/Flask, "
+            "Node/Express — or none for a purely static site). "
+            "Reply with ONLY a JSON object: "
             '{"summary": "<one-paragraph user-facing summary of what you will build>", '
             '"components": ["<short list of major components>"], '
-            '"stack": {"frontend": "<e.g. React+Vite>", "backend": "<e.g. Flask or none>"}}'
+            '"stack": {"frontend": "Next.js 14 (App Router, TypeScript)", '
+            '"backend": "<your chosen language+framework, or none>"}}'
         )
+        skills = skills_prompt_block()
+        if skills:
+            system += "\n\n" + skills
         user = f"Conversation so far:\n{convo}\n\nNew request: {prompt}"
         try:
             reply = llm_chat(
@@ -919,25 +986,46 @@ class TaskWorker(threading.Thread):
             return {"summary": f"Building: {prompt[:200]}", "components": [], "stack": {}}
 
     def _developer(self, prompt: str, plan: Dict[str, Any]) -> Dict[str, str]:
-        """Phase 2 — generate the full file set as {path: content}."""
+        """Phase 2 — generate the full file set as {path: content}.
+
+        PLATFORM MANDATE (2026-08-27): the frontend is ALWAYS a Next.js
+        (App Router, TypeScript) app under "frontend/"; the model picks the
+        BACKEND language/framework itself when the app needs one. The
+        developer-phase output budget is 32768 tokens so a complete Next.js
+        app fits in one JSON reply.
+        """
         system = (
-            "You are the Developer of ArcForge. Implement the planned app COMPLETELY. "
-            "Reply with ONLY a JSON object: "
+            "You are the Developer of ArcForge. Implement the planned app "
+            "COMPLETELY. Reply with ONLY a JSON object: "
             '{"summary": "<user-facing summary of what was built and how to run it>", '
             '"backend": {"<path>": "<full file content>"}, '
             '"frontend": {"<path>": "<full file content>"}}. '
-            "Paths are relative (e.g. \"frontend/package.json\", \"backend/app.py\", "
-            "\"frontend/src/App.tsx\"). Frontend must be a self-contained Vite+React app "
-            "(include package.json, index.html, src/*). Backend, when needed, is Flask "
-            "(include requirements.txt). Write REAL, complete, runnable code — no placeholders."
+            "Paths are relative and MUST live under frontend/ or backend/. "
+            "FRONTEND (MANDATORY): a complete Next.js 14 App Router app in "
+            "TypeScript under \"frontend/\" — package.json (next@14, react, "
+            "react-dom, scripts dev=\"next dev\"), next.config.mjs, tsconfig.json, "
+            "app/layout.tsx, app/page.tsx, app/globals.css, plus every route, "
+            "component and lib file the app needs. Use Tailwind ONLY if you "
+            "also include its config+postcss files; plain CSS modules or "
+            "globals.css are safer. NO create-react-app, NO Vite, NO "
+            "index.html — Next.js only. "
+            "BACKEND (YOUR CHOICE): if the app needs a server/API, pick ONE "
+            "language+framework (e.g. Python Flask with requirements.txt, or "
+            "Node Express with backend/package.json + server.js) and write "
+            "complete runnable code under \"backend/\" with clear instructions "
+            "in the summary. If the frontend alone suffices, omit backend. "
+            "Write REAL, complete, runnable code — no placeholders, no TODOs."
         )
+        skills = skills_prompt_block()
+        if skills:
+            system += "\n\n" + skills
         user = (
             f"Plan: {json.dumps(plan, ensure_ascii=False)}\n\n"
             f"Original request: {prompt}\n\nProduce the complete file set."
         )
         reply = llm_chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            json_mode=True, max_tokens=16384,
+            json_mode=True, max_tokens=32768,
         )
         data = _extract_json(reply)
         files: Dict[str, str] = {}
@@ -1018,36 +1106,103 @@ class TaskWorker(threading.Thread):
             elif path.endswith((".js", ".mjs", ".cjs")):
                 shell(f'node --check "{path}"', WORKSPACE, "debugger", 30)
 
-        # 2) Frontend deps + dev server
+        # 2) Frontend deps + dev server — framework-aware.
+        #    The mandate is Next.js, but legacy Vite apps (older generations)
+        #    are still served. Detection: package.json deps contain "next".
+        #    Next dev binds 0.0.0.0 so the SIGNED Daytona preview URL for the
+        #    app port can reach it (that URL is what the studio Preview tab
+        #    iframes — the REAL live preview).
         fe = os.path.join(WORKSPACE, "frontend")
+        app_port: Optional[int] = None
         if os.path.exists(os.path.join(fe, "package.json")):
-            shell("npm install --no-audit --no-fund --loglevel=error",
-                  fe, "debugger", 300)
-            probe = shell(
-                f"curl -s -o /dev/null -w '%{{http_code}}' "
-                f"http://localhost:{DEV_SERVER_PORT}/ --max-time 2",
-                fe, "debugger", 10,
-            )
-            already_up = str(probe.get("stdout", "")).strip().startswith(("2", "3"))
-            if not already_up:
-                # Launch detached — the dev server outlives the daemon AND
-                # every WebSocket client.
-                shell(
-                    f"nohup npx vite --port {DEV_SERVER_PORT} --host --strictPort "
-                    f"> /tmp/frontend-dev.log 2>&1 < /dev/null &",
-                    fe, "debugger", 20,
-                )
-                shell("sleep 4", fe, "debugger", 10)
-                shell(
+            try:
+                with open(os.path.join(fe, "package.json"), "r", encoding="utf-8") as fh:
+                    pkg = json.load(fh)
+                deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+                is_next = "next" in deps or any(p.endswith("next.config.mjs") or p.endswith("next.config.js") for p in [f["path"] for f in written])
+            except Exception:
+                is_next = False
+            if is_next:
+                app_port = NEXT_DEV_PORT
+                shell("npm install --no-audit --no-fund --loglevel=error",
+                      fe, "debugger", 600)
+                probe = shell(
                     f"curl -s -o /dev/null -w '%{{http_code}}' "
-                    f"http://localhost:{DEV_SERVER_PORT}/ --max-time 3",
+                    f"http://localhost:{NEXT_DEV_PORT}/ --max-time 3",
                     fe, "debugger", 10,
                 )
+                already_up = str(probe.get("stdout", "")).strip().startswith(("2", "3"))
+                if not already_up:
+                    # Kill any stale server on the port first (a previous
+                    # generation's next dev may still hold it).
+                    shell(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1",
+                          fe, "debugger", 15)
+                    shell(
+                        f"nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
+                        f"> /tmp/frontend-dev.log 2>&1 < /dev/null &",
+                        fe, "debugger", 20,
+                    )
+                    # Next dev cold-boots + compiles the first route on the
+                    # first request — give it room, then warm it with a real
+                    # request so the first user page load is fast.
+                    for _ in range(4):
+                        shell("sleep 5", fe, "debugger", 10)
+                        warm = shell(
+                            f"curl -s -o /dev/null -w '%{{http_code}}' "
+                            f"http://localhost:{NEXT_DEV_PORT}/ --max-time 20",
+                            fe, "debugger", 30,
+                        )
+                        if str(warm.get("stdout", "")).strip().startswith(("2", "3")):
+                            break
+            else:
+                # Legacy Vite app — serve on the Vite port as before.
+                app_port = VITE_DEV_PORT
+                shell("npm install --no-audit --no-fund --loglevel=error",
+                      fe, "debugger", 300)
+                probe = shell(
+                    f"curl -s -o /dev/null -w '%{{http_code}}' "
+                    f"http://localhost:{VITE_DEV_PORT}/ --max-time 2",
+                    fe, "debugger", 10,
+                )
+                already_up = str(probe.get("stdout", "")).strip().startswith(("2", "3"))
+                if not already_up:
+                    # Launch detached — the dev server outlives the daemon AND
+                    # every WebSocket client.
+                    shell(
+                        f"nohup npx vite --port {VITE_DEV_PORT} --host --strictPort "
+                        f"> /tmp/frontend-dev.log 2>&1 < /dev/null &",
+                        fe, "debugger", 20,
+                    )
+                    shell("sleep 4", fe, "debugger", 10)
+                    shell(
+                        f"curl -s -o /dev/null -w '%{{http_code}}' "
+                        f"http://localhost:{VITE_DEV_PORT}/ --max-time 3",
+                        fe, "debugger", 10,
+                    )
 
-        # 3) Backend deps + server
+        # 3) Backend deps + server (language chosen by the model).
         be = os.path.join(WORKSPACE, "backend")
         if os.path.exists(os.path.join(be, "requirements.txt")):
             shell("pip install -q -r requirements.txt", be, "debugger", 300)
+        be_pkg = os.path.join(be, "package.json")
+        if os.path.exists(be_pkg) and not os.path.exists(os.path.join(be, "app.py")) \
+                and not os.path.exists(os.path.join(be, "main.py")) \
+                and not os.path.exists(os.path.join(be, "server.py")):
+            # Node backend — install + start via its scripts (npm start, else dev).
+            shell("npm install --no-audit --no-fund --loglevel=error",
+                  be, "debugger", 600)
+            try:
+                with open(be_pkg, "r", encoding="utf-8") as fh:
+                    bpkg = json.load(fh)
+                bscript = "start" if "start" in (bpkg.get("scripts") or {}) else \
+                          ("dev" if "dev" in (bpkg.get("scripts") or {}) else None)
+            except Exception:
+                bscript = None
+            if bscript:
+                shell(
+                    f"nohup npm run {bscript} > /tmp/backend-dev.log 2>&1 < /dev/null &",
+                    be, "debugger", 20,
+                )
         for entry in ("app.py", "main.py", "server.py"):
             if os.path.exists(os.path.join(be, entry)):
                 shell(
@@ -1056,7 +1211,15 @@ class TaskWorker(threading.Thread):
                 )
                 break
 
-        return {"ok": ok, "issues": "; ".join(issues)[:1000], "commands": ran}
+        # 4) Publish the app-server state — the frontend re-fetches
+        #    agent-info on task_done and gets a SIGNED preview URL for this
+        #    port; broadcasting it also live-updates any connected studio.
+        if app_port is not None:
+            set_status("app", {"port": app_port, "up": True, "task_id": task_id})
+            emit({"type": "status", "status": get_status("app")})
+
+        return {"ok": ok, "issues": "; ".join(issues)[:1000], "commands": ran,
+                "app_port": app_port}
 
 
 # ---------------------------------------------------------------------------
