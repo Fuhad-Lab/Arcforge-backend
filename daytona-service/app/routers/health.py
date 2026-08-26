@@ -48,17 +48,37 @@ async def health_check() -> HealthResponse:
     summary="Readiness probe (checks Daytona connectivity)",
 )
 async def readiness_check() -> HealthResponse:
-    """Return service readiness.  200 only if Daytona API is reachable."""
+    """Return service readiness.  200 only if Daytona API is reachable.
+
+    SIDE-EFFECT-FREE BY DESIGN (incident 2026-08-26): an UNFILTERED
+    ``daytona.list()`` marks every listed sandbox as active (a bare list
+    call refreshes ``lastActivityAt`` on all sandboxes within ~5 s),
+    which permanently defeats ``autoStopInterval`` — idle workspaces
+    accumulated until the org memory quota (10 GiB) was exhausted and
+    every new sandbox failed with "Total memory limit exceeded",
+    surfacing as "the studio page doesn't connect". This probe now uses
+    a labels-filtered query that matches nothing real: it still proves
+    API reachability + key validity, but touches no real sandbox. The
+    true sandbox count / manual cleanup lives at POST /workspace/reap-idle.
+    """
     import asyncio
 
+    from daytona_sdk import ListSandboxesQuery
+
     daytona_connected = False
-    active_sandboxes = 0
 
     try:
         daytona = get_daytona()
-        sandboxes = await asyncio.to_thread(daytona.list)
+        probe_query = ListSandboxesQuery(labels={"probe": "arcforge-readiness"})
+
+        def _probe() -> list:
+            # Materialise the iterator — `len()` on a bare generator raises
+            # TypeError (the old code set connected=True before a len() that
+            # always threw, silently reporting connected=true / count=0).
+            return list(daytona.list(probe_query))
+
+        await asyncio.to_thread(_probe)
         daytona_connected = True
-        active_sandboxes = len(sandboxes)
     except Exception:
         logger.warning("Daytona readiness check failed", exc_info=True)
 
@@ -66,7 +86,10 @@ async def readiness_check() -> HealthResponse:
         status="ready" if daytona_connected else "degraded",
         version=settings.service_version,
         daytona_connected=daytona_connected,
-        active_sandboxes=active_sandboxes,
+        # Deliberately not counted: an unfiltered count would refresh
+        # activity on every sandbox. Use POST /workspace/reap-idle for
+        # the real inventory.
+        active_sandboxes=0,
     )
 
     if not daytona_connected:

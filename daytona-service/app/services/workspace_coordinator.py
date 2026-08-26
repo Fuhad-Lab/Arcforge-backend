@@ -39,6 +39,7 @@ from app.daytona_client import (
     get_daytona,
 )
 from app.models import CodeRunResult
+from app.services.quota_reaper import is_quota_error, reap_idle_workspaces
 
 logger = logging.getLogger(__name__)
 
@@ -140,30 +141,53 @@ class DaytonaWorkspaceManager:
                 timeout=settings.daytona_default_timeout,
             )
         except Exception as exc:
+            # Org-quota exhausted ("Total memory limit exceeded" etc.)?
+            # Free quota by reaping idle workspace sandboxes, then retry
+            # creation ONCE. Incident 2026-08-26: two stale 4 Gi test
+            # sandboxes silently ate 8/10 GiB of org memory quota and every
+            # new workspace failed with HTTP 500 — surfaced to users as
+            # "the studio page doesn't connect".
+            if is_quota_error(exc):
+                logger.warning(
+                    "Sandbox creation rejected by an org quota limit (%s) — "
+                    "reaping idle workspaces and retrying once", exc,
+                )
+                reaped = await reap_idle_workspaces()
+                if reaped:
+                    try:
+                        sandbox = await asyncio.to_thread(
+                            daytona.create, params=params,
+                            timeout=settings.daytona_default_timeout,
+                        )
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                        sandbox = None
             # create() raises "entered error state" when the sandbox fails to
             # boot during the SDK's wait — the sandbox STILL EXISTS server-side
             # as an Error corpse holding CPU quota. Look it up by its unique
             # name and delete it so this outage cannot leak one corpse per
             # generation (observed live: the eu target fails every boot).
-            corpse = None
-            try:
-                corpse = await asyncio.to_thread(daytona.get, name)
-            except Exception:
+            # (Skipped when the retry above succeeded.)
+            if sandbox is None:
                 corpse = None
-            if corpse is not None:
                 try:
-                    await asyncio.to_thread(daytona.delete, corpse, 30, False)
-                    logger.warning(
-                        "Sandbox creation failed (%s) — deleted the Error corpse "
-                        "%s to protect CPU quota", exc, getattr(corpse, "id", name),
-                    )
+                    corpse = await asyncio.to_thread(daytona.get, name)
                 except Exception:
-                    logger.warning(
-                        "Sandbox creation failed (%s) and corpse cleanup also "
-                        "failed for name=%s — manual cleanup may be needed",
-                        exc, name,
-                    )
-            raise
+                    corpse = None
+                if corpse is not None:
+                    try:
+                        await asyncio.to_thread(daytona.delete, corpse, 30, False)
+                        logger.warning(
+                            "Sandbox creation failed (%s) — deleted the Error corpse "
+                            "%s to protect CPU quota", exc, getattr(corpse, "id", name),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Sandbox creation failed (%s) and corpse cleanup also "
+                            "failed for name=%s — manual cleanup may be needed",
+                            exc, name,
+                        )
+                raise
 
         # Post-create health gate: a sandbox can land in state=Error with
         # NO error_reason (observed live in the 'eu' target — every sandbox

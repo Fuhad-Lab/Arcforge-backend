@@ -27,6 +27,7 @@ from app.daytona_client import (
     extract_sandbox_data,
     get_daytona,
 )
+from app.services.quota_reaper import is_quota_error, reap_idle_workspaces
 from app.models import (
     BulkActionResponse,
     CreateSandboxRequest,
@@ -103,8 +104,29 @@ async def create_sandbox(req: CreateSandboxRequest) -> SandboxResponse:
             timeout=settings.daytona_default_timeout,
         )
     except Exception as exc:
-        logger.exception("Failed to create sandbox")
-        raise _wrap("sandbox creation", exc) from exc
+        # Org quota exhausted? Free quota by reaping idle workspace
+        # sandboxes, then retry once (see quota_reaper for the incident
+        # rationale). Otherwise surface the original error.
+        if is_quota_error(exc):
+            logger.warning(
+                "Sandbox creation rejected by an org quota limit (%s) — "
+                "reaping idle workspaces and retrying once", exc,
+            )
+            reaped = await reap_idle_workspaces()
+            if not reaped:
+                logger.exception("Failed to create sandbox (quota exhausted, nothing reaped)")
+                raise _wrap("sandbox creation", exc) from exc
+            try:
+                sandbox = await asyncio.to_thread(
+                    daytona.create, params=params,
+                    timeout=settings.daytona_default_timeout,
+                )
+            except Exception as retry_exc:
+                logger.exception("Failed to create sandbox (after quota reap retry)")
+                raise _wrap("sandbox creation", retry_exc) from retry_exc
+        else:
+            logger.exception("Failed to create sandbox")
+            raise _wrap("sandbox creation", exc) from exc
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     logger.info("Sandbox %s created in %d ms", sandbox.id, elapsed_ms)

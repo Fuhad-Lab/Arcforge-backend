@@ -91,6 +91,30 @@ async def destroy_workspace(sandbox_id: str) -> None:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@router.post(
+    "/reap-idle",
+    summary="Delete idle workspace sandboxes to free Daytona org quota",
+)
+async def reap_idle(min_age_seconds: int = 0) -> dict:
+    """Ops/cleanup endpoint (also used by the quota-aware create retry).
+
+    Deletes workspace sandboxes that are Error-state corpses or idle for
+    more than ``min_age_seconds`` (default: the configured idle timeout).
+    Pass ``min_age_seconds=0`` to delete EVERY workspace sandbox (full
+    reset — useful during incidents).
+
+    NOTE: the listing this performs refreshes sandbox activity server
+    side, but the response snapshot still carries pre-refresh
+    lastActivityAt values, so the idle decisions are made on real data.
+    """
+    from app.services.quota_reaper import reap_idle_workspaces
+
+    reaped = await reap_idle_workspaces(
+        min_age_seconds=min_age_seconds if min_age_seconds > 0 else None
+    )
+    return {"reaped": reaped, "count": len(reaped)}
+
+
 # ======================================================================
 # In-VM Agent Orchestrator ("Shadow Agent" sidecar)
 # ======================================================================
