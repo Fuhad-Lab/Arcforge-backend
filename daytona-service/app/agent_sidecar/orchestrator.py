@@ -1100,9 +1100,10 @@ class TaskWorker(threading.Thread):
         # ── CHUNKED PATH: manifest, then one small call per file ──────────
         manifest_sys = (
             "You are the Developer of ArcForge planning file layout. The "
-            "frontend MUST be Next.js 14 App Router (TypeScript) under "
-            "'frontend/'; the backend language is YOUR choice when needed "
-            "(under 'backend/'). Reply with ONLY a JSON object: "
+            "frontend MUST be Next.js 14 App Router (TypeScript, tsconfig.json "
+            "REQUIRED, deps pinned next 14.2.35 / react 18.3.1 / typescript "
+            "5.5.4) under 'frontend/'; the backend language is YOUR choice "
+            "when needed (under 'backend/'). Reply with ONLY a JSON object: "
             '{"summary": "<one line>", "files": ['
             '{"path": "frontend/app/page.tsx", "purpose": "<what it contains, precisely>"}'
             "]} — list EVERY file the app needs (8-14 files), each with a "
