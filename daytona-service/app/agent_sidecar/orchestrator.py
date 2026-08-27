@@ -1145,6 +1145,16 @@ def run_agent_loop(
                       "error": f"unknown tool '{tool}' — you have: {tool_names}"}
         else:
             args = {k: v for k, v in data.items() if k != "tool"}
+            # UNWRAP OpenAI-style {"tool": name, "arguments": {...}} — models
+            # intermittently wrap their args this way; without unwrapping every
+            # tool saw an empty arg dict (live: read_file/terminal failed with
+            # 'read scope'/'command required' on perfectly valid calls).
+            if isinstance(args.get("arguments"), dict):
+                merged = dict(args["arguments"])
+                for k, v in args.items():
+                    if k != "arguments" and k not in merged:
+                        merged[k] = v
+                args = merged
             # Redact giant echo-backs from the journaled args
             display_args = {k: (v if not (isinstance(v, str) and len(v) > 90)
                                 else v[:90] + "…") for k, v in args.items()}
@@ -1281,7 +1291,7 @@ def _browser_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], 
         action = str(a.get("action") or "").strip().lower()
         if action == "navigate":
             return browser_engine.navigate(str(a.get("url") or "http://localhost:3000"))
-        if action == "console_spy":
+        if action in ("console_spy", "console"):
             return browser_engine.console_spy()
         if action == "interact":
             return browser_engine.interact(str(a.get("selector") or ""),
@@ -1290,8 +1300,46 @@ def _browser_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], 
         if action == "screenshot":
             return browser_engine.screenshot(str(a.get("filename") or ""),
                                              str(a.get("question") or ""))
+        if action == "snapshot":
+            # a11y tree of the CURRENT page (common model shorthand)
+            return browser_engine.navigate("about:blank" if False else _current_url())
         return {"ok": False, "error": "action must be navigate|console_spy|interact|screenshot"}
-    return {"browser_tool": browser_tool}
+
+    def _current_url() -> str:
+        try:
+            if browser_engine._page is not None:
+                return browser_engine._page.url or "http://localhost:3000"
+        except Exception:  # noqa: BLE001
+            pass
+        return "http://localhost:3000"
+
+    # Top-level aliases — models intermittently call these directly instead
+    # of through browser_tool (live: {"tool":"console_spy"}).
+    def console_spy(_: Dict[str, Any]) -> Dict[str, Any]:
+        if browser_engine is None:
+            return {"ok": False, "error": "browser engine unavailable"}
+        return browser_engine.console_spy()
+
+    def navigate(a: Dict[str, Any]) -> Dict[str, Any]:
+        if browser_engine is None:
+            return {"ok": False, "error": "browser engine unavailable"}
+        return browser_engine.navigate(str(a.get("url") or "http://localhost:3000"))
+
+    def interact(a: Dict[str, Any]) -> Dict[str, Any]:
+        if browser_engine is None:
+            return {"ok": False, "error": "browser engine unavailable"}
+        return browser_engine.interact(str(a.get("selector") or ""),
+                                       str(a.get("do") or "click"),
+                                       str(a.get("value") or ""))
+
+    def screenshot(a: Dict[str, Any]) -> Dict[str, Any]:
+        if browser_engine is None:
+            return {"ok": False, "error": "browser engine unavailable"}
+        return browser_engine.screenshot(str(a.get("filename") or ""),
+                                         str(a.get("question") or ""))
+
+    return {"browser_tool": browser_tool, "console_spy": console_spy,
+            "navigate": navigate, "interact": interact, "screenshot": screenshot}
 
 
 def _skills_toolset(role: str) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
