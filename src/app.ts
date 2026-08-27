@@ -6,6 +6,7 @@ import router from "./routes";
 import { logger } from "./lib/logger";
 import { wsSync } from "./services/websocket-sync";
 import { attachTunnelServer } from "./routes/tunnel";
+import { startTunnelSweeper } from "./services/tunnel-sweeper";
 
 const app: Express = express();
 
@@ -21,6 +22,11 @@ export const server = createServer(app);
 // WSS and the /ws WSS below use noServer mode + manual path-filtered
 // upgrade listeners, so each owns exactly its path with no conflict.
 attachTunnelServer(server);
+
+// Reverse tunnels must survive backend deploys: the sweeper re-dials every
+// live sandbox's tunnel every 45s (a deploy restart otherwise leaves all
+// bridges dead until some frontend happens to call agent-info).
+startTunnelSweeper();
 
 // Attach WebSocket sync on /ws (frontend live-collaboration).
 wsSync.attach(server);

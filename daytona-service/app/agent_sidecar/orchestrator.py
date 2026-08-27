@@ -619,12 +619,26 @@ rt_mux = ReverseTunnelMultiplexer()
 
 _last_llm_done_ts = 0.0
 _last_llm_cost_tokens = 0.0
+_last_tunnel_down_emit = 0.0
 # NVIDIA NIM pacing (2026-08-28 migration): the account's limit is RPM-based
 # (~40 RPM/model) with NO per-request token floor like Groq's 8k. A short
 # gap after big calls is pure safety margin, not a TPM window.
 TPM_GAP_S = 8.0
 TPM_MIN_GAP_S = 2.0
 TPM_FLOOR_TOKENS = 8000.0
+
+
+def emit_tunnel_down(reason: str) -> None:
+    """Tell connected frontends the LLM bridge is down so THEY can trigger
+    agent-info (which makes the backend re-dial the reverse tunnel). The
+    frontend is a dumb terminal but it CAN relay the nudge — its vm-ops
+    agent-info call is what forces ensureReverseTunnel. Rate-limited."""
+    global _last_tunnel_down_emit
+    now = time.time()
+    if now - _last_tunnel_down_emit < 20:
+        return
+    _last_tunnel_down_emit = now
+    emit({"type": "tunnel_down", "reason": reason[:200]})
 
 
 def _estimate_cost_tokens(messages: List[Dict[str, Any]], max_tokens: int) -> float:
@@ -732,6 +746,8 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
             # Transport-level failure — retry with PROGRESSIVE backoff so a
             # reverse-tunnel re-dial (backend deploy restart) is survived.
             wait = _CONNECT_BACKOFF_S[min(attempt, len(_CONNECT_BACKOFF_S) - 1)]
+            if "reverse-tunnel" in str(exc):
+                emit_tunnel_down(str(exc))
             if attempt < 3:
                 last_err = exc
                 log.warning("llm transport failure (attempt %d): %s — retrying in %ss",
