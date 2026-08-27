@@ -79,6 +79,11 @@ orch.emit = spy_emit
 
 # ── the scripted LLM ──────────────────────────────────────────────────────
 DISPATCH_CALLS = []
+TRIAGE_CALLS = []
+# "crash": first QA fail carries an attributed crash issue (deterministic
+#   verbatim route); "gap": first QA fail carries a plan-coverage checklist
+#   with a MISSING feature (the chief decides the build brief).
+SCENARIO = {"mode": "crash"}
 
 
 def mock_llm_chat(messages, json_mode=False, max_tokens=4000, model=None, **_):
@@ -96,9 +101,23 @@ def mock_llm_chat(messages, json_mode=False, max_tokens=4000, model=None, **_):
         if "frontend:" in user and "fit_check" not in user:
             return json.dumps({"tool": "integration_check"})
         return json.dumps({"tool": "qa_verification"})
+    if "MISSING FROM THE LIVE APP" in user or "Decide the fix delegations" in user:
+        # THE CHIEF'S GAP DECISION — it must see the missing-features list.
+        TRIAGE_CALLS.append(user)
+        if "category pie chart" in user:
+            return json.dumps({"delegations": [{
+                "agent": "frontend",
+                "task": ("BUILD THE MISSING PLAN FEATURE: the plan requires a "
+                         "category pie chart on the dashboard; the live app "
+                         "has no chart. Build ONLY the chart — keep everything "
+                         "else intact, verify_file, confirm it renders.")}]})
+        return json.dumps({"delegations": []})
     if "routing their message" in system:
         return json.dumps({"kind": "app", "intent": "test app"})
     if "Write the user-facing completion message" in system:
+        if "category pie chart" in user:
+            return ("I built the app. The category pie chart is still missing "
+                    "— that plan feature remains unbuilt.")
         return "I built the test app and verified it end-to-end."
     # agent loops (backend/frontend/debugger/fix): report via done
     if "Backend Agent" in system:
@@ -107,18 +126,33 @@ def mock_llm_chat(messages, json_mode=False, max_tokens=4000, model=None, **_):
     if "Frontend Agent" in system:
         return json.dumps({"tool": "done", "report": "frontend built: page.tsx"})
     if "QA gate" in system or "Debugger Agent" in system:
-        # FIRST debugger run fails with a deterministic issue; later pass.
         n = getattr(mock_llm_chat, "_dbg_calls", 0) + 1
         setattr(mock_llm_chat, "_dbg_calls", n)
-        if n == 1:
+        if n == 1 and SCENARIO["mode"] == "crash":
+            # Crash-class failure: attributed issue, no coverage list —
+            # rides verbatim to the frontend tool.
             return json.dumps({
                 "tool": "done", "status": "fail",
                 "report": "app shows 500",
                 "issues": [{"criterion": "App loads",
                             "observation": "Frontend serves HTTP 500. Error: missing import",
                             "suspect": "frontend"}]})
+        if n == 1 and SCENARIO["mode"] == "gap":
+            # Plan-coverage failure: a feature the plan requires is MISSING.
+            return json.dumps({
+                "tool": "done", "status": "fail",
+                "report": "app boots but the chart feature is absent",
+                "coverage": [
+                    {"feature": "expense list", "state": "present",
+                     "evidence": "items render", "suspect": "frontend"},
+                    {"feature": "category pie chart", "state": "missing",
+                     "evidence": "no chart anywhere on the page",
+                     "suspect": "frontend"}],
+                "issues": []})
         return json.dumps({"tool": "done", "status": "pass",
-                           "report": "all criteria pass"})
+                           "report": "all criteria pass",
+                           "coverage": [{"feature": "expense list", "state": "present",
+                                          "evidence": "renders", "suspect": "frontend"}]})
     return json.dumps({"tool": "done", "report": "mock done"})
 
 
@@ -171,6 +205,10 @@ check("repairs counted (>=1 fix round)", int(result.get("repairs", 0)) >= 1,
       str(result.get("repairs")))
 check("summary present", bool(result.get("summary")))
 check("premature finish was overridden (dispatch LLM called)", len(DISPATCH_CALLS) >= 1)
+check("pass result carries an empty missing list",
+      result.get("missing") == [], str(result.get("missing")))
+check("crash route used no triage LLM (deterministic verbatim)",
+      len(TRIAGE_CALLS) == 0, str(len(TRIAGE_CALLS)))
 
 # ═══ TEST 4: unified voice — zero swarm/chief vocabulary in the stream ═══
 print("\n[4] unified voice")
@@ -207,6 +245,112 @@ state3 = {"task_id": "t3",
 tool3, _ = orch._dispatch_guardrails(state3, {"tool": "backend_agent", "task": "x"})
 check("frontend-only plan: backend dispatch rejected", tool3 == "frontend", tool3)
 
+# ═══ TEST 5b: the plan-gap loop — debugger reports WHAT'S MISSING, the ═══
+# chief decides which tool builds it, the brief quotes the feature
+print("\n[5b] plan-gap loop (debugger → chief → build brief)")
+SCENARIO["mode"] = "gap"
+setattr(mock_llm_chat, "_dbg_calls", 0)
+DISPATCH_CALLS.clear()
+TRIAGE_CALLS.clear()
+plan_gap = ("# GapApp\n## Overview\nAn expense tracker.\n## Data & API\n"
+            "GET /api/items returns expenses.\n\n## Pages & UI\n"
+            "- an expense list\n- a category pie chart\n\n"
+            "## Acceptance Criteria\n1. Expenses render.\n"
+            "2. A pie chart breaks expenses down by category.\n")
+result_gap = orch.run_swarm("testtask03", "build me a gap app", plan_gap)
+check("gap scenario: verdict pass after the fix",
+      result_gap.get("verdict") == "pass", str(result_gap.get("verdict")))
+check("the chief received the missing-features checklist",
+      len(TRIAGE_CALLS) >= 1 and "category pie chart" in TRIAGE_CALLS[0],
+      str(TRIAGE_CALLS[:1]))
+gap_labels = [e.get("label", "") for e in EMITTED
+              if e.get("type") == "activity"]
+check("'Building what's missing' label emitted",
+      any("missing" in str(l).lower() for l in gap_labels), str(gap_labels[-8:]))
+fix_details = [str(e.get("detail", "")) for e in EMITTED
+               if e.get("type") == "activity"
+               and "missing" in str(e.get("label", "")).lower()]
+check("the fix dispatch brief quotes the missing feature",
+      any("pie chart" in d for d in fix_details), str(fix_details[:2]))
+check("gap pass result carries an empty missing list",
+      result_gap.get("missing") == [], str(result_gap.get("missing")))
+
+# ═══ TEST 5c: triage degraded → deterministic fallback gap briefs ═════════
+print("\n[5c] triage fallback")
+orig_triage = orch.ChiefAgent.triage
+orch.ChiefAgent.triage = lambda self, p, d, m: []  # chief LLM degrades
+try:
+    dels = orch._fix_delegations("tfall", "# P\n## Pages & UI\nchart\n", {
+        "status": "fail",
+        "issues": [],
+        "missing": [{"feature": "category pie chart", "state": "missing",
+                     "evidence": "no chart on the page",
+                     "suspect": "frontend"}]})
+finally:
+    orch.ChiefAgent.triage = orig_triage
+check("fallback delegation routes to the suspect",
+      len(dels) == 1 and dels[0]["agent"] == "frontend", json.dumps(dels)[:200])
+check("fallback brief is a build-the-missing-feature brief",
+      bool(dels) and dels[0]["task"].startswith("BUILD THE MISSING PLAN FEATURE")
+      and "pie chart" in dels[0]["task"],
+      dels[0]["task"][:120] if dels else "(none)")
+
+# ═══ TEST 5d: debugger result shape — the coverage checklist rides along ═══
+print("\n[5d] debugger result shape")
+SCENARIO["mode"] = "crash"
+res_v = orch.run_debugger_agent("tvd", "# P\n## Acceptance Criteria\nx\n")
+check("debugger result carries missing + coverage keys",
+      "missing" in res_v and "coverage" in res_v, str(list(res_v.keys())))
+
+# ═══ TEST 5e: honest-fail summary names what's missing ════════════════════
+print("\n[5e] honest-fail summary")
+plan_gap_fail = ("# GapApp2\n## Overview\nAn expense tracker.\n"
+                 "## Data & API\nGET /api/items returns expenses.\n\n"
+                 "## Pages & UI\n- a category pie chart\n\n"
+                 "## Acceptance Criteria\n1. A pie chart renders.\n")
+SUMMARY_CALLS = []
+
+
+def gap_fail_llm(messages, json_mode=False, max_tokens=4000, model=None, **_):
+    system = messages[0]["content"]
+    if "Write the user-facing completion message" in system:
+        SUMMARY_CALLS.append(messages[-1]["content"])
+        return ("I built the app but verification failed — the category pie "
+                "chart is still missing.")
+    if "QA gate" in system or "Debugger Agent" in system:
+        return json.dumps({
+            "tool": "done", "status": "fail",
+            "report": "chart still absent",
+            "coverage": [{"feature": "category pie chart",
+                          "state": "missing",
+                          "evidence": "no chart", "suspect": "frontend"}],
+            "issues": []})
+    if "MISSING FROM THE LIVE APP" in user or "Decide the fix delegations" in user:
+        TRIAGE_CALLS.append(messages[-1]["content"])
+        return json.dumps({"delegations": [{
+            "agent": "frontend",
+            "task": "BUILD THE MISSING PLAN FEATURE: category pie chart"}]})
+    return mock_llm_chat(messages, json_mode, max_tokens, model, **_)
+
+
+orig_chat = orch.llm_chat
+orch.llm_chat = gap_fail_llm
+try:
+    result_hf = orch.run_swarm("testtask04", "build me a gap app",
+                               plan_gap_fail)
+finally:
+    orch.llm_chat = orig_chat
+check("honest fail: verdict is fail", result_hf.get("verdict") == "fail",
+      str(result_hf.get("verdict")))
+check("honest fail: missing list surfaces in the result",
+      any("pie chart" in str(m.get("feature", ""))
+          for m in (result_hf.get("missing") or [])),
+      str(result_hf.get("missing")))
+check("honest fail: the summary prompt carried the missing features",
+      any("MISSING PLAN FEATURES" in u and "pie chart" in u
+          for u in SUMMARY_CALLS),
+      str(SUMMARY_CALLS)[:200])
+
 # ═══ TEST 6: mini-graph vs langgraph — same route both engines ═══════════
 print("\n[6] graph engine parity")
 if orch.LANGGRAPH_AVAILABLE:
@@ -215,11 +359,14 @@ if orch.LANGGRAPH_AVAILABLE:
     try:
         DISPATCH_CALLS.clear()
         setattr(mock_llm_chat, "_dbg_calls", 0)
+        SCENARIO["mode"] = "crash"
         result_mini = orch.run_swarm("testtask02", "build me a test app", plan)
         check("mini engine: verdict pass", result_mini.get("verdict") == "pass")
         check("mini engine: backend+frontend+debugger ran",
               all(result_mini["agents"].get(k)
                   for k in ("backend", "frontend", "debugger")))
+        check("mini engine: missing list present",
+              "missing" in result_mini, str(list(result_mini.keys())))
     finally:
         orch.LANGGRAPH_AVAILABLE = real
     print("    ran BOTH engines (langgraph + built-in fallback) ✓")

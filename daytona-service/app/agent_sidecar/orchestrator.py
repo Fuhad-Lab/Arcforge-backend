@@ -69,9 +69,13 @@ THE DEVELOPMENT TWINS share a context loop:
     app with browser_tool and attributes every error with evidence —
     its own (it fixes) or the backend's (mailbox: expected vs got).
 
-THE DEBUGGER tool reads plan.md, drives the live app via browser_tool,
-and returns a structured verdict; failures triage into fix dispatches.
-The cycle continues until the app matches the approved plan.
+THE DEBUGGER tool audits the live app against plan.md FEATURE BY
+FEATURE and reports exactly WHAT IS MISSING (a plan-coverage
+checklist, not just errors). The chief receives that checklist and
+DECIDES which of its tools builds each gap; crash-class evidence rides
+to the owner verbatim. The cycle continues until the app matches the
+approved plan — or budgets end, in which case the honest-fail verdict
+names the remaining gaps.
 
 Browser Vision Engine (vm_browser.py): Playwright bridge with
 navigate / console_spy / interact / screenshot (+ VLM review through the
@@ -1805,7 +1809,8 @@ def run_agent_loop(
             # debugger's verdict is data, not prose (live bug found by the
             # v4 graph test: issues were silently dropped here, so QA
             # failures produced zero fix dispatches).
-            for _k in ("status", "issues", "verdict", "summary", "tests"):
+            for _k in ("status", "issues", "verdict", "summary", "tests",
+                       "coverage", "missing"):
                 if data.get(_k) is not None:
                     done_extras[_k] = data[_k]
             break
@@ -2200,15 +2205,19 @@ HARD RULES:
 UI STANDARDS: inline styles or one <style> tag only (NO .css files); every file using hooks/handlers starts with 'use client'; Next 14 <Link> takes NO nested <a>; no lorem ipsum — realistic copy; responsive; loading + empty states.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
-DEBUGGER_SYSTEM = """You are the Debugger Agent of ArcForge — the QA gate. You NEVER write or edit code. You verify the live app against plan.md.
+DEBUGGER_SYSTEM = """You are the Debugger Agent of ArcForge — the QA gate. You NEVER write or edit code. You audit the LIVE app against plan.md and report exactly WHAT IS MISSING.
 TOOLS: browser_tool (navigate / console_spy / interact / screenshot) and read_file (plan.md, frontend/*, backend/*).
+THE PRIMARY QUESTION: what does the plan require that the app does NOT have yet?
 WORKFLOW:
-1. read_file plan.md → extract the Acceptance Criteria (and the core features if no explicit list).
+1. You already have the plan — extract EVERY feature and acceptance criterion it specifies (UI pages, components, interactions, data flows).
 2. browser_tool navigate http://localhost:3000 — inspect the accessibility tree.
-3. For EACH criterion: interact (click/type) to exercise it, then console_spy. A criterion passes only if the UI shows the expected outcome AND no console/network errors fire.
+3. For EACH plan feature: interact (click/type) to exercise it, then console_spy. Classify it:
+   - "present": the UI shows the expected outcome AND no console/network errors fire;
+   - "partial": part of it exists but a required piece is absent (name the piece);
+   - "missing": the app has none of it.
 4. Screenshot key screens when a visual check matters.
-FINISH with: {"tool":"done","report":"<evidence-based summary>","status":"pass"|"fail","issues":[{"criterion":"...","observation":"what actually happened","suspect":"frontend|backend|unclear"}]}.
-Be strict: an app that compiles but fails a criterion is a FAIL. Report only real, observed failures — never speculation."""
+FINISH with: {"tool":"done","report":"<evidence-based summary>","status":"pass"|"fail","coverage":[{"feature":"<plan feature>","state":"present|partial|missing","evidence":"what you actually saw","suspect":"frontend|backend|unclear"}],"issues":[{"criterion":"...","observation":"what actually happened","suspect":"frontend|backend|unclear"}]}.
+Rules: status is "pass" ONLY when every plan feature is "present". An app that boots but lacks a plan feature is a FAIL — name the feature. Report only real, observed evidence — never speculation. Your missing-features checklist is what the build acts on next: precise feature names, exact gaps."""
 
 
 def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]:
@@ -2372,26 +2381,34 @@ def _deterministic_issues() -> List[Dict[str, str]]:
 def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
     ctx = AgentContext(task_id, "debugger")
     ctx.activity("Verifying the app in the browser", "active",
-                 "testing the live app against the approved plan")
+                 "checking the live app against every plan feature")
     # The plan rides IN the prompt — the agent no longer burns its step
     # budget on repeated read_file(plan.md) calls (live: one run spent 7
     # consecutive steps re-reading the same file and hit the limit).
-    user = ("Verify the live app at http://localhost:3000 against this APPROVED "
+    user = ("Audit the live app at http://localhost:3000 against this APPROVED "
             "PLAN (you already have it — do NOT re-read plan.md; go straight "
-            "to the browser):\n\n"
-            f"{plan_text[:3200]}\n\n"
-            "Work through every acceptance criterion with browser interactions, "
-            "then give your verdict.")
+            "to the browser). Your PRIMARY question: what does the plan "
+            "require that the app does NOT have yet? Walk EVERY plan feature, "
+            "classify each present/partial/missing with evidence, then give "
+            "your verdict.\n\n"
+            f"{plan_text[:3200]}\n")
     pace_for_tpm()
     result = run_agent_loop(ctx, DEBUGGER_SYSTEM, user,
-                            build_debugger_toolset(ctx), max_tokens=4000,
-                            model=DEBUGGER_MODELS)
+                            build_debugger_toolset(ctx), max_steps=18,
+                            max_tokens=4000, model=DEBUGGER_MODELS)
     report = str(result.get("report", ""))
     status = "pass" if (result.get("status") == "pass" or
                         re.search(r"\bstatus\D{0,12}pass\b", report, re.I)) else "fail"
     issues = result.get("issues")
     if not isinstance(issues, list):
         issues = []
+    # THE PLAN-COVERAGE CHECKLIST — the debugger's primary product: exactly
+    # what the plan requires that the app lacks. The chief acts on THIS.
+    coverage = [c for c in (result.get("coverage") or [])
+                if isinstance(c, dict)
+                and str(c.get("feature", "")).strip()]
+    missing = [c for c in coverage
+               if str(c.get("state", "missing")).strip().lower() != "present"]
     if status == "fail":
         # DETERMINISTIC FALLBACK — probe the servers ourselves so the chief
         # always receives actionable, evidence-based issues.
@@ -2400,12 +2417,32 @@ def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
         for i in det:
             if json.dumps(i, sort_keys=True) not in seen:
                 issues.append(i)
-        if not issues:
+        if not issues and not missing:
             issues = [{"criterion": "overall", "observation": report[:400],
                        "suspect": "unclear"}]
+        # No coverage list produced → the UNATTRIBUTED issues become the gap
+        # report (attributed crash evidence already rides verbatim to its
+        # owner in _fix_delegations — no double delegation).
+        if not missing:
+            missing = [{"feature": str(i.get("criterion", "unknown"))[:200],
+                        "state": "missing",
+                        "evidence": str(i.get("observation", ""))[:400],
+                        "suspect": str(i.get("suspect", "unclear"))}
+                       for i in issues
+                       if isinstance(i, dict)
+                       and str(i.get("suspect", "")).lower()
+                       not in ("frontend", "backend")]
+    if status == "pass" and missing:
+        # Inconsistent verdict: features marked missing cannot be a pass.
+        status = "fail"
     ctx.activity("Verification complete", "done", status.upper())
-    ctx.say(f"Verification: {status.upper()} — {report[:400]}")
-    return {"status": status, "issues": issues, "report": report}
+    if status == "fail" and missing:
+        feats = "; ".join(str(m.get("feature", "?"))[:60] for m in missing[:4])
+        ctx.say(f"Verification: FAIL — missing from the plan: {feats}")
+    else:
+        ctx.say(f"Verification: {status.upper()} — {report[:400]}")
+    return {"status": status, "issues": issues, "missing": missing,
+            "coverage": coverage, "report": report}
 
 
 # ---------------------------------------------------------------------------
@@ -2527,11 +2564,17 @@ Your tools:
 Reply ONLY JSON:
 {"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","reason":"<one line, internal>"} (omit "task" for finish)."""
 
-CHIEF_TRIAGE_SYSTEM = """You are ArcForge — the user's build agent. Verification reported problems with the build. Decide the fix delegations. Rules: the suspect field tells you who likely caused it; give each delegation a PRECISE fix instruction referencing the observed evidence. Do not delegate anything that is not actionable. Reply ONLY JSON:
-{"delegations":[{"agent":"frontend"|"backend","task":"<precise fix instruction>"}]}
-or {"delegations":[]} when nothing actionable remains (e.g. only cosmetic/unclear issues)."""
+CHIEF_TRIAGE_SYSTEM = """You are ArcForge — the user's build agent. Verification audited the live app against the approved plan and reported WHAT IS MISSING. You decide which of your tools builds what.
+RULES:
+- The MISSING FEATURES list is your work queue: every missing or partial plan feature MUST become a delegation that BUILDS it. Quote the plan requirement, state exactly what is absent, and instruct to build ONLY the missing pieces — never rebuild what already works.
+- Crash-class evidence (HTTP errors, tracebacks) is routed verbatim to the owning tool elsewhere — do not re-delegate it.
+- Batch related missing features for the same tool into ONE dense delegation; keep the total low.
+- Do not delegate anything that is not actionable.
+Reply ONLY JSON:
+{"delegations":[{"agent":"frontend"|"backend","task":"<precise build/fix instruction>"}]}
+or {"delegations":[]} when nothing actionable remains."""
 
-CHIEF_SUMMARY_SYSTEM = """You are ArcForge — the user's ONE build agent (you coordinate internal tools, but the user only ever talks to you). The build finished. Write the user-facing completion message in FIRST PERSON ("I built…", "I verified…"): 2-4 sentences, plain language, stating what the app does, whether it passed end-to-end verification against the approved plan, and anything worth trying in the preview. NEVER mention sub-agents, "chief", "swarm", orchestration, or internal mechanics. No markdown headers."""
+CHIEF_SUMMARY_SYSTEM = """You are ArcForge — the user's ONE build agent (you coordinate internal tools, but the user only ever talks to you). The build finished. Write the user-facing completion message in FIRST PERSON ("I built…", "I verified…"): 2-4 sentences, plain language, stating what the app does, whether it passed end-to-end verification against the approved plan, and anything worth trying in the preview. If verification failed, NAME the plan features that are still missing so the user knows exactly what remains. NEVER mention sub-agents, "chief", "swarm", orchestration, or internal mechanics. No markdown headers."""
 
 
 class ChiefAgent:
@@ -2593,25 +2636,43 @@ class ChiefAgent:
     #    chief_node) — sub-agents are the chief's TOOLS; one LLM call picks the
     #    tool AND writes its brief.
 
-    # -- step 4: triage failures into fix delegations -----------------------
+    # -- step 4: triage QA gaps into build/fix delegations -----------------
     def triage(self, plan_text: str, debug_report: Dict[str, Any],
                mailbox_msgs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        issues = debug_report.get("issues") or []
-        mail = "\n".join(f"{m['from']}: {m['message'][:200]}" for m in mailbox_msgs[-8:])
-        user = (f"APPROVED PLAN (excerpt):\n{plan_text[:1200]}\n\n"
-                f"DEBUGGER VERDICT: {debug_report.get('status','?')}\n"
-                f"DEBUGGER ISSUES:\n{json.dumps(issues, indent=1)[:2000]}\n\n"
-                f"AGENT MAILBOX:\n{mail or '(empty)'}")
+        """THE CHIEF'S DECISION after a failed QA round: which tool builds
+        what's missing. Receives the debugger's missing-features checklist
+        (the work queue) plus any unattributed failures; crash-class
+        evidence is routed verbatim elsewhere and excluded here so nothing
+        is delegated twice."""
+        missing = [m for m in (debug_report.get("missing") or [])
+                   if isinstance(m, dict)]
+        issues = [i for i in (debug_report.get("issues") or [])
+                  if isinstance(i, dict)
+                  and str(i.get("suspect", "")).lower()
+                  not in ("frontend", "backend")]
+        mail = "\n".join(f"{m['from']}: {m['message'][:200]}"
+                         for m in mailbox_msgs[-8:])
+        user = (f"APPROVED PLAN (excerpt):\n{plan_text[:1600]}\n\n"
+                f"DEBUGGER VERDICT: {debug_report.get('status','?')}\n\n"
+                f"MISSING FROM THE LIVE APP (plan features not yet built — "
+                f"your work queue):\n"
+                + (json.dumps(missing, indent=1)[:2400] if missing
+                   else "(none reported)")
+                + "\n\nUNATTRIBUTED FAILURES:\n"
+                + (json.dumps(issues, indent=1)[:1200] if issues
+                   else "(none)")
+                + f"\n\nAGENT MAILBOX:\n{mail or '(empty)'}\n"
+                  "Decide the fix delegations.")
         try:
             pace_for_tpm()
             data = _extract_json(llm_chat(
                 [{"role": "system", "content": CHIEF_TRIAGE_SYSTEM},
                  {"role": "user", "content": user}],
-                json_mode=True, max_tokens=1400, model=CHIEF_MODELS))
+                json_mode=True, max_tokens=1600, model=CHIEF_MODELS))
             dels = [d for d in (data.get("delegations") or [])
                     if isinstance(d, dict) and d.get("agent") in ("frontend", "backend")
                     and str(d.get("task", "")).strip()]
-            return dels[:3]
+            return dels[:4]
         except Exception as exc:  # noqa: BLE001
             append_log(self.ctx.task_id, "chief", "warn", f"triage degraded: {exc}")
             return []
@@ -2622,11 +2683,19 @@ class ChiefAgent:
         def rep(key: str) -> str:
             r = reports.get(key)
             return str((r or {}).get("report", "(not run)"))[:400]
+        # The honest-fail contract: the verdict tells the user EXACTLY what
+        # remains — the debugger's missing-features checklist, verbatim.
+        missing = [m for m in ((reports.get("debugger") or {}).get("missing") or [])
+                   if isinstance(m, dict) and str(m.get("feature", "")).strip()]
+        miss_txt = ""
+        if verdict != "pass" and missing:
+            feats = "; ".join(str(m.get("feature", "?"))[:80] for m in missing[:6])
+            miss_txt = (f"\nMISSING PLAN FEATURES (still not built): {feats}")
         user = (f"USER REQUEST: {prompt[:300]}\nPLAN: {plan_title}\n"
                 f"BACKEND REPORT: {rep('backend')}\n"
                 f"FRONTEND REPORT: {rep('frontend')}\n"
                 f"DEBUGGER VERDICT: {verdict}\n"
-                f"DEBUGGER REPORT: {rep('debugger')}\n"
+                f"DEBUGGER REPORT: {rep('debugger')}{miss_txt}\n"
                 "Write the completion message.")
         try:
             pace_for_tpm()
@@ -2745,6 +2814,7 @@ class AgentState(TypedDict, total=False):
     repairs: int
     # outcome
     verdict: str                      # pass | fail
+    missing: List[Dict[str, Any]]     # the debugger's plan-gap checklist
     issues: List[Dict[str, str]]
     summary: str
     app_port: Any
@@ -2965,18 +3035,26 @@ def _dispatch_guardrails(state: Dict[str, Any],
 
 def _fix_delegations(task_id: str, plan_text: str,
                      debug_report: Dict[str, Any]) -> List[Dict[str, str]]:
-    """QA failed → precise fix dispatches. DETERMINISTIC issues (live-server
-    evidence: dev-log error lines, crash tracebacks) bypass the triage LLM
-    and reach the owning tool verbatim (live-proven: a lossy rephrase fixed
-    nothing); genuinely ambiguous issues go through triage."""
+    """QA failed → THE CHIEF DECIDES which tool builds what's missing.
+    CRASH-CLASS evidence (live-server errors: 500s, tracebacks) rides
+    verbatim to the owning tool (live-proven: a lossy rephrase fixed
+    nothing). PLAN-GAP items (the debugger's missing-features checklist)
+    go through the chief's triage LLM — it picks the tool and writes the
+    build brief for each gap. If that call degrades, deterministic
+    fallback briefs route by the debugger's suspect field — the loop
+    never stalls."""
     issues = [i for i in (debug_report.get("issues") or [])
               if isinstance(i, dict)]
+    missing = [m for m in (debug_report.get("missing") or [])
+               if isinstance(m, dict) and str(m.get("feature", "")).strip()]
     delegations: List[Dict[str, str]] = []
+
+    # 1) Crash-class first — the app must boot before features can be judged.
     for i in issues:
         side = str(i.get("suspect", "")).strip().lower()
         obs = str(i.get("observation", "")).strip()
         if side not in ("frontend", "backend") or not obs:
-            continue  # ambiguous → triage below
+            continue
         if side == "frontend":
             task = (
                 f"FIX (deterministic evidence from the live server):\n{obs[:500]}\n\n"
@@ -2996,25 +3074,63 @@ def _fix_delegations(task_id: str, plan_text: str,
                 "endpoint — you may not report done while it errors."
             )
         delegations.append({"agent": side, "task": task})
-    vague = [i for i in issues
-             if not (isinstance(i, dict)
-                     and str(i.get("suspect", "")).lower() in ("frontend", "backend")
-                     and str(i.get("observation", "")).strip())]
-    if vague:
+
+    # 2) Plan gaps — the chief's decision (its tools, its briefs).
+    if missing:
         chief = ChiefAgent(task_id)
-        delegations += chief.triage(plan_text,
-                                    {"status": "fail", "issues": vague},
-                                    mailbox_db_read(task_id, "chief"))
+        chief_dels = chief.triage(plan_text, debug_report,
+                                  mailbox_db_read(task_id, "chief"))
+        if chief_dels:
+            delegations += chief_dels
+        else:
+            # Chief LLM degraded → deterministic fallback: each missing
+            # feature routes to the debugger's suspect with a gap brief.
+            for m in missing:
+                side = str(m.get("suspect", "")).strip().lower()
+                if side not in ("frontend", "backend"):
+                    side = "frontend"
+                feat = str(m.get("feature", ""))[:200]
+                ev = str(m.get("evidence", ""))[:300]
+                task = (f"BUILD THE MISSING PLAN FEATURE (verification found it "
+                        f"absent from the live app):\n"
+                        f"- Feature: {feat}\n"
+                        f"- Evidence: {ev or 'not observed in the UI'}\n\n"
+                        "Build ONLY this missing piece (keep everything that "
+                        "already works intact), verify_file what you write, "
+                        "and confirm it renders in the browser before done.")
+                delegations.append({"agent": side, "task": task})
+    elif issues:
+        # No coverage list — unattributed issues go through triage as before.
+        vague = [i for i in issues
+                 if str(i.get("suspect", "")).lower()
+                 not in ("frontend", "backend")]
+        if vague:
+            chief = ChiefAgent(task_id)
+            delegations += chief.triage(
+                plan_text, {"status": "fail", "issues": vague,
+                            "missing": []},
+                mailbox_db_read(task_id, "chief"))
     return delegations[:MAX_FIXES]
 
 
 # -- The nodes ----------------------------------------------------------------
 
 
+def _fix_activity_label(task: str) -> str:
+    """Unified-voice label for fix dispatches — the user sees WHAT the
+    agent is doing, not which internal tool got the brief."""
+    t = str(task)
+    if t.startswith("BUILD THE MISSING"):
+        return "Building what's missing"
+    return "Applying a fix"
+
+
 def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """THE dispatcher hub. Every other node returns here. Order:
     1. pending fix dispatches (from a failed QA round) run first;
-    2. a fresh QA failure triages into fix dispatches;
+    2. a fresh QA failure produces the debugger's missing-features
+       checklist → the CHIEF DECIDES which tool builds each gap
+       (crash-class evidence rides verbatim to its owner);
     3. QA re-run is due after fixes (debug_pending);
     4. otherwise — the agent_dispatcher LLM decides the next tool call.
     The node returns only state DELTAS (merged by the engine)."""
@@ -3040,11 +3156,13 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "file_system_state": file_system_state(task_id),
         })
         emit({"type": "activity", "task_id": task_id,
-              "label": "Applying a fix", "state": "active",
+              "label": _fix_activity_label(nxt["task"]), "state": "active",
               "detail": str(nxt["task"])[:120]})
         return update
 
-    # 2) Fresh QA failure → triage into fix dispatches (or finish honestly).
+    # 2) Fresh QA failure → the debugger's missing-features checklist goes
+    #    to the chief, which decides which tool builds what (or an honest
+    #    finish when budgets are spent).
     if verdict == "fail":
         if debug_rounds >= DEBUG_MAX_ROUNDS or repairs >= MAX_FIXES:
             update.update({"next_agent": "end", "verdict": verdict,
@@ -3059,7 +3177,7 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
             update.update({"next_agent": "end", "verdict": verdict,
                            "debug_pending": False})
             append_log(task_id, "chief", "info",
-                       "QA failed with no actionable issues — reporting honestly")
+                       "QA failed with no actionable gaps — reporting honestly")
             return update
         nxt = delegations.pop(0)
         dispatches.append(nxt["agent"])
@@ -3073,7 +3191,7 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "file_system_state": file_system_state(task_id),
         })
         emit({"type": "activity", "task_id": task_id,
-              "label": "Applying a fix", "state": "active",
+              "label": _fix_activity_label(nxt["task"]), "state": "active",
               "detail": str(nxt["task"])[:120]})
         return update
 
@@ -3172,6 +3290,7 @@ def debugger_node(state: Dict[str, Any]) -> Dict[str, Any]:
     reports["debugger"] = debug
     return {"reports": reports, "verdict": str(debug.get("status", "fail")),
             "issues": debug.get("issues") or [],
+            "missing": debug.get("missing") or [],
             "debug_rounds": int(state.get("debug_rounds") or 0) + 1}
 
 
@@ -3262,6 +3381,10 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
         "verdict": verdict,
         "repairs": int(final.get("repairs") or 0),
         "plan": plan_text,
+        # The honest-fail contract: name exactly what's still missing.
+        "missing": [m for m in ((reports.get("debugger") or {})
+                                .get("missing") or [])
+                    if isinstance(m, dict)][:12],
         "agents": {
             "backend": str((reports.get("backend") or {}).get("report", ""))[:600],
             "frontend": str((reports.get("frontend") or {}).get("report", ""))[:600],
@@ -3457,15 +3580,20 @@ class TaskWorker(threading.Thread):
 
             # ── Complete ──────────────────────────────────────────────────
             app_port = (get_status("app") or {}).get("port")
+            missing_feats = swarm.get("missing") or []
+            miss_line = "; ".join(
+                str(m.get("feature", "")) for m in missing_feats
+                if isinstance(m, dict) and m.get("feature"))[:400]
             result = {
                 "summary": swarm["summary"],
                 "kind": "app",
                 "files": [],  # the file journal (files table) has the truth
                 "checks": {"ok": swarm["verdict"] == "pass",
                            "issues": "" if swarm["verdict"] == "pass"
-                           else "see debugger report"},
+                           else (miss_line or "see verification report")},
                 "repairs": {"rounds": swarm["repairs"], "diagnoses": []},
                 "verdict": swarm["verdict"],
+                "missing": missing_feats,
                 "agents": swarm["agents"],
                 "plan": plan_text[:4000],
                 "duration_ms": int((time.time() - started) * 1000),
