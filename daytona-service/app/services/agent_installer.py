@@ -111,6 +111,11 @@ class AgentInstaller:
             # 1) Read the sidecar templates from this host.
             orchestrator_src = (_SIDECAR_SRC_DIR / "orchestrator.py").read_text("utf-8")
             tunnel_src = (_SIDECAR_SRC_DIR / "tunnel_client.py").read_text("utf-8")
+            # v3 swarm sidecar modules:
+            #   vm_browser.py     — Browser Vision Engine (Playwright bridge)
+            #   skills_server.py  — MCP-style skills host (per-agent scopes)
+            vm_browser_src = (_SIDECAR_SRC_DIR / "vm_browser.py").read_text("utf-8")
+            skills_server_src = (_SIDECAR_SRC_DIR / "skills_server.py").read_text("utf-8")
 
             # --- Derive the WS tunnel config from the host env ------------
             # The VM's AI client points at localhost:7777; the tunnel_client
@@ -157,6 +162,16 @@ class AgentInstaller:
                 watchdog_src.encode("utf-8"),
                 f"{SIDE_CAR_HOME}/watchdog.sh",
             )
+            await asyncio.to_thread(
+                sandbox.fs.upload_file,
+                vm_browser_src.encode("utf-8"),
+                f"{SIDE_CAR_HOME}/vm_browser.py",
+            )
+            await asyncio.to_thread(
+                sandbox.fs.upload_file,
+                skills_server_src.encode("utf-8"),
+                f"{SIDE_CAR_HOME}/skills_server.py",
+            )
             # Token file (mode 600) — the host re-reads this to broker
             # credentials to the VM's owner; it is never stored elsewhere.
             await asyncio.to_thread(
@@ -164,9 +179,9 @@ class AgentInstaller:
                 token.encode("utf-8"),
                 f"{SIDE_CAR_HOME}/agent_token",
             )
-            # Platform skills (the 17-skill catalog) — planted next to the
-            # daemon so its generation prompts carry the same mandatory
-            # skills the host-side pipeline injects. No secrets inside.
+            # Platform skills — planted as the MCP-style catalog consumed
+            # by the in-VM skills server (per-agent scopes, segregation
+            # enforced server-side). No secrets inside.
             if skills:
                 await asyncio.to_thread(
                     sandbox.fs.upload_file,
@@ -251,6 +266,11 @@ class AgentInstaller:
                 # --- Tunnel config (read by orchestrator.py for /reverse-tunnel
                 # auth — the shared AGENT_PROXY_SECRET between VM and backend) ---
                 f"TUNNEL_TOKEN={proxy_secret}",
+                # Vision model for the Browser Vision Engine — routed through
+                # the reverse tunnel (/vlm path) to NVIDIA on the backend side;
+                # the VM never holds a provider key.
+                "ORCH_VLM_MODEL=meta/llama-3.2-11b-vision-instruct",
+                "ORCH_VLM_ENABLED=1",
                 # Kept for backward compat (the old tunnel_client.py reads
                 # these — harmless if tunnel_client isn't running).
                 f"TUNNEL_BACKEND_WS_URL={tunnel_ws_url}",
@@ -295,6 +315,25 @@ class AgentInstaller:
             # 5) Launch: PM2 preferred (manages BOTH tunnel-client +
             #    agent-brain), watchdog fallback. Both source the env file
             #    so the token/tunnel/LLM config never appears in `ps`.
+            # 4.5) BROWSER VISION ENGINE + LSP tooling (background, never
+            #      blocks the daemon): Playwright + Chromium for the
+            #      browser_tool (navigate/console_spy/interact/screenshot)
+            #      and pyflakes as the Python LSP diagnostics engine.
+            #      Best-effort — browser_tool degrades gracefully until ready.
+            try:
+                await asyncio.to_thread(
+                    sandbox.process.exec,
+                    "nohup bash -c 'pip install --quiet --disable-pip-version-check "
+                    "playwright pyflakes 2>/dev/null; "
+                    "python3 -m playwright install chromium --with-deps "
+                    "> /home/daytona/.system/playwright-install.log 2>&1' "
+                    "> /dev/null 2>&1 < /dev/null &",
+                    "/home/daytona", None, 10,
+                )
+                logger.info("sidecar: browser engine install launched in background")
+            except Exception as exc:  # noqa: BLE001
+                logger.info("sidecar: browser engine background install skipped: %s", exc)
+
             launch = (
                 # idempotent: stop any previous supervisor + daemons
                 "(pm2 delete tunnel-client 2>/dev/null || true); "
@@ -535,6 +574,8 @@ class AgentInstaller:
             '        ORCH_LLM_KEY: "tunnel-injected",\n'
             f'        ORCH_LLM_MODEL: "{llm["model"]}",\n'
             '        ORCH_LLM_READY: "1",\n'
+            '        ORCH_VLM_MODEL: "meta/llama-3.2-11b-vision-instruct",\n'
+            '        ORCH_VLM_ENABLED: "1",\n'
             f'        TUNNEL_TOKEN: "{tunnel_token}",'
         )
         # If the old template (with __TUNNEL_ENV__) is somehow still

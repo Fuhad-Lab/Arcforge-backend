@@ -64,7 +64,9 @@ async def create_workspace(req: CreateWorkspaceRequest) -> WorkspaceInitResponse
                 if req.agent_llm else None
             ),
             agent_skills=(
-                [{"name": s.name, "instruction": s.instruction}
+                [{"name": s.name, "instruction": s.instruction,
+                  "description": s.description, "source": s.source,
+                  "scope": s.scope}
                  for s in req.skills]
                 if req.skills else None
             ),

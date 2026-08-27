@@ -8,7 +8,7 @@
  */
 import { logger } from "../lib/logger";
 import { getSingleModeLlmConfig } from "./agent-platform";
-import { PLATFORM_SKILLS } from "./skill-registry";
+import { vmSkillsCatalog } from "./skill-registry";
 
 // Generous timeouts — the Render-hosted daytona-service may cold-start.
 const TIMEOUTS = {
@@ -446,12 +446,10 @@ export async function ensureProjectSandbox(
   //    ~600 tokens of the 8k Groq request floor. Only self-contained skills
   //    ship to the VM; the full catalog stays available to host-side swarm
   //    mode (god-mode-protocol) where those connections can actually exist.
-  const vmSkills = PLATFORM_SKILLS
-    .filter((s) => !s.requiresConnection)
-    .map((s) => ({
-      name: s.name,
-      instruction: s.instruction,
-    }));
+  // v3: the skills ship as the MCP-hosted catalog (scope-tagged) consumed
+  // by the in-VM skills server — NOT as injected prompt text. Per-agent
+  // segregation is enforced inside the VM (skills_server.py).
+  const vmSkills = vmSkillsCatalog();
   const init = await initWorkspace({
     project_id: row.id,
     user_id: row.user_id,

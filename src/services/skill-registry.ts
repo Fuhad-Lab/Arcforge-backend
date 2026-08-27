@@ -2,6 +2,9 @@ import type { Department, PipelinePhase } from "./god-mode-protocol";
 
 export type AgentMode = "single" | "swarm";
 
+/** In-VM swarm roles a skill can serve (skills-server.py segregation). */
+export type VmScope = "chief" | "frontend" | "backend" | "debugger";
+
 export type PlatformSkill = {
   id: string;
   name: string;
@@ -12,6 +15,14 @@ export type PlatformSkill = {
   description: string;
   instruction: string;
   requiresConnection?: string;
+  /**
+   * Which in-VM swarm agents may consult this skill via the skills MCP
+   * server. EMPTY = not hosted in the VM (redundant there). STRICT
+   * per-agent segregation is the user mandate: the backend agent can
+   * never consult "UI/UX Pro Max", the frontend agent never gets the
+   * backend-only skills.
+   */
+  vmScope?: VmScope[];
 };
 
 // ─── 🧠 THE EXECUTIVE TEAM ─────────────────────────────────────────────
@@ -28,6 +39,7 @@ const EXECUTIVE_SKILLS: PlatformSkill[] = [
       "Forces Plan → Spec → Code workflow. Stops the AI from hallucinating code without a roadmap.",
     instruction:
       "Always produce and follow a plan, then a contract/spec, then implementation. Do not jump directly to code. In swarm mode, the plan is the foundation for inter-agent negotiation.",
+    vmScope: ["chief"],
   },
   {
     id: "sequential-thinking",
@@ -40,6 +52,7 @@ const EXECUTIVE_SKILLS: PlatformSkill[] = [
       "Forces the AI to break complex logic into step-by-step chains before answering.",
     instruction:
       "For complex decisions, reason in ordered steps and verify each dependency before proceeding. Use this during contract negotiation to systematically verify each endpoint.",
+    vmScope: ["chief", "backend"],
   },
   {
     id: "memory",
@@ -52,6 +65,7 @@ const EXECUTIVE_SKILLS: PlatformSkill[] = [
       "Gives the AI a persistent knowledge graph. Remembers user preferences across sessions.",
     instruction:
       "Use durable project context when available and record only reusable decisions, never secrets or transient logs.",
+    vmScope: ["chief"],
   },
   {
     id: "linear",
@@ -82,6 +96,7 @@ const DESIGN_SKILLS: PlatformSkill[] = [
       "192+ rules for spacing, typography, and color theory. Prevents AI-slop designs.",
     instruction:
       "Use deliberate hierarchy, spacing, typography, contrast, responsive behavior, accessible states, and avoid generic AI-slop layouts.",
+    vmScope: ["frontend"],
   },
   {
     id: "figma-bridge",
@@ -107,6 +122,7 @@ const DESIGN_SKILLS: PlatformSkill[] = [
       "Spins up a real browser to see and click the website. Verifies buttons and layouts.",
     instruction:
       "Validate important user journeys in a real browser and inspect title, body, HTTP status, and console errors.",
+    vmScope: ["frontend", "debugger"],
   },
   {
     id: "puppeteer",
@@ -119,6 +135,7 @@ const DESIGN_SKILLS: PlatformSkill[] = [
       "Browser inspection and competitor layout research.",
     instruction:
       "Use browser inspection for research only; do not copy protected content or send uncontrolled actions.",
+    vmScope: [],
   },
 ];
 
@@ -149,6 +166,7 @@ const ENGINEERING_SKILLS: PlatformSkill[] = [
       "Manages project files inside an isolated workspace. Supports create, edit, delete, move, copy, read, list, mkdir, and tree operations on files and directories.",
     instruction:
       "Use the workspace to organize code into MULTIPLE files with proper directory structure. Never generate a monolithic single file. Use atomic writes. All paths are relative to the project root.",
+    vmScope: ["frontend", "backend"],
   },
   {
     id: "fetch",
@@ -161,6 +179,7 @@ const ENGINEERING_SKILLS: PlatformSkill[] = [
       "Converts web pages to Markdown. Essential for reading live documentation.",
     instruction:
       "Fetch authoritative documentation when library behavior may have changed; cite the retrieved source in the plan.",
+    vmScope: ["backend"],
   },
   {
     id: "sentry",
@@ -204,6 +223,7 @@ const SECURITY_SKILLS: PlatformSkill[] = [
       "Local version-control checkpoints. Feature branches and granular commits.",
     instruction:
       "Make granular reversible checkpoints around risky work and inspect the diff before export.",
+    vmScope: ["frontend", "backend"],
   },
   {
     id: "brave-search",
@@ -234,6 +254,7 @@ const SPEED_SKILLS: PlatformSkill[] = [
       "Timezone-aware date and scheduling context.",
     instruction:
       "Use an explicit timezone for scheduling and date logic; never assume the server timezone is the user timezone.",
+    vmScope: ["frontend", "backend", "debugger"],
   },
   {
     id: "slack",
@@ -281,10 +302,8 @@ export function mandatorySkillPrompt(mode: AgentMode): string {
   ].join("\n");
 }
 
-/**
- * Get skills grouped by department. Useful for the /mcp/skills endpoint
- * so the frontend can display them in categories.
- */
+/** Get skills grouped by department. Useful for the /mcp/skills endpoint
+ *  so the frontend can display them in categories. */
 export function skillsByDepartment(): Record<Department, PlatformSkill[]> {
   return {
     executive: EXECUTIVE_SKILLS,
@@ -293,4 +312,29 @@ export function skillsByDepartment(): Record<Department, PlatformSkill[]> {
     security: SECURITY_SKILLS,
     speed: SPEED_SKILLS,
   };
+}
+
+/**
+ * The catalog hosted by the IN-VM skills MCP server (skills_server.py).
+ *
+ * - connection-backed skills are excluded (the VM cannot reach them);
+ * - each skill carries its vmScope so the server enforces STRICT
+ *   per-agent segregation (chief / frontend / backend / debugger).
+ */
+export function vmSkillsCatalog(): Array<{
+  name: string;
+  scope: VmScope[];
+  description: string;
+  instruction: string;
+  source: string;
+}> {
+  return PLATFORM_SKILLS
+    .filter((s) => !s.requiresConnection && (s.vmScope ?? []).length > 0)
+    .map((s) => ({
+      name: s.name,
+      scope: s.vmScope ?? [],
+      description: s.description,
+      instruction: s.instruction,
+      source: s.source,
+    }));
 }

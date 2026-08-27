@@ -242,15 +242,23 @@ class AgentLlmConfig(BaseModel):
 
 
 class SkillInstruction(BaseModel):
-    """One platform skill injected into the in-VM generation prompts.
+    """One platform skill hosted by the in-VM skills MCP server.
 
-    Mirrors { name, instruction } from the Node backend's skill-registry —
-    the single source of truth. Written verbatim into skills.json next to
-    the sidecar so the orchestrator's Architect/Developer prompts carry the
-    same mandatory 17-skill catalog the host-side pipeline always used.
+    Mirrors { name, scope, description, instruction, source } from the
+    Node backend's skill-registry (vmSkillsCatalog — the single source of
+    truth). Written verbatim into skills.json next to the sidecar; the
+    in-VM skills_server.py enforces STRICT per-agent segregation from the
+    scope tags (chief / frontend / backend / debugger).
     """
     name: str = Field(min_length=1, max_length=120)
     instruction: str = Field(default="", max_length=4000)
+    description: str = Field(default="", max_length=2000)
+    source: str = Field(default="", max_length=400)
+    scope: list[str] = Field(
+        default_factory=list,
+        description=("Swarm roles allowed to consult this skill "
+                     "(chief|frontend|backend|debugger). Empty = not hosted."),
+    )
 
 
 class CreateWorkspaceRequest(BaseModel):
@@ -273,9 +281,9 @@ class CreateWorkspaceRequest(BaseModel):
     skills: list[SkillInstruction] | None = Field(
         default=None,
         description=(
-            "Platform skill catalog (17 skills) to plant as skills.json "
-            "next to the sidecar — the in-VM orchestrator injects them "
-            "into its generation prompts."
+            "Platform skill catalog to plant as skills.json next to the "
+            "sidecar — hosted by the in-VM skills MCP server with strict "
+            "per-agent scope segregation."
         ),
     )
 

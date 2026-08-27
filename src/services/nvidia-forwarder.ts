@@ -117,6 +117,34 @@ function buildUpstreamUrl(baseUrl: string, path: string): string {
   return `${baseUrl}${safePath}`;
 }
 
+/**
+ * Resolve the VISION model endpoint (NVIDIA NIM).
+ *
+ * The in-VM Browser Vision Engine sends screenshot-review requests with
+ * path `/vlm/chat/completions`; the backend routes them to NVIDIA with the
+ * server-side `NVIDIA_API_KEY` (the VM never holds it). The VLM model id
+ * arrives inside the request body (ORCH_VLM_MODEL — verified live:
+ * `meta/llama-3.2-11b-vision-instruct`; the user's historical cellex choice
+ * `nvidia/neva-22b` is decommissioned on this account, probed 2026-08-27).
+ */
+function resolveVlmEndpoint(): { baseUrl: string; key: string } {
+  const key =
+    process.env.NVIDIA_API_KEY ||
+    process.env.NVIDIA_NIM_API_KEY ||
+    "";
+  if (!key) {
+    throw new Error(
+      "VLM routing requested but NVIDIA_API_KEY is not set on the tunnel " +
+        "server (screenshot vision checks need it).",
+    );
+  }
+  const base = (
+    process.env.NVIDIA_VLM_BASE_URL ||
+    "https://integrate.api.nvidia.com/v1"
+  ).trim();
+  return { baseUrl: base, key };
+}
+
 /** Lowercase header set we MUST strip from the inbound frame. */
 const STRIPPED_INBOUND_HEADERS = new Set([
   "authorization",
@@ -187,7 +215,16 @@ export async function* forwardToNvidia(
   params: ForwardParams,
 ): AsyncGenerator<NvidiaForwardEvent, void, void> {
   const { method, path, headers, bodyString } = params;
-  const { baseUrl, key } = resolveLlmEndpoint();
+
+  // VLM routing: /vlm/* paths go to the NVIDIA vision endpoint with the
+  // server-side NVIDIA key. `/vlm/chat/completions` → `<vlm-base>/chat/completions`.
+  const isVlm = path.startsWith("/vlm/");
+  const { baseUrl, key } = isVlm
+    ? resolveVlmEndpoint()
+    : resolveLlmEndpoint();
+  const upstreamPath = isVlm
+    ? path.replace(/^\/vlm/, "")
+    : path;
 
   if (!key) {
     throw new Error(
@@ -196,7 +233,7 @@ export async function* forwardToNvidia(
     );
   }
 
-  const url = buildUpstreamUrl(baseUrl, path);
+  const url = buildUpstreamUrl(baseUrl, upstreamPath);
   const outboundHeaders = buildOutboundHeaders(headers, key, bodyString, method);
   const hasBody =
     bodyString && method.toUpperCase() !== "GET" && method.toUpperCase() !== "HEAD";

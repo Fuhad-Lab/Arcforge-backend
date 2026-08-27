@@ -1,74 +1,77 @@
 #!/usr/bin/env python3
 """
-ArcForge Orchestrator — the In-VM "Shadow Agent" daemon.
+ArcForge Orchestrator v3 — the Hierarchical Autonomous Swarm daemon.
 
-This is the BRAIN that lives inside every Daytona MicroVM. It runs as a
-persistent background service (managed by PM2 as "agent-brain", with a
-shell watchdog fallback) and owns the full agent lifecycle:
+Runs inside every Daytona MicroVM (PM2 "agent-brain"). The architecture
+(user-mandated 2026-08-27) is ROLE-BASED and NON-LINEAR:
 
-    ┌────────────────────────────────────────────────────────────┐
-    │  Daytona MicroVM                                           │
-    │                                                            │
-    │  /workspace/          the user's app (tmpfs — instant HMR) │
-    │  /workspace/.system/  -> /home/daytona/.system (disk-backed)│
-    │      orchestrator.py   this daemon                         │
-    │      state.db          SQLite: chat / tasks / logs / status│
-    │                                                            │
-    │  PM2 keeps "agent-brain" alive — crash => instant restart  │
-    │  Listens on 0.0.0.0:9000, Bearer <AGENT_TOKEN> auth        │
-    └────────────────────────────────────────────────────────────┘
+                User prompt  (WebSocket)
+                      │
+              ┌───────▼────────┐
+              │  CHIEF AGENT   │  The Gateway. NEVER writes code.
+              │  (Brain)       │  Classifies → Plans → Seeks APPROVAL →
+              └───────┬────────┘  Dispatches sub-agents AS TOOLS.
+        ┌─────────────┼──────────────────┐
+        │             │                  │
+ ┌──────▼─────┐ ┌─────▼──────┐   ┌───────▼───────┐
+ │ BACKEND    │ │ FRONTEND   │   │ DEBUGGER      │
+ │ AGENT      │◄──► AGENT    │   │ (QA gate)     │
+ └──────┬─────┘ └─────┬──────┘   └───────┬───────┘
+        │             │                  │
+        └── api_contract.json + agent_mailbox (SQLite) ──┘
+                      │
+              plan.md (the Holy Scripture — written EXACTLY
+              as the user approved it; every agent answers to it)
 
-ARCHITECTURE (the "In-VM Sidecar" pattern):
+APPROVAL STATE MACHINE (the pause that makes this a product):
+  user prompt → Chief drafts a plan → task state AWAITING_APPROVAL →
+  WS event {type:"approval_request", plan} → the studio shows
+  [Make changes | Approve Plan] → user feedback is injected as
+  "I have read through the plan. Make the following change(s): …" →
+  Chief refines → AWAITING_APPROVAL again … until approved →
+  plan.md locked → swarm dispatch.
 
-  1. The frontend is a DUMB TERMINAL. It opens a WebSocket, renders
-     whatever the daemon broadcasts, and sends prompts. It holds no
-     execution state of its own.
+THE DEVELOPMENT TWINS share a context loop:
+  • Backend writes its server, then PUBLISHES /workspace/.system/
+    api_contract.json (endpoints + port) and posts to the agent mailbox.
+  • Frontend is FORBIDDEN from guessing API URLs — it READS the contract
+    and writes frontend/lib/api_client.ts from it.
+  • THE FIT CHECK: both servers run; the Frontend Agent opens the app with
+    browser_tool (navigate + console_spy) and attributes every error with
+    profound evidence — its own (it fixes) or the Backend's (mailbox: what
+    it expected vs got). The Backend Agent repairs. Loop until clean.
 
-  2. The daemon is AUTONOMOUS. Prompts land in a durable task queue
-     (SQLite). A dedicated worker THREAD consumes the queue and runs the
-     multi-agent pipeline (Architect -> Developer -> Debugger). The
-     worker is fully decoupled from every WebSocket: if the user closes
-     the tab mid-build, the pipeline keeps running and writing to
-     state.db. When the user returns and reconnects, the daemon replays
-     everything from SQLite (the "sync" handshake).
+THE DEBUGGER reads plan.md, drives the live app via browser_tool interact,
+and returns a structured verdict; the Chief triages failures into fix
+delegations. The cycle continues until the app matches the approved plan.
 
-  3. The daemon SURVIVES CRASHES. PM2 restarts the process if it dies;
-     on boot the daemon re-enqueues any task that was pending/running
-     when it died, so work is never lost.
+Browser Vision Engine (vm_browser.py): Playwright bridge with
+navigate / console_spy / interact / screenshot (+ VLM review through the
+reverse tunnel — the VM never holds a provider key).
 
-SQLite schema (state.db, WAL mode for concurrent reader/writer):
+Skills (skills_server.py): hosted as MCP-style tools with STRICT per-agent
+segregation — the backend agent physically cannot consult "UI/UX Pro Max".
 
-    chat_history(id, ts, role, content, meta_json)
-    task_queue  (id, ts, status, prompt, result_json, error)
-    process_logs(id, ts, task_id, source, level, message)
-    agent_status(key, value_json, updated_at)
-    files       (path, task_id, ts, action)          -- file-change journal
+LSP: agents get lsp_diagnostics — TypeScript (tsc --noEmit) for the
+Frontend Agent, pyflakes/pyright for the Backend Agent — real language
+intell feeding the self-correction loops.
 
-WebSocket protocol (daemon -> client):
-    {"type":"sync",        chat_history, active_status, tasks, logs}
-    {"type":"task_queued", task_id, prompt}
-    {"type":"status",      status}                    -- agent_status upsert
-    {"type":"activity",    task_id, label, state, detail}
-    {"type":"log",         task_id, source, level, message, ts}
-    {"type":"chat",        message}                   -- row appended to chat_history
-    {"type":"files",       task_id, files:[{path, action}]}
-    {"type":"task_done",   task_id, result}
-    {"type":"task_failed", task_id, error}
-    {"type":"pong"}
+Everything the UI shows is REAL: every activity line is an actual agent
+action; there are no hardcoded progress strings anywhere.
 
-WebSocket protocol (client -> daemon):
-    {"type":"hello"}                              -- request a fresh sync
-    {"type":"prompt", text}
-    {"type":"ping"}
+Durable state: SQLite (WAL). PM2 restarts re-enqueue unfinished tasks;
+a task awaiting approval re-emits its approval request on reconnect.
 
-Dependencies: fastapi + uvicorn (installed by the host orchestrator at
-workspace creation). Everything else is stdlib — sqlite3, threading,
-urllib (LLM calls), subprocess (terminal commands).
+WebSocket protocol (daemon → client): sync, task_queued, status,
+activity, log, chat, files, approval_request, plan_locked, task_done,
+task_failed, pong.
+(client → daemon): hello, ping, prompt, approval_response.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -79,175 +82,66 @@ import subprocess
 import threading
 import time
 import uuid
-import shlex
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
 # ---------------------------------------------------------------------------
-# Configuration (env-overridable; injected by the host at install time)
+# Configuration
 # ---------------------------------------------------------------------------
 
 PORT = int(os.environ.get("ORCH_PORT", "9000"))
 TOKEN = os.environ.get("ORCH_TOKEN", "")
 WORKSPACE = os.environ.get("ORCH_WORKSPACE", "/workspace")
-# Reverse-tunnel auth: the shared AGENT_PROXY_SECRET between the VM and
-# the backend. The backend presents this as `X-Agent-Token` (or ?token=)
-# when it dials into /reverse-tunnel. Empty in dev — auth is bypassed.
 RT_TOKEN = os.environ.get("TUNNEL_TOKEN", "")
-# Physical home is DISK-backed (survives VM stop/start). /workspace may be a
-# tmpfs RAM disk, so the host symlinks /workspace/.system -> this directory.
 SYSTEM_DIR = os.environ.get("ORCH_SYSTEM_DIR", "/home/daytona/.system")
 DB_PATH = os.environ.get("ORCH_DB", os.path.join(SYSTEM_DIR, "state.db"))
 
-# LLM (OpenAI-compatible chat-completions endpoint). The VM's AI client
-# supports TWO modes, selected by the ORCH_LLM_URL scheme:
-#
-#   "reverse-tunnel://"  →  NEW (post-Task-15) — the BACKEND dials INTO
-#     this orchestrator's /reverse-tunnel WS endpoint (inbound through
-#     the signed daytonaproxy01.eu URL — bypasses the Daytona EU egress
-#     filter that blocks the VM dialing OUT to *.onrender.com). When the
-#     orchestrator needs to call the LLM, it sends a `req` frame over
-#     the inbound WS to the backend; the backend injects the real
-#     NVIDIA key (server-side only) and streams res/chunk/done frames
-#     back down the same WS. The VM NEVER holds the real key.
-#
-#   "http://..." / "https://..."  →  LEGACY — the orchestrator POSTs
-#     directly via urllib. Used when the VM CAN reach the LLM endpoint
-#     (e.g. a non-Daytona region, or the local tunnel_client on
-#     http://localhost:7777/v1). Maintained for backward compat and
-#     for environments where the egress filter isn't blocking.
-#
-# ORCH_LLM_KEY is a dummy placeholder when reverse-tunnel mode is active
-# (the OpenAI-compatible client API requires *an* api_key arg, but its
-# value is ignored — the backend injects the real Bearer token
-# server-side before forwarding to NVIDIA). Direct mode (VM→NVIDIA) is
-# DISABLED: the VM has no NVIDIA key by design.
 LLM_URL = os.environ.get("ORCH_LLM_URL", "http://localhost:7777/v1")
-# Detect the reverse-tunnel sentinel BEFORE rstrip — the sentinel is
-# "reverse-tunnel://" and we MUST NOT strip its trailing slashes (they
-# are part of the scheme marker).
 LLM_USE_REVERSE_TUNNEL = LLM_URL.startswith("reverse-tunnel://")
 if not LLM_USE_REVERSE_TUNNEL:
-    # Normal URL — strip trailing slashes, normalize to the full
-    # chat-completions endpoint.
     LLM_URL = LLM_URL.rstrip("/")
     if not LLM_URL.endswith("/chat/completions"):
         LLM_URL = f"{LLM_URL}/chat/completions"
 LLM_KEY = os.environ.get("ORCH_LLM_KEY", "tunnel-injected")
 LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "openai/gpt-oss-120b")
 LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "900"))
-# Region-aware readiness flag (written by the installer after probing the
-# LLM routes from inside the VM). 0 = this VM's egress cannot reach any LLM
-# endpoint (eu blocks NVIDIA) — clients then route generation host-side.
-# NOTE: in reverse-tunnel mode, LLM_READY is set to 1 by the installer
-# because the path doesn't depend on the VM's egress — it depends on the
-# backend's ability to dial IN (which is always possible via the signed URL).
 LLM_READY = os.environ.get("ORCH_LLM_READY", "1") == "1"
 
-# Pipeline tuning
-# ── Frontend dev-server ports (2026-08-27 mandate: Next.js-only frontends) ──
-# The platform mandate is: the AI produces a Next.js frontend and picks the
-# backend language itself. Next dev runs on 3000; 5173 is kept only for
-# legacy Vite apps (older generations / manual prompts) — the debugger
-# phase detects the framework from frontend/package.json and launches the
-# right server, and both ports are probed when brokering the preview URL.
+# Vision model for the Browser Vision Engine (routed through the reverse
+# tunnel at /vlm/chat/completions; the backend holds the NVIDIA key).
+VLM_MODEL = os.environ.get("ORCH_VLM_MODEL", "meta/llama-3.2-11b-vision-instruct")
+VLM_ENABLED = os.environ.get("ORCH_VLM_ENABLED", "1") == "1"
+
 NEXT_DEV_PORT = int(os.environ.get("ORCH_NEXT_PORT", "3000"))
 VITE_DEV_PORT = int(os.environ.get("ORCH_VITE_PORT", "5173"))
-# Back-compat alias: older env files set ORCH_DEV_SERVER_PORT for the Vite
-# server. If present, it overrides VITE_DEV_PORT (not NEXT_DEV_PORT).
-DEV_SERVER_PORT = int(os.environ.get("ORCH_DEV_SERVER_PORT", str(VITE_DEV_PORT)))
-VITE_DEV_PORT = DEV_SERVER_PORT
 LOG_TAIL_FOR_SYNC = int(os.environ.get("ORCH_SYNC_LOG_TAIL", "50"))
-
 LOG_FILE = os.environ.get("ORCH_LOG_FILE", os.path.join(SYSTEM_DIR, "orchestrator.log"))
 
-# ---------------------------------------------------------------------------
-# Logging — mirror to stderr (PM2 captures it) and a file
-# ---------------------------------------------------------------------------
+# Swarm tuning
+APPROVAL_TIMEOUT_S = float(os.environ.get("ORCH_APPROVAL_TIMEOUT_S", str(6 * 3600)))
+AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "26"))
+DEBUG_MAX_ROUNDS = int(os.environ.get("ORCH_DEBUG_MAX_ROUNDS", "2"))
+
+API_CONTRACT_PATH = os.path.join(WORKSPACE, ".system", "api_contract.json")
+PLAN_PATH = os.path.join(WORKSPACE, "plan.md")
 
 os.makedirs(SYSTEM_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE),
-    ],
+    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE)],
 )
 log = logging.getLogger("orchestrator")
 
 # ---------------------------------------------------------------------------
-# Platform skills — planted by the host installer as skills.json next to
-# this daemon (the same 17-skill catalog the host-side pipeline injects via
-# god-mode-protocol.ts; single source of truth = skill-registry.ts on the
-# backend). Loaded once at boot and injected into the Architect/Developer
-# prompts so in-VM generations honour the mandatory skills too.
-# ---------------------------------------------------------------------------
-SKILLS: List[Dict[str, str]] = []
-try:
-    _skills_path = os.path.join(SYSTEM_DIR, "skills.json")
-    if os.path.exists(_skills_path):
-        with open(_skills_path, "r", encoding="utf-8") as _fh:
-            _raw = json.load(_fh)
-        if isinstance(_raw, list):
-            SKILLS = [
-                {"name": str(s.get("name", "")).strip(),
-                 "instruction": str(s.get("instruction", "")).strip()}
-                for s in _raw if isinstance(s, dict) and s.get("name")
-            ]
-except Exception as _exc:  # noqa: BLE001 — skills must never break the daemon
-    log.warning("skills.json present but unreadable: %s", _exc)
-
-if SKILLS:
-    log.info("loaded %d platform skills from skills.json", len(SKILLS))
-
-def skills_prompt_block() -> str:
-    """Render the ENGINEERING STANDARDS injected into generation prompts.
-
-    HISTORY (why this is not the 17-skill list anymore): the old block
-    injected 17 one-line skill instructions (~2,000 chars ≈ 600 tokens) into
-    every generation call — while the Groq free-tier floor caps a WHOLE
-    request at 8k tokens. The skills were eating the code budget, and most
-    described tools the VM does not have (Linear/Figma/Postgres/Sentry/
-    GitHub/Slack/Brave — connection-backed MCPs), so the model could only
-    "comply" rhetorically. The block below is the applicable subset of the
-    same catalog (ui-ux-pro-max, filesystem, sequential-thinking, git,
-    memory) distilled into CONCRETE, verifiable standards. The full catalog
-    still ships as skills.json and is reported in /status for the UI.
-    """
-    return (
-        "## ENGINEERING STANDARDS (mandatory, verifiable):\n"
-        "- STRUCTURE: multiple focused files (components/, lib/); no monolith "
-        "page; shared helpers extracted to lib/.\n"
-        "- UI: clear type hierarchy; consistent 8px spacing; real hover/focus/"
-        "disabled states; responsive flex/grid that works at 375px; dark bg "
-        "#0a0a0a with accessible contrast; NO lorem ipsum — plausible real "
-        "copy/mock data; every list has an empty state.\n"
-        "- CODE: typed props/interfaces; named-by-intent handlers; no dead "
-        "code/TODOs; data lives in lib/ (fetched or mocked), not inlined JSX.\n"
-        "- RESILIENCE: async UI has loading + error states; forms validate "
-        "before acting.\n"
-        "- SECURITY: never inline secrets; treat rendered user input as unsafe.\n"
-        "- WORKFLOW: you edit a REAL git repo — keep changes minimal; never "
-        "delete working features when modifying."
-    )
-
-
-# ---------------------------------------------------------------------------
-# v2 AGENT LOOP — scaffold, workspace context, git checkpoints
-# (2026-08-27 overhaul: the model must spend tokens on the APP, see the code
-# it is modifying, and get its errors fed back to it. See Task 24 worklog.)
+# Scaffold + workspace helpers (proven v2 machinery, kept as-is)
 # ---------------------------------------------------------------------------
 
 _SRC_EXTS = (".tsx", ".ts", ".jsx", ".js", ".py", ".mjs", ".cjs")
 _SKIP_DIRS = {"node_modules", ".next", ".git", ".system", "__pycache__", ".venv", "dist", "build"}
 
-# The pinned Next.js 14 skeleton the daemon writes BEFORE the developer
-# phase. Every token the model does NOT spend on package.json/tsconfig/
-# next.config/layout is a token spent on the actual app. (Deps are the exact
-# pins the old prompt demanded — proven to install+run in this VM image.)
 SCAFFOLD_FILES: Dict[str, str] = {
     "frontend/package.json": (
         '{"name":"arcforge-app","version":"0.1.0","private":true,'
@@ -284,16 +178,12 @@ SCAFFOLD_FILES: Dict[str, str] = {
         "  )\n"
         "}\n"
     ),
-    "frontend/.gitignore": "node_modules/\n.next/\n", 
+    "frontend/.gitignore": "node_modules/\n.next/\n",
     ".gitignore": "**/node_modules/\n**/.next/\n**/__pycache__/\n*.log\n",
 }
 
 
 def seed_scaffold(task_id: Optional[str] = None) -> bool:
-    """Write the pinned Next.js skeleton (only missing files) and kick off a
-    BACKGROUND `npm install` so deps download while the LLM generates. The
-    later verify-phase install becomes a fast no-op. Returns True if the
-    frontend skeleton was freshly seeded (first generation)."""
     fe = os.path.join(WORKSPACE, "frontend")
     seeded = False
     for rel, content in SCAFFOLD_FILES.items():
@@ -315,13 +205,12 @@ def seed_scaffold(task_id: Optional[str] = None) -> bool:
                 start_new_session=True,
             )
             log.info("scaffold: background npm install launched")
-        except Exception as exc:  # noqa: BLE001 — scaffold install is best-effort
+        except Exception as exc:  # noqa: BLE001
             log.warning("scaffold: background npm install failed to start: %s", exc)
     return seeded
 
 
 def _iter_source_files() -> List[str]:
-    """All source files under frontend/ + backend/, excluding junk dirs."""
     out: List[str] = []
     for root_name in ("frontend", "backend"):
         base = os.path.join(WORKSPACE, root_name)
@@ -336,10 +225,6 @@ def _iter_source_files() -> List[str]:
 
 
 def workspace_has_source() -> bool:
-    """True once a generation has produced app code (follow-up territory).
-    Scaffold files (package.json, tsconfig, next.config.mjs, app/layout.tsx,
-    .gitignore) do NOT count — otherwise every first generation over the
-    seeded skeleton would be misrouted to the edit path."""
     scaffold = set(SCAFFOLD_FILES.keys())
     for rel in _iter_source_files():
         if rel in scaffold or rel.endswith("app/layout.tsx"):
@@ -356,36 +241,7 @@ def workspace_tree_text() -> str:
     return "\n".join(files[:60])
 
 
-def workspace_context_text(char_budget: int = 5000) -> str:
-    """File tree + the contents of the most important source files, capped.
-    Priority: frontend/app/page.tsx, then components, then lib, then backend."""
-    lines = ["CURRENT WORKSPACE FILES:", workspace_tree_text()]
-    pri = ["frontend/app/page.tsx"]
-    files = _iter_source_files()
-    ordered = [f for f in pri if f in files] + \
-              [f for f in files if f not in pri and "/app/" in f] + \
-              [f for f in files if f.startswith("frontend/components/")] + \
-              [f for f in files if f.startswith("frontend/lib/")] + \
-              [f for f in files if f.startswith("backend/")]
-    spent = 0
-    for rel in ordered:
-        if spent >= char_budget:
-            lines.append("(context budget reached — remaining files omitted)")
-            break
-        try:
-            with open(os.path.join(WORKSPACE, rel), "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
-        except OSError:
-            continue
-        if len(content) > 4000:
-            content = content[:4000] + "\n/* ...TRUNCATED... */"
-        lines.append(f"\n----- {rel} -----\n{content}")
-        spent += len(content)
-    return "\n".join(lines)
-
-
 def read_file_for_edit(rel: str, cap: int = 6000) -> str:
-    """Current content of one file for the per-file edit prompt."""
     try:
         with open(os.path.join(WORKSPACE, rel), "r", encoding="utf-8", errors="replace") as fh:
             content = fh.read()
@@ -397,8 +253,6 @@ def read_file_for_edit(rel: str, cap: int = 6000) -> str:
 
 
 def git_checkpoint(label: str) -> Optional[str]:
-    """Best-effort git checkpoint at /workspace (rollback support). NEVER
-    raises — a missing git binary or a repo problem must not fail a task."""
     try:
         def g(*args: str) -> subprocess.CompletedProcess:
             return subprocess.run(
@@ -413,14 +267,14 @@ def git_checkpoint(label: str) -> Optional[str]:
         r = g("commit", "-q", "--no-verify", "-m", label)
         if r.returncode == 0:
             return label
-        # Nothing to commit (no changes) is fine.
         return None
     except Exception as exc:  # noqa: BLE001
         log.warning("git checkpoint failed (non-fatal): %s", exc)
         return None
 
+
 # ---------------------------------------------------------------------------
-# SQLite state store
+# SQLite state store (chat, tasks, logs, status, files, approvals, mailbox)
 # ---------------------------------------------------------------------------
 
 _SCHEMA = """
@@ -459,16 +313,31 @@ CREATE TABLE IF NOT EXISTS files (
     ts      REAL NOT NULL,
     action  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS approvals (
+    task_id  TEXT PRIMARY KEY,
+    plan     TEXT NOT NULL,
+    status   TEXT NOT NULL,
+    feedback TEXT,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_mailbox (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    task_id TEXT,
+    from_agent TEXT NOT NULL,
+    to_agent   TEXT NOT NULL,
+    message    TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_chat_ts       ON chat_history(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_task_ts  ON process_logs(task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_files_ts      ON files(ts);
+CREATE INDEX IF NOT EXISTS idx_mailbox_ts    ON agent_mailbox(task_id, ts);
 """
 
 _db_lock = threading.RLock()
 
 
 def db() -> sqlite3.Connection:
-    """Thread-safe connection factory (one connection per call, WAL mode)."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -482,17 +351,9 @@ def init_db() -> None:
         conn.executescript(_SCHEMA)
 
 
-# -- typed row helpers -------------------------------------------------------
-
-
 def append_chat(role: str, content: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    row = {
-        "id": uuid.uuid4().hex,
-        "ts": time.time(),
-        "role": role,
-        "content": content,
-        "meta": meta or {},
-    }
+    row = {"id": uuid.uuid4().hex, "ts": time.time(), "role": role,
+           "content": content, "meta": meta or {}}
     with _db_lock, db() as conn:
         conn.execute(
             "INSERT INTO chat_history (id, ts, role, content, meta_json) VALUES (?,?,?,?,?)",
@@ -531,12 +392,11 @@ def recent_chat(limit: int = 200) -> List[Dict[str, Any]]:
             "SELECT id, ts, role, content, meta_json FROM chat_history "
             "ORDER BY ts DESC LIMIT ?", (limit,),
         ).fetchall()
-    out = [
+    return [
         {"id": r["id"], "ts": r["ts"], "role": r["role"], "content": r["content"],
          "meta": json.loads(r["meta_json"] or "{}")}
         for r in rows
-    ]
-    return list(reversed(out))
+    ][::-1]
 
 
 def recent_logs(limit: int = LOG_TAIL_FOR_SYNC, task_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -551,12 +411,11 @@ def recent_logs(limit: int = LOG_TAIL_FOR_SYNC, task_id: Optional[str] = None) -
                 "SELECT id, ts, task_id, source, level, message FROM process_logs "
                 "ORDER BY ts DESC LIMIT ?", (limit,),
             ).fetchall()
-    out = [
+    return [
         {"id": r["id"], "ts": r["ts"], "task_id": r["task_id"], "source": r["source"],
          "level": r["level"], "message": r["message"]}
         for r in rows
-    ]
-    return list(reversed(out))
+    ][::-1]
 
 
 def all_tasks() -> List[Dict[str, Any]]:
@@ -582,22 +441,60 @@ def upsert_file(path: str, task_id: Optional[str], action: str) -> None:
         )
 
 
+# -- approvals ---------------------------------------------------------------
+
+
+def approval_upsert(task_id: str, plan: str, status: str, feedback: str = "") -> None:
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO approvals (task_id, plan, status, feedback, updated_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
+            "plan=excluded.plan, status=excluded.status, feedback=excluded.feedback, "
+            "updated_at=excluded.updated_at",
+            (task_id, plan, status, feedback, time.time()),
+        )
+
+
+def approval_get(task_id: str) -> Optional[Dict[str, Any]]:
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT task_id, plan, status, feedback, updated_at FROM approvals "
+            "WHERE task_id=?", (task_id,)).fetchone()
+    if not row:
+        return None
+    return {"task_id": row["task_id"], "plan": row["plan"], "status": row["status"],
+            "feedback": row["feedback"], "updated_at": row["updated_at"]}
+
+
+# -- agent mailbox (the Twins' communication channel) -------------------------
+
+
+def mailbox_send(task_id: str, from_agent: str, to_agent: str, message: str) -> None:
+    with _db_lock, db() as conn:
+        conn.execute(
+            "INSERT INTO agent_mailbox (ts, task_id, from_agent, to_agent, message) "
+            "VALUES (?,?,?,?,?)",
+            (time.time(), task_id, from_agent, to_agent, str(message)[:2000]),
+        )
+
+
+def mailbox_read(task_id: str, agent: str) -> List[Dict[str, Any]]:
+    with _db_lock, db() as conn:
+        rows = conn.execute(
+            "SELECT ts, from_agent, to_agent, message FROM agent_mailbox "
+            "WHERE task_id=? AND to_agent=? ORDER BY ts ASC",
+            (task_id, agent)).fetchall()
+    return [{"ts": r["ts"], "from": r["from_agent"], "message": r["message"]} for r in rows]
+
+
 # ---------------------------------------------------------------------------
-# WebSocket connection manager (the broadcast hub)
+# WebSocket connection manager
 # ---------------------------------------------------------------------------
 
 
 class ConnectionManager:
-    """Tracks connected dumb-terminals.
-
-    broadcast() NEVER blocks the worker: it is always scheduled onto the
-    asyncio loop from the worker thread via run_coroutine_threadsafe. When
-    zero clients are connected the events simply go nowhere — the durable
-    copy in SQLite is the source of truth and sync replays it on reconnect.
-    """
-
     def __init__(self) -> None:
-        self.active: List[Any] = []          # starlette WebSocket objects
+        self.active: List[Any] = []
         self._lock = threading.Lock()
 
     async def connect(self, ws: Any) -> None:
@@ -610,11 +507,7 @@ class ConnectionManager:
         with self._lock:
             if ws in self.active:
                 self.active.remove(ws)
-        # NOTE: no cancellation signal is ever sent to the worker. Tab close
-        # is a NON-EVENT for the pipeline — that is the entire point of the
-        # sidecar architecture.
-        log.info("client disconnected (%d total) — background tasks continue",
-                 len(self.active))
+        log.info("client disconnected (%d total) — background tasks continue", len(self.active))
 
     async def broadcast(self, event: Dict[str, Any]) -> None:
         with self._lock:
@@ -631,57 +524,32 @@ class ConnectionManager:
             self.disconnect(ws)
 
     def broadcast_from_worker(self, event: Dict[str, Any]) -> None:
-        """Thread-safe bridge: worker thread -> asyncio loop."""
         loop = _LOOP
         if loop is None or loop.is_closed():
             return
         try:
             asyncio.run_coroutine_threadsafe(self.broadcast(event), loop)
-        except Exception as exc:  # pragma: no cover — never kill the worker
+        except Exception as exc:  # pragma: no cover
             log.warning("broadcast failed: %s", exc)
 
 
 manager = ConnectionManager()
-_LOOP: Optional[asyncio.AbstractEventLoop] = None      # captured at startup
+_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
 def emit(event: Dict[str, Any]) -> None:
-    """Worker-facing helper: broadcast an event to all terminals."""
     manager.broadcast_from_worker(event)
 
 
 # ---------------------------------------------------------------------------
-# REVERSE TUNNEL — backend dials INTO this orchestrator's /reverse-tunnel
-# WS endpoint (inbound through the signed daytonaproxy01.eu URL). Bypasses
-# the Daytona EU egress filter that blocks the VM dialing OUT to
-# *.onrender.com. See module-level docstring on the LLM_URL config above.
-#
-# PROTOCOL (matches src/routes/tunnel.ts on the backend — keep in sync):
-#   VM→backend: {t:"req", id, method, path, headers, body}
-#   backend→VM: {t:"res", id, status, headers}
-#                {t:"chunk", id, body}
-#                {t:"done", id}
-#                {t:"error", id, message}
-#                {t:"ping"} / {t:"pong"}
-#
-# The VM is the WS SERVER (the backend dials in). The orchestrator's
-# worker thread (which calls llm_chat) sends `req` frames over the WS;
-# the backend receives them, calls NVIDIA with the server-side key,
-# and streams res/chunk/done back. The multiplexer tracks in-flight
-# req IDs and resolves their asyncio.Futures when the matching frames
-# arrive on the /reverse-tunnel WS.
+# REVERSE TUNNEL (backend dials in; LLM + VLM requests flow out through it)
 # ---------------------------------------------------------------------------
 
 
 class _InflightRT:
-    """One in-flight LLM request pending on the reverse-tunnel WS."""
-
     __slots__ = ("future", "status", "headers", "body_parts")
 
     def __init__(self) -> None:
-        # asyncio.Future — must be created on the loop (this class is
-        # only ever instantiated from inside coroutines scheduled on
-        # _LOOP, so get_running_loop() works).
         self.future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.status: int = 0
         self.headers: Dict[str, str] = {}
@@ -689,18 +557,9 @@ class _InflightRT:
 
 
 class ReverseTunnelMultiplexer:
-    """Tracks in-flight LLM requests pending on the reverse-tunnel WS.
-
-    Each register(req_id) returns an _InflightRT whose .future the
-    worker thread's bridged coroutine awaits. The /reverse-tunnel WS
-    handler dispatches res/chunk/done/error frames here. On WS
-    disconnect, fail_all() errors every pending request so the worker
-    thread's llm_chat raises immediately instead of hanging.
-    """
-
     def __init__(self) -> None:
         self._inflight: Dict[str, _InflightRT] = {}
-        self._ws: Any = None  # starlette WebSocket (the backend's inbound WS)
+        self._ws: Any = None
         self._ws_connected: asyncio.Event = asyncio.Event()
         self._ws_connected.clear()
         self._send_lock = asyncio.Lock()
@@ -739,15 +598,12 @@ class ReverseTunnelMultiplexer:
         self._inflight.pop(req_id, None)
 
     def fail_all(self, reason: str) -> None:
-        """Fail every in-flight request (called on WS disconnect)."""
         for e in self._inflight.values():
             if not e.future.done():
                 e.future.set_exception(ConnectionError(reason))
         self._inflight.clear()
 
     async def send_req(self, frame: Dict[str, Any]) -> None:
-        """Send a req frame over the inbound WS (VM→backend). Raises if
-        the backend hasn't dialed in yet (or the WS has dropped)."""
         async with self._send_lock:
             if self._ws is None or not self._ws_connected.is_set():
                 raise ConnectionError("reverse-tunnel WS not connected (backend hasn't dialed in)")
@@ -758,310 +614,176 @@ rt_mux = ReverseTunnelMultiplexer()
 
 
 # ---------------------------------------------------------------------------
-# LLM client (stdlib urllib — OpenAI-compatible chat completions)
+# LLM clients — text (Groq/OpenAI-compatible) + VLM (NVIDIA vision, /vlm path)
 # ---------------------------------------------------------------------------
 
-
-# Track when the last LLM call finished + how big it was, for TPM pacing
-# (see llm_chat docstring). Simple module-globals — the worker thread is
-# the only caller.
 _last_llm_done_ts = 0.0
 _last_llm_cost_tokens = 0.0
-TPM_GAP_S = 65.0      # full-window cooling (a max-size request)
-TPM_MIN_GAP_S = 2.5   # after a tiny call
-TPM_FLOOR_TOKENS = 8000.0  # Groq free-tier per-request/minute floor
+# NVIDIA NIM pacing (2026-08-28 migration): the account's limit is RPM-based
+# (~40 RPM/model) with NO per-request token floor like Groq's 8k. A short
+# gap after big calls is pure safety margin, not a TPM window.
+TPM_GAP_S = 8.0
+TPM_MIN_GAP_S = 2.0
+TPM_FLOOR_TOKENS = 8000.0
 
 
-def _estimate_cost_tokens(messages: List[Dict[str, str]], max_tokens: int) -> float:
-    """What Groq's pre-check counts against the minute: prompt tokens + the
-    RESERVED max_tokens (worst case), not the actual completion."""
-    prompt_chars = sum(len(m.get("content", "")) for m in messages)
+def _estimate_cost_tokens(messages: List[Dict[str, Any]], max_tokens: int) -> float:
+    prompt_chars = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            prompt_chars += len(c)
+        elif isinstance(c, list):  # vision content blocks
+            for blk in c:
+                if isinstance(blk, dict) and isinstance(blk.get("text"), str):
+                    prompt_chars += len(blk["text"])
     return prompt_chars / 4.0 + max_tokens
 
 
 def pace_for_tpm(gap_s: Optional[float] = None) -> None:
-    """PROPORTIONAL TPM pacing (v2). The old code slept a flat 65s before
-    EVERY call — architect→developer alone burned a minute of dead time.
-    Groq's pre-check counts prompt+max_tokens (reserved) against the
-    rolling minute, so the gap only needs to be proportional to the
-    PREVIOUS call's reserved size:
-
-        small call (~1.5k reserved)  ->  ~12s
-        full-window call (~8k)       ->  65s (fully cold window)
-
-    Callers may still force a gap (the chunked path uses 30s).
-    No-op on a cold clock."""
     global _last_llm_done_ts, _last_llm_cost_tokens
     if gap_s is None:
-        gap_s = max(
-            TPM_MIN_GAP_S,
-            TPM_GAP_S * min(1.0, _last_llm_cost_tokens / TPM_FLOOR_TOKENS),
-        )
+        gap_s = max(TPM_MIN_GAP_S, TPM_GAP_S * min(1.0, _last_llm_cost_tokens / TPM_FLOOR_TOKENS))
     wait = _last_llm_done_ts + gap_s - time.time()
     if wait > 0:
-        log.info("tpm pacing: sleeping %.1fs before the next LLM call "
-                 "(previous call reserved ~%.0f tokens)", wait, _last_llm_cost_tokens)
+        log.info("tpm pacing: sleeping %.1fs (previous call reserved ~%.0f tokens)",
+                 wait, _last_llm_cost_tokens)
         time.sleep(wait)
 
 
-def llm_chat(
-    messages: List[Dict[str, str]],
-    json_mode: bool = False,
-    max_tokens: int = 16384,
-) -> str:
-    """Call the configured OpenAI-compatible endpoint. Raises RuntimeError
-    with a readable message on failure (the worker catches and degrades).
-
-    GROQ TPM NOTE (live-measured 2026-08-27): this account's tier enforces
-    ~8k tokens/min. The pre-check rejects prompt+max_tokens that exceed
-    the CURRENT minute's remaining budget — so a big request passes on a
-    cold minute but 413s (`rate_limit_exceeded`, code `tokens`) when it
-    follows another call too closely. Empirically a cold-minute burst of
-    12k max_tokens + ~5k real completion streams fine and fast (~450
-    tok/s). llm_chat therefore: (a) records the time of every successful
-    call, (b) exposes pace_for_tpm() so the pipeline can space a big call
-    at least TPM_GAP_S after the previous one, and (c) retries 429/413
-    rate-limit responses after sleeping out the window.
-
-    Dispatches on the ORCH_LLM_URL scheme:
-      - "reverse-tunnel://"  →  send a `req` frame over the inbound
-        /reverse-tunnel WS to the backend; the backend injects the real
-        provider key server-side and streams res/chunk/done back.
-      - "http(s)://..."       →  legacy urllib POST (used in non-Daytona
-        environments or where the egress filter isn't blocking).
-    """
-    if LLM_USE_REVERSE_TUNNEL:
-        return _llm_chat_via_reverse_tunnel(
-            messages, json_mode=json_mode, max_tokens=max_tokens,
-        )
-
-    if not LLM_URL or not LLM_KEY:
-        raise RuntimeError("LLM endpoint not configured (ORCH_LLM_URL / ORCH_LLM_KEY)")
-
-    body: Dict[str, Any] = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-    }
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
-
-    last_err: Optional[Exception] = None
-    for attempt in range(3):
-        req = urllib_request.Request(
-            LLM_URL,
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                # Dummy Authorization — tunnel_client strips this header
-                # at the edge and the ArcForge backend injects the real
-                # NVIDIA Bearer token before forwarding to NVIDIA. The VM
-                # never holds the real key.
-                "Authorization": f"Bearer {LLM_KEY}",
-            },
-            method="POST",
-        )
-        try:
-            with urllib_request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            content = payload["choices"][0]["message"]["content"]
-            if not isinstance(content, str) or not content.strip():
-                raise RuntimeError("LLM returned an empty message")
-            global _last_llm_done_ts, _last_llm_cost_tokens
-            _last_llm_done_ts = time.time()
-            _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
-            return content
-        except HTTPError as exc:
-            # 429 -> retry with backoff (free-tier rate limits); others raise.
-            if exc.code == 429 and attempt < 2:
-                last_err = exc
-                time.sleep(20 * (attempt + 1))
-                continue
-            detail = exc.read().decode("utf-8", "replace")[:500]
-            raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
-        except (URLError, TimeoutError, OSError) as exc:
-            if attempt < 2:
-                last_err = exc
-                time.sleep(5)
-                continue
-            raise RuntimeError(f"LLM unreachable: {exc}") from exc
-    raise RuntimeError(f"LLM failed after retries: {last_err}")
-
-
-def _llm_chat_via_reverse_tunnel(
-    messages: List[Dict[str, str]],
-    json_mode: bool = False,
-    max_tokens: int = 16384,
-) -> str:
-    """Reverse-tunnel LLM call. Sends a `req` frame over the inbound
-    /reverse-tunnel WS to the backend, awaits res/chunk/done, returns
-    the assembled JSON payload (same shape as an OpenAI chat completion
-    response). Called from the worker THREAD (llm_chat runs there);
-    bridges to the asyncio loop via run_coroutine_threadsafe so the
-    frame send + future await both happen on _LOOP (single-threaded
-    by definition — no thread-safety issues on the multiplexer).
-    """
-    global _last_llm_done_ts
+def _tunnel_request(path: str, body: Dict[str, Any]) -> Tuple[int, str]:
+    """One request/response over the reverse tunnel. Returns (status, body)."""
     loop = _LOOP
     if loop is None or loop.is_closed():
         raise RuntimeError("reverse-tunnel: asyncio loop not initialized")
-
-    body: Dict[str, Any] = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "temperature": 0,
-        "max_tokens": max_tokens,
-    }
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
-
-    body_str = json.dumps(body)
     req_id = uuid.uuid4().hex
-    # Strip Authorization + Host + Content-Length — the backend injects
-    # the real NVIDIA Bearer token server-side and recomputes hop-by-hop
-    # headers. (We're not actually sending them anyway, but keep the
-    # protocol identical to the old tunnel_client for code symmetry.)
-    frame: Dict[str, Any] = {
-        "t": "req",
-        "id": req_id,
-        "method": "POST",
-        "path": "/v1/chat/completions",
-        "headers": {"Content-Type": "application/json"},
-        "body": body_str,
-    }
-
-    last_err: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            # Schedule the send-and-await on the asyncio loop. Block the
-            # worker thread until it resolves (or times out). The future
-            # resolves when /reverse-tunnel receives a `done`/`error` frame.
-            future = asyncio.run_coroutine_threadsafe(
-                _rt_send_and_await(req_id, frame), loop,
-            )
-            entry = future.result(timeout=LLM_TIMEOUT_S + 10)
-        except asyncio.TimeoutError:
-            rt_mux.cancel(req_id)
-            if attempt < 2:
-                last_err = TimeoutError("reverse-tunnel LLM call timed out")
-                time.sleep(5)
-                continue
-            raise RuntimeError("reverse-tunnel: LLM call timed out")
-        except ConnectionError as exc:
-            # Backend hasn't dialed in yet, or WS dropped mid-call.
-            if attempt < 2:
-                last_err = exc
-                time.sleep(5)
-                continue
-            raise RuntimeError(f"reverse-tunnel WS not connected: {exc}") from exc
-        except RuntimeError as exc:
-            # The backend sent an `error` frame.
-            if attempt < 2:
-                last_err = exc
-                time.sleep(5)
-                continue
-            raise
-        except Exception as exc:  # noqa: BLE001 — defensive
-            if attempt < 2:
-                last_err = exc
-                time.sleep(5)
-                continue
-            raise RuntimeError(f"reverse-tunnel LLM call failed: {exc}") from exc
-
-        status = entry.status or 502
-        body_preview = "".join(entry.body_parts)[:600]
-        # Groq rate limits: 429 (RPM) or 413 with code `tokens`/
-        # `rate_limit_exceeded` (TPM — the request exceeded the current
-        # minute's remaining budget). Both are TRANSIENT: sleep out the
-        # window and retry. Other statuses are real errors — raise.
-        tpm_limited = status == 413 and (
-            "rate_limit_exceeded" in body_preview or "tokens per minute" in body_preview
-        )
-        if (status == 429 or tpm_limited) and attempt < 2:
-            last_err = RuntimeError(
-                f"LLM HTTP {status}: rate-limited — {body_preview[:200]}")
-            log.warning("llm rate-limited (HTTP %s) — sleeping out the window, retry %d/2",
-                        status, attempt + 1)
-            time.sleep(65)
-            continue
-        if status != 200:
-            raise RuntimeError(f"LLM HTTP {status}: {body_preview[:500]}")
-
-        # Success — assemble the JSON payload the same way the urllib
-        # path would: parse the body and extract choices[0].message.content.
-        full_body = "".join(entry.body_parts)
-        try:
-            payload = json.loads(full_body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"reverse-tunnel: LLM returned non-JSON (first 300 chars): {full_body[:300]}"
-            ) from exc
-        content = payload["choices"][0]["message"]["content"]
-        if not isinstance(content, str) or not content.strip():
-            raise RuntimeError("LLM returned an empty message")
-        global _last_llm_done_ts, _last_llm_cost_tokens
-        _last_llm_done_ts = time.time()
-        _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
-        return content
-
-    raise RuntimeError(f"reverse-tunnel LLM failed after retries: {last_err}")
+    frame = {"t": "req", "id": req_id, "method": "POST", "path": path,
+             "headers": {"Content-Type": "application/json"},
+             "body": json.dumps(body)}
+    future = asyncio.run_coroutine_threadsafe(_rt_send_and_await(req_id, frame), loop)
+    entry = future.result(timeout=LLM_TIMEOUT_S + 10)
+    return entry.status or 502, "".join(entry.body_parts)
 
 
 async def _rt_send_and_await(req_id: str, frame: Dict[str, Any]) -> _InflightRT:
-    """Coroutine that runs on _LOOP: register the req id, send the req
-    frame over the reverse-tunnel WS, await the matching future.
-    Returns the resolved _InflightRT (with status + headers + body_parts
-    populated). Raises if the WS drops or the backend sends an `error`
-    frame — these are converted by the caller's exception handling
-    into retry/raise decisions.
-    """
     entry = rt_mux.register(req_id)
     try:
         await rt_mux.send_req(frame)
     except Exception:
         rt_mux.cancel(req_id)
         raise
-    try:
-        await entry.future
-    except Exception:
-        # The future was resolved with an exception (on_error or fail_all).
-        # entry has been popped from the mux already; just re-raise.
-        raise
+    await entry.future
     return entry
 
 
+def _parse_chat_completion(raw: str) -> str:
+    payload = json.loads(raw)
+    content = payload["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("LLM returned an empty message")
+    return content
+
+
+def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
+                   direct_url: Optional[str] = None) -> str:
+    """Dispatch on transport: reverse-tunnel or direct urllib. Retries 429/413."""
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            if LLM_USE_REVERSE_TUNNEL:
+                status, raw = _tunnel_request(path, body)
+            else:
+                url = direct_url or LLM_URL
+                req = urllib_request.Request(
+                    url, data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json",
+                             "Authorization": f"Bearer {LLM_KEY}"},
+                    method="POST")
+                with urllib_request.urlopen(req, timeout=LLM_TIMEOUT_S) as resp:
+                    raw = resp.read().decode("utf-8")
+                status = 200
+            if status != 200:
+                preview = raw[:400]
+                tpm_limited = status == 413 and (
+                    "rate_limit_exceeded" in preview or "tokens per minute" in preview)
+                if (status == 429 or tpm_limited) and attempt < 2:
+                    last_err = RuntimeError(f"LLM HTTP {status}: {preview[:200]}")
+                    log.warning("llm rate-limited (HTTP %s) — sleeping out the window", status)
+                    time.sleep(65)
+                    continue
+                raise RuntimeError(f"LLM HTTP {status}: {preview}")
+            return _parse_chat_completion(raw)
+        except HTTPError as exc:
+            if exc.code in (429, 413) and attempt < 2:
+                last_err = exc
+                time.sleep(20 * (attempt + 1))
+                continue
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
+        except (URLError, TimeoutError, OSError, ConnectionError, RuntimeError) as exc:
+            # Retry transient failures (WS drop, timeout, rate-limit RuntimeError)
+            msg = str(exc)
+            if attempt < 2 and not msg.startswith("LLM HTTP 4"):
+                last_err = exc
+                time.sleep(5)
+                continue
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"LLM unreachable: {exc}") from exc
+    raise RuntimeError(f"LLM failed after retries: {last_err}")
+
+
+def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
+             max_tokens: int = 16384) -> str:
+    """Text LLM (the swarm's brain). Raises RuntimeError with a readable msg."""
+    body: Dict[str, Any] = {"model": LLM_MODEL, "messages": messages,
+                            "temperature": 0, "max_tokens": max_tokens}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    try:
+        return _llm_call_impl(body)
+    finally:
+        global _last_llm_done_ts, _last_llm_cost_tokens
+        _last_llm_done_ts = time.time()
+        _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
+
+
+def llm_vlm(image_path: str, question: str, max_tokens: int = 420) -> str:
+    """Vision LLM — screenshot review via the reverse tunnel (/vlm path →
+    NVIDIA on the backend side; the VM never holds the key)."""
+    if not VLM_ENABLED:
+        return "(vision model disabled)"
+    with open(image_path, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode("ascii")
+    body = {
+        "model": VLM_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                {"type": "text", "text": question},
+            ],
+        }],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    try:
+        return _llm_call_impl(body, path="/vlm/chat/completions")
+    except Exception as exc:  # noqa: BLE001 — VLM is best-effort
+        return f"(vision check unavailable: {str(exc)[:150]})"
+
+
 def _repair_double_escaped(text: str) -> str:
-    """Repair LLM file content that arrived with ONLY escaped newlines.
-
-    Observed live (2026-08-26, Nemotron-3.5-lightning "Social media" run):
-    the model double-escapes newlines in JSON file content, so app.py and
-    package.json land as a SINGLE line full of literal '\\n' two-char
-    sequences — py_compile fails on line 1 and npm dies with EJSONPARSE.
-
-    Safety: fires ONLY when the content has zero REAL newlines but at
-    least one escaped one. Any legitimately-formatted code file always
-    has real newlines, so healthy files are never touched (a literal
-    '\\n' inside a Python/JS string on a normal multi-line file stays
-    exactly as the model wrote it).
-    """
     if not text:
         return text
-    real_nl = text.count("\n")
-    lit_nl = text.count("\\n")
-    if real_nl == 0 and lit_nl >= 1:
-        return (
-            text.replace("\\r\\n", "\n")
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace('\\"', '"')
-        )
+    if text.count("\n") == 0 and text.count("\\n") >= 1:
+        return (text.replace("\\r\\n", "\n").replace("\\n", "\n")
+                .replace("\\t", "\t").replace('\\"', '"'))
     return text
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
-    """Parse the first JSON object out of an LLM reply (handles markdown
-    fences and preamble prose)."""
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     candidate = fenced.group(1) if fenced else text
     start = candidate.find("{")
@@ -1075,14 +797,1043 @@ def _extract_json(text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# The autonomous task queue + multi-agent pipeline (the worker THREAD)
+# Browser Vision Engine + Skills server (sidecar modules)
+# ---------------------------------------------------------------------------
+
+import importlib.util as _ilu
+
+_SIDE_CAR_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_module(name: str):
+    path = os.path.join(_SIDE_CAR_DIR, f"{name}.py")
+    if not os.path.exists(path):
+        log.warning("sidecar module missing: %s", path)
+        return None
+    spec = _ilu.spec_from_file_location(name, path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+_vm_browser_mod = _load_module("vm_browser")
+_skills_server_mod = _load_module("skills_server")
+
+browser_engine = None
+if _vm_browser_mod is not None:
+    browser_engine = _vm_browser_mod.get_browser_engine(vlm_fn=llm_vlm)
+else:  # pragma: no cover
+    log.error("vm_browser.py failed to load — browser_tool will report not-installed")
+
+if _skills_server_mod is not None:
+    _skills_server_mod.load_catalog()
+else:  # pragma: no cover
+    log.error("skills_server.py failed to load — skills MCP unavailable")
+
+
+def skills_catalog_summary() -> Dict[str, int]:
+    if _skills_server_mod is not None:
+        return _skills_server_mod.catalog_summary()
+    return {r: 0 for r in ("chief", "frontend", "backend", "debugger")}
+
+
+# ---------------------------------------------------------------------------
+# LSP diagnostics — real language intell for the agents
+#   Frontend Agent → TypeScript (tsc --noEmit over the whole project)
+#   Backend Agent  → Python (pyright when installed, pyflakes fallback,
+#                    py_compile last resort)
+# ---------------------------------------------------------------------------
+
+
+def lsp_diagnostics(scope: str) -> str:
+    """Run the language server check for one side. Returns trimmed output."""
+    if scope == "frontend":
+        fe = os.path.join(WORKSPACE, "frontend")
+        if not os.path.exists(os.path.join(fe, "package.json")):
+            return "frontend/package.json missing — nothing to check"
+        try:
+            proc = subprocess.run(
+                "npx tsc --noEmit 2>&1 | head -n 60",
+                shell=True, cwd=fe, capture_output=True, text=True, timeout=240)
+            out = (proc.stdout or "") + (proc.stderr or "")
+            out = out.strip()
+            if not out:
+                return "TSC CLEAN — no type errors."
+            return f"TSC DIAGNOSTICS:\n{out[:3000]}"
+        except subprocess.TimeoutExpired:
+            return "tsc timed out (240s) — diagnostics unavailable"
+        except Exception as exc:  # noqa: BLE001
+            return f"tsc failed to run: {exc}"
+    if scope == "backend":
+        be = os.path.join(WORKSPACE, "backend")
+        if not os.path.isdir(be):
+            return "backend/ does not exist"
+        py_files = []
+        for dirpath, dirnames, filenames in os.walk(be):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            for fn in filenames:
+                if fn.endswith(".py"):
+                    py_files.append(os.path.join(dirpath, fn))
+        if not py_files:
+            return "no python files to check"
+        # pyright (real LSP) when available, else pyflakes, else py_compile
+        for cmd in (
+            "pyright --outputjson 2>/dev/null | head -c 6000",
+            "python3 -m pyflakes " + " ".join(f'"{p}"' for p in py_files[:40]),
+        ):
+            try:
+                proc = subprocess.run(cmd, shell=True, cwd=be, capture_output=True,
+                                      text=True, timeout=180)
+                out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+                if proc.returncode == 127 or not out:
+                    continue  # tool not installed — try the next
+                if cmd.startswith("pyright"):
+                    try:
+                        data = json.loads(out)
+                        diags = data.get("generalDiagnostics", [])
+                        if not diags:
+                            return "PYRIGHT CLEAN — no diagnostics."
+                        lines = []
+                        for d in diags[:40]:
+                            rng = d.get("range", {}).get("start", {})
+                            lines.append(f"{d.get('file','?').replace(be+'/','')}:"
+                                         f"{rng.get('line',0)+1} "
+                                         f"[{d.get('severity','?')}] {d.get('message','')}")
+                        return "PYRIGHT DIAGNOSTICS:\n" + "\n".join(lines)[:3000]
+                    except json.JSONDecodeError:
+                        pass  # fall through to raw output below
+                else:
+                    if out == "":  # pyflakes prints nothing when clean
+                        return "PYFLAKES CLEAN — no issues."
+                    return f"PYFLAKES DIAGNOSTICS:\n{out[:3000]}"
+                return f"DIAGNOSTICS:\n{out[:3000]}"
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception:  # noqa: BLE001
+                continue
+        # Last resort — compile check
+        bad = []
+        for p in py_files[:40]:
+            r = subprocess.run(["python3", "-m", "py_compile", p],
+                               capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                bad.append(f"{os.path.basename(p)}: {(r.stderr or '')[-300:]}")
+        return ("PY_COMPILE OK — no syntax errors." if not bad
+                else "SYNTAX ERRORS:\n" + "\n".join(bad)[:3000])
+    return f"unknown scope {scope}"
+
+
+# ---------------------------------------------------------------------------
+# Shared execution helpers
+# ---------------------------------------------------------------------------
+
+
+def safe_join(base: str, rel: str) -> Optional[str]:
+    """Join + path-traversal guard. None when rel escapes base."""
+    rel = (rel or "").strip().lstrip("/").replace("\\", "/")
+    if not rel or ".." in rel.split("/"):
+        return None
+    dest = os.path.normpath(os.path.join(base, rel))
+    if not (dest == base or dest.startswith(base + os.sep)):
+        return None
+    return dest
+
+
+def shell_run(cmd: str, cwd: str, timeout: int = 180) -> Dict[str, Any]:
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout)
+        return {"exit_code": proc.returncode,
+                "stdout": (proc.stdout or "")[-2500:], "stderr": (proc.stderr or "")[-2000:]}
+    except subprocess.TimeoutExpired:
+        return {"exit_code": -1, "stdout": "", "stderr": f"timed out after {timeout}s"}
+    except Exception as exc:  # noqa: BLE001
+        return {"exit_code": -1, "stdout": "", "stderr": f"{type(exc).__name__}: {exc}"}
+
+
+def write_workspace_file(rel: str, content: str, task_id: Optional[str],
+                         allowed_prefixes: Tuple[str, ...] = ("frontend", "backend")) -> Dict[str, Any]:
+    """Scoped write with journaling + UI file event."""
+    rel = (rel or "").strip().lstrip("/")
+    if not rel:
+        return {"ok": False, "error": "path required"}
+    if not rel.startswith(allowed_prefixes):
+        return {"ok": False, "error":
+                f"SCOPE VIOLATION: you may only write under {'/'.join(allowed_prefixes)} — "
+                f"'{rel}' is outside your scope."}
+    dest = safe_join(WORKSPACE, rel)
+    if dest is None:
+        return {"ok": False, "error": f"invalid path '{rel}'"}
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    existed = os.path.exists(dest)
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write(_repair_double_escaped(content))
+    action = "edit" if existed else "create"
+    upsert_file(dest, task_id, action)
+    if task_id:
+        emit({"type": "files", "task_id": task_id,
+              "files": [{"path": dest, "action": action}]})
+    return {"ok": True, "path": rel, "action": action, "bytes": len(content)}
+
+
+# ---------------------------------------------------------------------------
+# THE AGENT LOOP ENGINE — JSON tool-calling with history compaction
+# ---------------------------------------------------------------------------
+
+
+def _compact_history(messages: List[Dict[str, str]], keep_last: int = 6,
+                     budget_chars: int = 9000) -> List[Dict[str, str]]:
+    """Keep [system, task] verbatim + the last `keep_last` exchanges verbatim;
+    older tool exchanges collapse to one-line summaries. Keeps every request
+    under the Groq floor even for long agent runs."""
+    if len(messages) <= 2 + keep_last:
+        return messages
+    head = messages[:2]
+    older = messages[2:-keep_last]
+    tail = messages[-keep_last:]
+    summary_lines: List[str] = []
+    for m in older:
+        if m["role"] == "assistant":
+            try:
+                d = _extract_json(m["content"])
+                tool = d.get("tool", "?")
+                arg = d.get("path") or d.get("command") or d.get("action") or d.get("skill") or ""
+                summary_lines.append(f"assistant called {tool} {str(arg)[:60]}")
+            except Exception:
+                summary_lines.append("assistant replied (non-JSON, dropped)")
+        else:
+            text = m["content"]
+            summary_lines.append(f"tool result: {text[:120]}")
+    digest = "EARLIER STEPS (compacted):\n- " + "\n- ".join(summary_lines[-14:])
+    # Hard char budget on the digest
+    if len(digest) > budget_chars:
+        digest = digest[:budget_chars] + "\n…(older steps truncated)"
+    return head + [{"role": "user", "content": digest}] + tail
+
+
+class AgentContext:
+    """Everything a sub-agent run needs, bound to one task."""
+
+    def __init__(self, task_id: str, agent_name: str) -> None:
+        self.task_id = task_id
+        self.agent_name = agent_name          # "chief" | "backend" | "frontend" | "debugger"
+        self.label = {"chief": "Chief Agent", "backend": "Backend Agent",
+                      "frontend": "Frontend Agent",
+                      "debugger": "Debugger Agent"}[agent_name]
+        self.files_written: List[str] = []
+        self.contract_reads = 0
+        self.started = time.time()
+
+    def activity(self, label: str, state: str, detail: str = "") -> None:
+        emit({"type": "activity", "task_id": self.task_id, "label": label,
+              "state": state, "detail": detail})
+        append_log(self.task_id, self.agent_name, "info",
+                   f"{label} — {detail}" if detail else label)
+
+    def say(self, message: str, kind: str = "note") -> None:
+        """The agent's own stream line — appended to chat so the UI shows
+        REAL agent narration (never hardcoded)."""
+        append_log(self.task_id, self.agent_name, "info", message)
+        emit({"type": "log", "task_id": self.task_id, "source": self.agent_name,
+              "level": "info", "message": message})
+
+
+def run_agent_loop(
+    ctx: AgentContext,
+    system_prompt: str,
+    task_prompt: str,
+    toolset: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
+    max_steps: int = AGENT_MAX_STEPS,
+    max_tokens: int = 4500,
+) -> Dict[str, Any]:
+    """Run one agent: LLM ↔ tools until it replies {"tool":"done", ...} or
+    hits the step limit. Every tool call is journaled + broadcast as an
+    activity line (the agent's REAL stream)."""
+    tool_names = ", ".join(sorted(toolset.keys()))
+    sys_full = (f"{system_prompt}\n\nAVAILABLE TOOLS: {tool_names}.\n"
+                'Reply with ONLY a JSON object per step: {"tool":"<name>", <args…>} '
+                'or to finish: {"tool":"done","report":"<what you did and the outcome>"}'
+                + ("" if len(toolset) < 14 else ""))
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": sys_full},
+        {"role": "user", "content": task_prompt},
+    ]
+    last_report = ""
+    for step in range(1, max_steps + 1):
+        pace_for_tpm()
+        try:
+            reply = llm_chat(_compact_history(messages), json_mode=True,
+                             max_tokens=max_tokens)
+        except Exception as exc:  # noqa: BLE001
+            ctx.say(f"{ctx.label} LLM call failed at step {step}: {str(exc)[:200]}")
+            return {"tool": "done", "report": f"LLM failure at step {step}: "
+                    f"{str(exc)[:200]}", "status": "degraded"}
+        try:
+            data = _extract_json(reply)
+        except Exception:  # noqa: BLE001
+            data = {"tool": "done", "report": reply[:600]}
+        tool = str(data.get("tool") or "").strip().lower()
+        if tool in ("", "done", "finish", "complete"):
+            last_report = str(data.get("report") or data.get("summary") or
+                              data.get("reply") or "done")[:1200]
+            break
+        fn = toolset.get(tool)
+        if fn is None:
+            result = {"ok": False,
+                      "error": f"unknown tool '{tool}' — you have: {tool_names}"}
+        else:
+            args = {k: v for k, v in data.items() if k != "tool"}
+            # Redact giant echo-backs from the journaled args
+            display_args = {k: (v if not (isinstance(v, str) and len(v) > 90)
+                                else v[:90] + "…") for k, v in args.items()}
+            ctx.activity(f"{ctx.label} — {tool}", "active",
+                         " ".join(f"{k}={v}" for k, v in display_args.items())[:160])
+            try:
+                result = fn(args)
+            except Exception as exc:  # noqa: BLE001 — tools must never kill the loop
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        result_str = json.dumps(result, ensure_ascii=False)[:3500]
+        ctx.activity(f"{ctx.label} — {tool}", "done",
+                     ("ok" if result.get("ok", True) else
+                      f"error: {str(result.get('error', ''))[:140]}"))
+        messages.append({"role": "assistant", "content": reply})
+        messages.append({"role": "user", "content": f"TOOL RESULT ({tool}): {result_str}"})
+    else:
+        last_report = f"step limit ({max_steps}) reached — {last_report[:300]}"
+    return {"tool": "done", "report": last_report, "steps": min(step, max_steps)}
+
+
+# ---------------------------------------------------------------------------
+# SUB-AGENT TOOLSETS (strict capability scopes)
+# ---------------------------------------------------------------------------
+
+
+def _fs_toolset(ctx: AgentContext, scope_dir: str,
+                prefixes: Tuple[str, ...]) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    def write_file(a: Dict[str, Any]) -> Dict[str, Any]:
+        path, content = a.get("path", ""), a.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            return {"ok": False, "error": "content required"}
+        r = write_workspace_file(path, content, ctx.task_id, allowed_prefixes=prefixes)
+        if r.get("ok"):
+            ctx.files_written.append(r["path"])
+        return r
+
+    def edit_file(a: Dict[str, Any]) -> Dict[str, Any]:
+        path, find, replace = a.get("path", ""), a.get("find", ""), a.get("replace", "")
+        dest = safe_join(WORKSPACE, path) if path.startswith(("frontend", "backend")) else None
+        if dest is None:
+            return {"ok": False, "error": f"path must be under {prefixes}"}
+        if not os.path.exists(dest):
+            return {"ok": False, "error": f"{path} does not exist"}
+        try:
+            with open(dest, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError as exc:
+            return {"ok": False, "error": str(exc)}
+        if find and find in content:
+            content = content.replace(find, replace, 1)
+        elif find:
+            return {"ok": False, "error": f"find-text not present in {path}"}
+        else:
+            content = replace  # no find → whole-file rewrite
+        return write_file({"path": path, "content": content})
+
+    def read_file(a: Dict[str, Any]) -> Dict[str, Any]:
+        path = a.get("path", "")
+        if path.startswith(("frontend", "backend")) or path == "plan.md":
+            dest = safe_join(WORKSPACE, path)
+            if dest and os.path.exists(dest):
+                with open(dest, "r", encoding="utf-8", errors="replace") as fh:
+                    return {"ok": True, "content": fh.read()[:7000]}
+            return {"ok": False, "error": f"{path} not found"}
+        return {"ok": False, "error": "read scope: frontend/, backend/, plan.md"}
+
+    def delete_file(a: Dict[str, Any]) -> Dict[str, Any]:
+        path = a.get("path", "")
+        dest = safe_join(WORKSPACE, path) if path.startswith(prefixes) else None
+        if dest is None or not os.path.isfile(dest):
+            return {"ok": False, "error": f"cannot delete {path}"}
+        os.remove(dest)
+        upsert_file(dest, ctx.task_id, "delete")
+        emit({"type": "files", "task_id": ctx.task_id,
+              "files": [{"path": dest, "action": "delete"}]})
+        return {"ok": True, "deleted": path}
+
+    return {"write_file": write_file, "edit_file": edit_file,
+            "read_file": read_file, "delete_file": delete_file}
+
+
+def _terminal_tool(ctx: AgentContext, cwd: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    def terminal(a: Dict[str, Any]) -> Dict[str, Any]:
+        cmd = str(a.get("command") or a.get("cmd") or "").strip()
+        if not cmd:
+            return {"ok": False, "error": "command required"}
+        if any(bad in cmd for bad in ("rm -rf /", "mkfs", "shutdown", "reboot")):
+            return {"ok": False, "error": "command rejected (unsafe)"}
+        out = shell_run(cmd, cwd, timeout=240)
+        ok = out["exit_code"] == 0
+        text = f"exit {out['exit_code']}\n{out['stdout'] or out['stderr']}"[:2800]
+        return {"ok": ok, "output": text}
+    return terminal
+
+
+def _browser_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    def browser_tool(a: Dict[str, Any]) -> Dict[str, Any]:
+        if browser_engine is None:
+            return {"ok": False, "error": "browser engine unavailable"}
+        action = str(a.get("action") or "").strip().lower()
+        if action == "navigate":
+            return browser_engine.navigate(str(a.get("url") or "http://localhost:3000"))
+        if action == "console_spy":
+            return browser_engine.console_spy()
+        if action == "interact":
+            return browser_engine.interact(str(a.get("selector") or ""),
+                                           str(a.get("do") or a.get("action2") or "click"),
+                                           str(a.get("value") or ""))
+        if action == "screenshot":
+            return browser_engine.screenshot(str(a.get("filename") or ""),
+                                             str(a.get("question") or ""))
+        return {"ok": False, "error": "action must be navigate|console_spy|interact|screenshot"}
+    return {"browser_tool": browser_tool}
+
+
+def _skills_toolset(role: str) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    if _skills_server_mod is None:
+        return {}
+    def mcp_list_skills(_: Dict[str, Any]) -> Dict[str, Any]:
+        return _skills_server_mod.mcp_list_tools(role)
+    def mcp_use_skill(a: Dict[str, Any]) -> Dict[str, Any]:
+        return _skills_server_mod.mcp_call_tool(
+            role, str(a.get("skill") or a.get("name") or ""),
+            str(a.get("input") or a.get("question") or ""))
+    return {"mcp_list_skills": mcp_list_skills, "mcp_use_skill": mcp_use_skill}
+
+
+def _mailbox_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    def mailbox_send(a: Dict[str, Any]) -> Dict[str, Any]:
+        to = str(a.get("to") or "").strip().lower()
+        if to not in ("backend", "frontend", "chief"):
+            return {"ok": False, "error": "to must be backend|frontend|chief"}
+        msg = str(a.get("message") or a.get("text") or "").strip()
+        if not msg:
+            return {"ok": False, "error": "message required"}
+        mailbox_send(ctx.task_id, ctx.agent_name, to, msg)
+        return {"ok": True, "delivered_to": to}
+    def mailbox_read(_: Dict[str, Any]) -> Dict[str, Any]:
+        msgs = mailbox_read(ctx.task_id, ctx.agent_name)
+        return {"ok": True, "messages": msgs[-10:]}
+    return {"mailbox_send": mailbox_send, "mailbox_read": mailbox_read}
+
+
+def build_backend_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    tools: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+    tools.update(_fs_toolset(ctx, "backend", ("backend",)))
+    tools["terminal"] = _terminal_tool(ctx, os.path.join(WORKSPACE, "backend"))
+
+    def lsp(_: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True, "diagnostics": lsp_diagnostics("backend")}
+    tools["lsp_diagnostics"] = lsp
+
+    def api_contract_update(a: Dict[str, Any]) -> Dict[str, Any]:
+        contract = a.get("contract")
+        if not isinstance(contract, (dict, list)):
+            # allow a JSON string too
+            if isinstance(a.get("contract_json"), str):
+                try:
+                    contract = json.loads(a["contract_json"])
+                except json.JSONDecodeError:
+                    return {"ok": False, "error": "contract_json is not valid JSON"}
+            else:
+                return {"ok": False, "error": "contract object required"}
+        os.makedirs(os.path.dirname(API_CONTRACT_PATH), exist_ok=True)
+        with open(API_CONTRACT_PATH, "w", encoding="utf-8") as fh:
+            json.dump(contract, fh, indent=2)
+        mailbox_send(ctx.task_id, "backend", "frontend",
+                     "API CONTRACT PUBLISHED — read it with api_contract_read.")
+        ctx.activity("Backend Agent — published api_contract.json", "done")
+        return {"ok": True, "path": ".system/api_contract.json"}
+
+    tools["api_contract_update"] = api_contract_update
+    tools.update(_mailbox_toolset(ctx))
+    tools.update(_skills_toolset("backend"))
+    return tools
+
+
+def build_frontend_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    tools: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+    tools.update(_fs_toolset(ctx, "frontend", ("frontend",)))
+    tools["terminal"] = _terminal_tool(ctx, os.path.join(WORKSPACE, "frontend"))
+
+    def lsp(_: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True, "diagnostics": lsp_diagnostics("frontend")}
+    tools["lsp_diagnostics"] = lsp
+
+    def api_contract_read(_: Dict[str, Any]) -> Dict[str, Any]:
+        ctx.contract_reads += 1
+        if not os.path.exists(API_CONTRACT_PATH):
+            return {"ok": True, "contract": None,
+                    "note": "No backend contract exists — this app appears to be "
+                            "frontend-only per the plan. Do not invent API URLs."}
+        with open(API_CONTRACT_PATH, "r", encoding="utf-8") as fh:
+            return {"ok": True, "contract": json.load(fh)}
+
+    tools["api_contract_read"] = api_contract_read
+    tools.update(_browser_toolset(ctx))
+    tools.update(_mailbox_toolset(ctx))
+    tools.update(_skills_toolset("frontend"))
+
+    # The Integration Link guard: writing fetch/API code before reading the
+    # contract earns an explicit warning in the tool result.
+    _orig_write = tools["write_file"]
+
+    def guarded_write(a: Dict[str, Any]) -> Dict[str, Any]:
+        r = _orig_write(a)
+        if r.get("ok") and ctx.contract_reads == 0:
+            content = str(a.get("content", ""))
+            if re.search(r"""(fetch\(|axios|localhost:\d+|/api/)""", content) \
+                    and os.path.exists(API_CONTRACT_PATH):
+                r["warning"] = ("INTEGRATION LINK: you wrote API-calling code but have NOT "
+                                "read the backend contract this task. Call api_contract_read "
+                                "and align your URLs — guessing endpoints is forbidden.")
+        return r
+
+    tools["write_file"] = guarded_write
+    return tools
+
+
+def build_debugger_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    tools: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+    tools.update(_browser_toolset(ctx))
+
+    def read_file(a: Dict[str, Any]) -> Dict[str, Any]:
+        path = str(a.get("path") or "")
+        if path == "plan.md":
+            if os.path.exists(PLAN_PATH):
+                with open(PLAN_PATH, "r", encoding="utf-8", errors="replace") as fh:
+                    return {"ok": True, "content": fh.read()[:8000]}
+            return {"ok": False, "error": "plan.md not found"}
+        if path.startswith(("frontend/", "backend/")):
+            dest = safe_join(WORKSPACE, path)
+            if dest and os.path.exists(dest):
+                with open(dest, "r", encoding="utf-8", errors="replace") as fh:
+                    return {"ok": True, "content": fh.read()[:5000]}
+            return {"ok": False, "error": f"{path} not found"}
+        return {"ok": False, "error": "read scope: plan.md, frontend/*, backend/*"}
+
+    tools["read_file"] = read_file
+    return tools
+
+
+# ---------------------------------------------------------------------------
+# THE SUB-AGENTS
+# ---------------------------------------------------------------------------
+
+BACKEND_SYSTEM = """You are the Backend Agent of ArcForge — an autonomous backend developer working inside a Linux VM.
+HARD RULES:
+- You NEVER touch frontend/ files and never use a browser. Your world is backend/ + the API contract.
+- The approved plan.md is the binding contract. Implement exactly what it specifies.
+- After your server code works, you MUST publish the integration contract (api_contract_update) so the Frontend Agent can integrate — it is forbidden from guessing your endpoints.
+WORKFLOW: read the plan → write the code (small focused files) → lsp_diagnostics → install deps + start the server via terminal (nohup, background) → smoke-test endpoints with curl → api_contract_update {contract:{base_url,port,endpoints:[{method,path,description,response}]}} → mailbox_send to frontend (contract ready) → done.
+BACKEND CHOICE: Python Flask (requirements.txt + app.py, port 8000, enable CORS for localhost:3000) unless the plan says otherwise.
+If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
+
+FRONTEND_SYSTEM = """You are the Frontend Agent of ArcForge — an autonomous frontend developer working inside a Linux VM.
+HARD RULES:
+- You NEVER touch backend/ files. Your world is frontend/ (Next.js 14 App Router + TypeScript — the pinned scaffold with deps already exists).
+- INTEGRATION LINK (law): you are FORBIDDEN from guessing API URLs. If the plan has a backend, call api_contract_read FIRST and write frontend/lib/api_client.ts from the contract. Every fetch goes through that client.
+- After writing code: lsp_diagnostics (tsc) until clean; start the dev server via terminal: nohup npx next dev -p 3000 -H 0.0.0.0 & ; then VERIFY with browser_tool: navigate http://localhost:3000 → console_spy → fix every error (yours) or report it to the backend agent (mailbox_send: what you called, what you expected, what you got). You cannot report done while console errors exist.
+UI STANDARDS: inline styles or one <style> tag only (NO .css files); every file using hooks/handlers starts with 'use client'; Next 14 <Link> takes NO nested <a>; no lorem ipsum — realistic copy; responsive; loading + empty states.
+If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
+
+DEBUGGER_SYSTEM = """You are the Debugger Agent of ArcForge — the QA gate. You NEVER write or edit code. You verify the live app against plan.md.
+TOOLS: browser_tool (navigate / console_spy / interact / screenshot) and read_file (plan.md, frontend/*, backend/*).
+WORKFLOW:
+1. read_file plan.md → extract the Acceptance Criteria (and the core features if no explicit list).
+2. browser_tool navigate http://localhost:3000 — inspect the accessibility tree.
+3. For EACH criterion: interact (click/type) to exercise it, then console_spy. A criterion passes only if the UI shows the expected outcome AND no console/network errors fire.
+4. Screenshot key screens when a visual check matters.
+FINISH with: {"tool":"done","report":"<evidence-based summary>","status":"pass"|"fail","issues":[{"criterion":"...","observation":"what actually happened","suspect":"frontend|backend|unclear"}]}.
+Be strict: an app that compiles but fails a criterion is a FAIL. Report only real, observed failures — never speculation."""
+
+
+def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]:
+    ctx = AgentContext(task_id, "backend")
+    ctx.activity("Backend Agent — starting", "active", task[:120])
+    plan_excerpt = plan_text[:2600]
+    system = BACKEND_SYSTEM.replace("{plan}", "")
+    user = (f"TASK FROM THE CHIEF AGENT:\n{task}\n\n"
+            f"APPROVED PLAN (plan.md):\n{plan_excerpt}\n\n"
+            f"CURRENT backend/ TREE:\n{workspace_tree_text() or '(empty)'}")
+    pace_for_tpm()
+    result = run_agent_loop(ctx, system, user, build_backend_toolset(ctx),
+                            max_tokens=4500)
+    ctx.activity("Backend Agent — finished", "done",
+                 str(result.get("report", ""))[:200])
+    ctx.say(f"Backend Agent report: {str(result.get('report',''))[:400]}")
+    return result
+
+
+def run_frontend_agent(task_id: str, task: str, plan_text: str,
+                       fit_check: bool = False) -> Dict[str, Any]:
+    ctx = AgentContext(task_id, "frontend")
+    kind = "FIT CHECK" if fit_check else "starting"
+    ctx.activity(f"Frontend Agent — {kind}", "active", task[:120])
+    system = FRONTEND_SYSTEM
+    if fit_check:
+        user = (
+            "INTEGRATION FIT CHECK — both servers are running. Your job: prove "
+            "frontend and backend fit like a puzzle.\n"
+            f"APPROVED PLAN (for reference):\n{plan_text[:1800]}\n\n"
+            "STEPS: browser_tool navigate http://localhost:3000 → console_spy → "
+            "for EVERY error decide with profound evidence whether it is YOURS "
+            "(fix via write_file, then re-navigate) or the BACKEND's (mailbox_send "
+            "to backend: exactly what you called, what you expected, what you got). "
+            "Use interact on 1-2 key flows to confirm real data renders. "
+            "Finish with done + a report stating: page status, console errors "
+            "(or none), data integration verdict, any mailbox messages sent."
+        )
+    else:
+        user = (f"TASK FROM THE CHIEF AGENT:\n{task}\n\n"
+                f"APPROVED PLAN (plan.md):\n{plan_text[:2600]}\n\n"
+                f"CURRENT frontend/ TREE:\n{workspace_tree_text() or '(scaffold only)'}")
+    pace_for_tpm()
+    result = run_agent_loop(ctx, system, user, build_frontend_toolset(ctx),
+                            max_tokens=4500)
+    ctx.activity("Frontend Agent — finished", "done",
+                 str(result.get("report", ""))[:200])
+    ctx.say(f"Frontend Agent report: {str(result.get('report',''))[:400]}")
+    return result
+
+
+def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
+    ctx = AgentContext(task_id, "debugger")
+    ctx.activity("Debugger Agent — E2E verification", "active",
+                 "testing the live app against plan.md")
+    user = ("Verify the live app at http://localhost:3000 against plan.md "
+            "(read it first). Work through every acceptance criterion with "
+            "browser interactions, then give your verdict.")
+    pace_for_tpm()
+    result = run_agent_loop(ctx, DEBUGGER_SYSTEM, user,
+                            build_debugger_toolset(ctx), max_tokens=3000)
+    report = str(result.get("report", ""))
+    status = "pass" if (result.get("status") == "pass" or
+                        re.search(r"\bstatus\D{0,12}pass\b", report, re.I)) else "fail"
+    issues = result.get("issues")
+    if not isinstance(issues, list):
+        issues = []
+    if status == "fail" and not issues:
+        issues = [{"criterion": "overall", "observation": report[:400],
+                   "suspect": "unclear"}]
+    ctx.activity("Debugger Agent — verdict", "done", status.upper())
+    ctx.say(f"Debugger verdict: {status.upper()} — {report[:400]}")
+    return {"status": status, "issues": issues, "report": report}
+
+
+# ---------------------------------------------------------------------------
+# Server launch helpers (the deterministic "Fit Check" plumbing)
+# ---------------------------------------------------------------------------
+
+
+def ensure_servers_up(task_id: str) -> Dict[str, Any]:
+    """Deterministically bring up the frontend + backend dev servers so the
+    Fit Check and the Debugger test a LIVE app. Logs everything honestly."""
+    out: Dict[str, Any] = {"frontend": False, "backend": False, "app_port": None}
+
+    def sh(cmd: str, cwd: str, timeout: int = 240) -> str:
+        r = shell_run(cmd, cwd, timeout)
+        append_log(task_id, "orchestrator", "info",
+                   f"$ {cmd}\n{r['stdout'] or r['stderr']}"[:1200])
+        return r["stdout"] + r["stderr"]
+
+    fe = os.path.join(WORKSPACE, "frontend")
+    if os.path.exists(os.path.join(fe, "package.json")):
+        sh("npm install --no-audit --no-fund --loglevel=error", fe, 600)
+        sh(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1", fe, 15)
+        sh("rm -rf .next node_modules/.cache", fe, 60)
+        sh(f"nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
+           f"> /tmp/frontend-dev.log 2>&1 < /dev/null &", fe, 20)
+        for _ in range(6):
+            sh("sleep 5", fe, 10)
+            code = sh(f"curl -s -o /dev/null -w '%{{http_code}}' "
+                      f"http://localhost:{NEXT_DEV_PORT}/ --max-time 20", fe, 30)
+            if code.strip().startswith(("2", "3")):
+                out["frontend"] = True
+                out["app_port"] = NEXT_DEV_PORT
+                break
+    be = os.path.join(WORKSPACE, "backend")
+    if os.path.isdir(be):
+        if os.path.exists(os.path.join(be, "requirements.txt")):
+            sh("pip install -q -r requirements.txt 2>&1 | tail -n 2", be, 420)
+        be_pkg = os.path.join(be, "package.json")
+        started = False
+        if os.path.exists(be_pkg):
+            sh("npm install --no-audit --no-fund --loglevel=error", be, 600)
+            try:
+                with open(be_pkg, "r", encoding="utf-8") as fh:
+                    bpkg = json.load(fh)
+                bscript = ("start" if "start" in (bpkg.get("scripts") or {})
+                           else "dev" if "dev" in (bpkg.get("scripts") or {}) else None)
+            except Exception:  # noqa: BLE001
+                bscript = None
+            if bscript:
+                sh(f"nohup npm run {bscript} > /tmp/backend-dev.log 2>&1 < /dev/null &", be, 20)
+                started = True
+        for entry in ("app.py", "main.py", "server.py"):
+            if os.path.exists(os.path.join(be, entry)):
+                sh(f"nohup python3 {entry} > /tmp/backend-dev.log 2>&1 < /dev/null &", be, 20)
+                started = True
+                break
+        if started:
+            time.sleep(3)
+            crash = shell_run("tail -n 20 /tmp/backend-dev.log 2>/dev/null", be, 15)
+            txt = crash["stdout"]
+            if "Traceback (most recent call last)" in txt:
+                append_log(task_id, "orchestrator", "warn",
+                           f"backend crashed at boot: {txt[-500:]}")
+            else:
+                out["backend"] = True
+    if out["app_port"]:
+        set_status("app", {"port": out["app_port"], "up": True, "task_id": task_id})
+        emit({"type": "status", "status": get_status("app")})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# THE CHIEF AGENT — gateway, planner, orchestrator
+# ---------------------------------------------------------------------------
+
+CHIEF_CLASSIFY_SYSTEM = """You are the Chief Agent of ArcForge — the gateway of an autonomous build swarm. Your FIRST job is routing the user's message:
+- "answer": a question / chat / explanation that needs NO code changes (e.g. "What is React?", "Why use TypeScript?"). You answer it yourself — the build pipeline does NOT run.
+- "app": a request to build, modify, extend or fix an application — it goes through the plan + approval + swarm pipeline.
+Reply with ONLY JSON:
+{"kind":"answer","reply":"<your direct answer to the user>"}
+or
+{"kind":"app","intent":"<one line: what they want built/changed>"}"""
+
+CHIEF_PLAN_SYSTEM = """You are the Chief Agent of ArcForge — leader of an autonomous build swarm. Draft a build plan in Markdown that the user will review and approve. Once approved it becomes plan.md — the binding contract the Frontend Agent, Backend Agent and Debugger all answer to.
+Required structure (Markdown):
+# <App Name>
+## Overview
+2-3 sentences: what the app is and does.
+## Pages & UI
+Each page/screen with its key UI elements and the styling direction.
+## Data & API
+The data model and EVERY API endpoint the backend will expose (method, path, purpose, response shape) — or "No backend needed (static/frontend-only)" if the app needs no server.
+## Components
+File layout: frontend/ (Next.js 14 App Router + TypeScript — mandated) and backend/ (your chosen language/framework, only if needed).
+## Acceptance Criteria
+Numbered, concrete, testable statements the Debugger will click through on the live app (e.g. "1. Typing text and pressing Add creates a new item in the list").
+Rules: specific enough to build from; no code; keep it under ~90 lines."""
+
+CHIEF_REFINE_SYSTEM = """You are the Chief Agent of ArcForge. The user read your proposed plan and REJECTED it with change requests. Apply their changes and produce the FULL revised plan (same structure: Overview / Pages & UI / Data & API / Components / Acceptance Criteria). Keep everything they did NOT ask to change intact. The revised plan goes back to the user for approval."""
+
+CHIEF_BRIEF_SYSTEM = """You are the Chief Agent of ArcForge writing a dispatch brief for a sub-agent. From the approved plan, extract EXACTLY what this sub-agent must build — its slice of the plan, nothing else. Be concrete (endpoints with paths, pages with elements, file names). Reply ONLY JSON: {"task":"<the brief, 3-10 sentences>"} or {"skip":true,"reason":"<why this agent is not needed>"}."""
+
+CHIEF_TRIAGE_SYSTEM = """You are the Chief Agent of ArcForge. The Debugger and/or the Development Twins reported problems with the build. Decide the fix delegations. Rules: the suspect field tells you who likely caused it; give each delegation a PRECISE fix instruction referencing the observed evidence. Do not delegate anything that is not actionable. Reply ONLY JSON:
+{"delegations":[{"agent":"frontend"|"backend","task":"<precise fix instruction>"}]}
+or {"delegations":[]} when nothing actionable remains (e.g. only cosmetic/unclear issues)."""
+
+CHIEF_SUMMARY_SYSTEM = """You are the Chief Agent of ArcForge. The swarm finished. Write the user-facing completion message: 2-4 sentences, plain language, stating what was built, whether it passed the debugger's E2E check against the approved plan, and anything the user should try in the preview. No markdown headers."""
+
+
+class ChiefAgent:
+    """The Gateway — receives every prompt, classifies, plans, seeks approval,
+    dispatches the swarm. NEVER writes application code."""
+
+    def __init__(self, task_id: str) -> None:
+        self.ctx = AgentContext(task_id, "chief")
+
+    # -- step 1: classify -------------------------------------------------
+    def classify(self, prompt: str) -> Dict[str, Any]:
+        history = recent_chat(12)
+        convo = "\n".join(f"{m['role']}: {m['content'][:300]}" for m in history[-6:])
+        user = f"Recent conversation:\n{convo}\n\nNEW USER MESSAGE:\n{prompt}"
+        try:
+            pace_for_tpm()
+            data = _extract_json(llm_chat(
+                [{"role": "system", "content": CHIEF_CLASSIFY_SYSTEM},
+                 {"role": "user", "content": user}],
+                json_mode=True, max_tokens=1100))
+            if data.get("kind") == "answer" and str(data.get("reply", "")).strip():
+                return {"kind": "answer", "reply": str(data["reply"])}
+            if data.get("kind") == "app":
+                return {"kind": "app", "intent": str(data.get("intent", prompt[:120]))}
+        except Exception as exc:  # noqa: BLE001
+            append_log(self.ctx.task_id, "chief", "warn",
+                       f"classify degraded: {exc} — defaulting to app")
+        return {"kind": "app", "intent": prompt[:120]}
+
+    # -- step 2: plan -------------------------------------------------------
+    def draft_plan(self, prompt: str) -> str:
+        follow_up = workspace_has_source()
+        history = recent_chat(12)
+        convo = "\n".join(f"{m['role']}: {m['content'][:250]}" for m in history[-6:])
+        user = f"Conversation so far:\n{convo}\n\nUSER REQUEST:\n{prompt}\n"
+        if follow_up:
+            user += (f"\nEXISTING WORKSPACE (this is a follow-up — the plan must "
+                     f"preserve and extend it):\n{workspace_tree_text()}\n")
+        pace_for_tpm()
+        return llm_chat(
+            [{"role": "system", "content": CHIEF_PLAN_SYSTEM},
+             {"role": "user", "content": user}],
+            json_mode=False, max_tokens=3600).strip()
+
+    def refine_plan(self, plan: str, feedback: str) -> str:
+        # The exact injection template the user mandated.
+        user = (f'The user said: "I have read through the plan. Make the '
+                f'following change(s): {feedback}"\n\nCURRENT PLAN:\n{plan}\n\n'
+                "Produce the full revised plan now.")
+        pace_for_tpm()
+        return llm_chat(
+            [{"role": "system", "content": CHIEF_REFINE_SYSTEM},
+             {"role": "user", "content": user}],
+            json_mode=False, max_tokens=3600).strip()
+
+    # -- step 3: dispatch briefs (sub-agents as the chief's tools) ---------
+    def brief(self, agent: str, plan_text: str, extra: str = "") -> Optional[str]:
+        slice_desc = {
+            "backend": ("the Backend Agent: everything under Data & API + the backend "
+                        "part of Components. It must implement the endpoints exactly "
+                        "as planned, start the server, and publish the api contract."),
+            "frontend": ("the Frontend Agent: everything under Pages & UI + the "
+                         "frontend part of Components (Next.js 14 App Router). It "
+                         "reads the published api contract (if any backend exists) "
+                         "and must not guess URLs."),
+            "debugger": ("the Debugger Agent: verify the live app against the "
+                         "Acceptance Criteria only."),
+        }[agent]
+        user = (f"APPROVED PLAN:\n{plan_text[:2600]}\n\n"
+                f"Write the dispatch brief for {slice_desc}\n{extra}")
+        try:
+            pace_for_tpm()
+            data = _extract_json(llm_chat(
+                [{"role": "system", "content": CHIEF_BRIEF_SYSTEM},
+                 {"role": "user", "content": user}],
+                json_mode=True, max_tokens=1400))
+            if data.get("skip"):
+                append_log(self.ctx.task_id, "chief", "info",
+                           f"chief skipped {agent} agent: {data.get('reason','')}")
+                return None
+            task = str(data.get("task", "")).strip()
+            return task or None
+        except Exception as exc:  # noqa: BLE001
+            append_log(self.ctx.task_id, "chief", "warn",
+                       f"brief for {agent} degraded: {exc}")
+            return None
+
+    # -- step 4: triage failures into fix delegations -----------------------
+    def triage(self, plan_text: str, debug_report: Dict[str, Any],
+               mailbox_msgs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        issues = debug_report.get("issues") or []
+        mail = "\n".join(f"{m['from']}: {m['message'][:200]}" for m in mailbox_msgs[-8:])
+        user = (f"APPROVED PLAN (excerpt):\n{plan_text[:1200]}\n\n"
+                f"DEBUGGER VERDICT: {debug_report.get('status','?')}\n"
+                f"DEBUGGER ISSUES:\n{json.dumps(issues, indent=1)[:2000]}\n\n"
+                f"AGENT MAILBOX:\n{mail or '(empty)'}")
+        try:
+            pace_for_tpm()
+            data = _extract_json(llm_chat(
+                [{"role": "system", "content": CHIEF_TRIAGE_SYSTEM},
+                 {"role": "user", "content": user}],
+                json_mode=True, max_tokens=1400))
+            dels = [d for d in (data.get("delegations") or [])
+                    if isinstance(d, dict) and d.get("agent") in ("frontend", "backend")
+                    and str(d.get("task", "")).strip()]
+            return dels[:3]
+        except Exception as exc:  # noqa: BLE001
+            append_log(self.ctx.task_id, "chief", "warn", f"triage degraded: {exc}")
+            return []
+
+    # -- step 5: final user-facing summary ----------------------------------
+    def summarize(self, prompt: str, plan_title: str, reports: Dict[str, Any],
+                  verdict: str) -> str:
+        user = (f"USER REQUEST: {prompt[:300]}\nPLAN: {plan_title}\n"
+                f"BACKEND REPORT: {str(reports.get('backend',{}).get('report','(none)'))[:400]}\n"
+                f"FRONTEND REPORT: {str(reports.get('frontend',{}).get('report','(none)'))[:400]}\n"
+                f"DEBUGGER VERDICT: {verdict}\n"
+                f"DEBUGGER REPORT: {str(reports.get('debugger',{}).get('report','(none)'))[:400]}\n"
+                "Write the completion message.")
+        try:
+            pace_for_tpm()
+            return llm_chat(
+                [{"role": "system", "content": CHIEF_SUMMARY_SYSTEM},
+                 {"role": "user", "content": user}],
+                json_mode=False, max_tokens=900).strip()
+        except Exception:  # noqa: BLE001
+            return (f"{plan_title} — build finished. Debugger verdict: {verdict}. "
+                    "Open the preview to try it.")
+
+
+# ---------------------------------------------------------------------------
+# Approval state machine (worker-side wait + WS-side release)
+# ---------------------------------------------------------------------------
+
+_APPROVAL_LOCK = threading.Lock()
+_APPROVAL_EVENTS: Dict[str, threading.Event] = {}
+_APPROVAL_DECISIONS: Dict[str, Dict[str, Any]] = {}
+# The task currently halting the worker for approval (chief-gateway routing).
+_AWAITING_TASK: Optional[str] = None
+
+
+def approval_wait(task_id: str) -> Optional[Dict[str, Any]]:
+    """Block the worker until a decision arrives (WS or REST). None on timeout."""
+    with _APPROVAL_LOCK:
+        ev = _APPROVAL_EVENTS.setdefault(task_id, threading.Event())
+    emit({"type": "approval_request", "task_id": task_id,
+          "plan": (approval_get(task_id) or {}).get("plan", "")})
+    decided = ev.wait(timeout=APPROVAL_TIMEOUT_S)
+    with _APPROVAL_LOCK:
+        _APPROVAL_EVENTS.pop(task_id, None)
+        decision = _APPROVAL_DECISIONS.pop(task_id, None)
+    if not decided or decision is None:
+        return None
+    return decision
+
+
+def approval_submit(task_id: str, action: str, feedback: str = "") -> bool:
+    """Called from the WS/REST handlers with the user's decision."""
+    if action not in ("approve", "change"):
+        return False
+    with _APPROVAL_LOCK:
+        if task_id not in _APPROVAL_EVENTS and task_id != _AWAITING_TASK:
+            # A decision for a task that isn't waiting (late duplicate?) —
+            # still record it in SQLite so a crashed worker can honour it.
+            approval_upsert(task_id, (approval_get(task_id) or {}).get("plan", ""),
+                            "approved" if action == "approve" else "changed", feedback)
+            return False
+        _APPROVAL_DECISIONS[task_id] = {"action": action, "feedback": feedback}
+        ev = _APPROVAL_EVENTS.get(task_id)
+    approval_upsert(task_id, (approval_get(task_id) or {}).get("plan", ""),
+                    "approved" if action == "approve" else "changed", feedback)
+    if ev is not None:
+        ev.set()
+    return True
+
+
+def route_prompt_during_approval(text: str) -> bool:
+    """Chief-gateway rule: while a task awaits approval, any free-typed
+    prompt is treated as plan-change feedback via the injection template."""
+    global _AWAITING_TASK
+    with _APPROVAL_LOCK:
+        task_id = _AWAITING_TASK
+    if task_id is None:
+        return False
+    decision = {"action": "change", "feedback": text}
+    with _APPROVAL_LOCK:
+        _APPROVAL_DECISIONS[task_id] = decision
+        ev = _APPROVAL_EVENTS.get(task_id)
+    if ev is not None:
+        ev.set()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# THE SWARM RUNNER — backend → frontend → fit check → debugger → fixes
+# ---------------------------------------------------------------------------
+
+
+def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
+    chief = ChiefAgent(task_id)
+    reports: Dict[str, Any] = {"backend": None, "frontend": None, "debugger": None}
+    repairs = 0
+
+    def set_active(state: str, detail: str = "") -> None:
+        set_status("active", {"state": state, "detail": detail, "task_id": task_id})
+        emit({"type": "status", "status": get_status("active")})
+
+    set_active("swarm", "dispatching the Development Twins")
+
+    # ── Twin 1: Backend ──────────────────────────────────────────────────
+    chief.ctx.activity("Chief Agent — dispatching Backend Agent", "active")
+    backend_task = chief.brief("backend", plan_text)
+    if backend_task:
+        reports["backend"] = run_backend_agent(task_id, backend_task, plan_text)
+    else:
+        chief.ctx.say("Chief: no backend needed for this plan (frontend-only app).")
+    chief.ctx.activity("Chief Agent — Backend Agent dispatched", "done")
+
+    # ── Twin 2: Frontend ─────────────────────────────────────────────────
+    chief.ctx.activity("Chief Agent — dispatching Frontend Agent", "active")
+    extra = (" NOTE: a backend EXISTS for this app — the contract is published at "
+             ".system/api_contract.json; read it before writing any fetch code."
+             if reports["backend"] else "")
+    frontend_task = chief.brief("frontend", plan_text, extra=extra)
+    if frontend_task:
+        reports["frontend"] = run_frontend_agent(task_id, frontend_task, plan_text)
+    chief.ctx.activity("Chief Agent — Frontend Agent dispatched", "done")
+
+    # ── The Fit Check (Twins converge) ────────────────────────────────────
+    set_active("swarm", "integration fit check")
+    chief.ctx.activity("Chief Agent — integration fit check", "active",
+                       "both servers up, frontend drives the browser")
+    servers = ensure_servers_up(task_id)
+    append_log(task_id, "orchestrator", "info",
+               f"servers: {json.dumps(servers)}")
+    fit = run_frontend_agent(task_id, "", plan_text, fit_check=True)
+    reports["fit_check"] = fit
+    # Backend repairs requested via the mailbox during the fit check
+    for _ in range(2):
+        backend_fix_msgs = mailbox_read(task_id, "backend")
+        if not backend_fix_msgs:
+            break
+        repairs += 1
+        fix_task = ("INTEGRATION FIX REQUEST (from the Frontend Agent's fit check):\n"
+                    + "\n".join(f"- {m['message']}" for m in backend_fix_msgs[-4:])
+                    + "\nFix the reported endpoint(s), restart your server via "
+                      "terminal, and re-publish the api contract if routes changed.")
+        chief.ctx.activity("Chief Agent — Backend Agent repair round", "active")
+        run_backend_agent(task_id, fix_task, plan_text)
+        run_frontend_agent(task_id, "", plan_text, fit_check=True)
+    chief.ctx.activity("Chief Agent — integration fit check", "done")
+
+    # ── The Debugger (quality gate) + fix cycle ───────────────────────────
+    verdict = "fail"
+    for round_no in range(1, DEBUG_MAX_ROUNDS + 1):
+        set_active("debugger", f"E2E verification round {round_no}")
+        debug = run_debugger_agent(task_id, plan_text)
+        reports["debugger"] = debug
+        verdict = debug.get("status", "fail")
+        if verdict == "pass":
+            break
+        set_active("swarm", f"triaging failures (round {round_no})")
+        delegations = chief.triage(plan_text, debug,
+                                   mailbox_read(task_id, "chief"))
+        if not delegations:
+            break
+        for d in delegations:
+            repairs += 1
+            chief.ctx.activity(
+                f"Chief Agent — fix round {round_no}: {d['agent']} Agent", "active",
+                str(d["task"])[:120])
+            if d["agent"] == "backend":
+                run_backend_agent(task_id, d["task"], plan_text)
+            else:
+                run_frontend_agent(task_id, d["task"], plan_text)
+        ensure_servers_up(task_id)
+
+    summary = chief.summarize(prompt, plan_text.splitlines()[0].lstrip("# ").strip()
+                              or "The app", reports, verdict)
+    return {
+        "summary": summary,
+        "verdict": verdict,
+        "repairs": repairs,
+        "plan": plan_text,
+        "agents": {
+            "backend": str((reports.get("backend") or {}).get("report", ""))[:600],
+            "frontend": str((reports.get("frontend") or {}).get("report", ""))[:600],
+            "fit_check": str((reports.get("fit_check") or {}).get("report", ""))[:600],
+            "debugger": str((reports.get("debugger") or {}).get("report", ""))[:600],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task queue + worker
 # ---------------------------------------------------------------------------
 
 import queue as _queue  # noqa: E402
 
-# The durable queue: worker thread blocks on this. Enqueued by both the WS
-# handler and the REST fallback; mirrored into SQLite so a daemon crash
-# (and PM2 restart) re-enqueues unfinished work on boot.
 task_queue: "_queue.SimpleQueue[str]" = _queue.SimpleQueue()
 
 
@@ -1101,13 +1852,7 @@ def enqueue_task(prompt: str) -> str:
 
 
 class TaskWorker(threading.Thread):
-    """Consumes the task queue and runs the full pipeline.
-
-    Runs as a plain OS thread — NOT tied to any WebSocket, request, or
-    event loop. If every client disconnects (tab close, laptop lid, train
-    tunnel) the loop keeps executing and writing to state.db; returning
-    clients get everything via the sync handshake.
-    """
+    """Consumes tasks through the Chief Agent (the swarm gateway)."""
 
     def __init__(self) -> None:
         super().__init__(name="task-worker", daemon=True)
@@ -1122,42 +1867,40 @@ class TaskWorker(threading.Thread):
                 log.exception("task %s crashed the worker guard", task_id)
                 self._mark_failed(task_id, f"internal error: {exc}")
 
-    # -- task lifecycle ------------------------------------------------------
-
     def _mark(self, task_id: str, status: str, error: Optional[str] = None) -> None:
         with _db_lock, db() as conn:
             if error is not None:
-                conn.execute(
-                    "UPDATE task_queue SET status=?, error=? WHERE id=?",
-                    (status, error, task_id),
-                )
+                conn.execute("UPDATE task_queue SET status=?, error=? WHERE id=?",
+                             (status, error, task_id))
             else:
-                conn.execute("UPDATE task_queue SET status=? WHERE id=?", (status, task_id))
+                conn.execute("UPDATE task_queue SET status=? WHERE id=?",
+                             (status, task_id))
 
     def _mark_failed(self, task_id: str, error: str) -> None:
+        global _AWAITING_TASK
         self._mark(task_id, "failed", error)
-        append_chat("assistant", (
-            "I hit an error while working on that: "
-            f"{str(error)[:500]}. Your prompt is saved — tell me to retry and "
-            "I'll pick it back up."
-        ), {"task_id": task_id, "failed": True})
+        append_chat("assistant",
+                    f"I hit an error while working on that: {str(error)[:400]}. "
+                    "Your prompt is saved — tell me to retry and I'll pick it back up.",
+                    {"task_id": task_id, "failed": True})
         emit({"type": "task_failed", "task_id": task_id, "error": str(error)[:500]})
         emit({"type": "chat", "message": recent_chat(1)[0]})
         set_status("active", {"state": "idle"})
         emit({"type": "status", "status": get_status("active")})
+        with _APPROVAL_LOCK:
+            if _AWAITING_TASK == task_id:
+                _AWAITING_TASK = None
 
     def _run_task(self, task_id: str) -> None:
+        global _AWAITING_TASK
         with _db_lock, db() as conn:
             row = conn.execute(
                 "SELECT prompt, status FROM task_queue WHERE id=?", (task_id,)
             ).fetchone()
         if not row or row["status"] in ("done", "failed"):
             return
-
         prompt = row["prompt"]
-        self._mark(task_id, "running")
         started = time.time()
-        log.info("task %s started: %.80s", task_id, prompt)
 
         def activity(label: str, state: str, detail: str = "") -> None:
             emit({"type": "activity", "task_id": task_id, "label": label,
@@ -1170,700 +1913,143 @@ class TaskWorker(threading.Thread):
             emit({"type": "status", "status": get_status("active")})
 
         try:
-            # ── Phase 0: GIT CHECKPOINT (rollback point before touching code)
+            self._mark(task_id, "running")
+            set_active("chief", "analysing your request")
+            chief = ChiefAgent(task_id)
+
+            # Crash-recovery path: a previous daemon run already got this task
+            # to the approval stage. Honour a recorded decision if present.
+            prior = approval_get(task_id)
+            recovered_plan: Optional[str] = None
+            if prior and prior["status"] == "approved":
+                recovered_plan = prior["plan"]
+                activity("Chief Agent", "done", "recovered an approved plan after restart")
+
             follow_up = workspace_has_source()
             if follow_up:
                 git_checkpoint(f"checkpoint before: {prompt[:100]}")
 
-            # ── Phase 1: ARCHITECT ─────────────────────────────────────────
-            set_active("architect", "Planning the build")
-            activity("Planning", "active")
-            plan = self._architect(prompt, follow_up)
-            activity("Planning", "done", str(plan.get("summary", ""))[:200])
+            if not recovered_plan:
+                # ── Step 1: CLASSIFY (the gateway decision) ──────────────
+                activity("Chief Agent — analysing request", "active")
+                route = chief.classify(prompt)
+                if route["kind"] == "answer":
+                    activity("Chief Agent — answering directly", "done")
+                    reply = route["reply"]
+                    append_chat("assistant", reply, {"task_id": task_id})
+                    emit({"type": "chat", "message": recent_chat(1)[0]})
+                    result = {"summary": reply, "kind": "answer",
+                              "files": [], "checks": {"ok": True, "issues": ""},
+                              "repairs": {"rounds": 0, "diagnoses": []},
+                              "duration_ms": int((time.time() - started) * 1000),
+                              "model": LLM_MODEL, "app_port": None}
+                    with _db_lock, db() as conn:
+                        conn.execute(
+                            "UPDATE task_queue SET status='done', result_json=? WHERE id=?",
+                            (json.dumps(result), task_id))
+                    emit({"type": "task_done", "task_id": task_id, "result": result})
+                    set_active("idle")
+                    emit({"type": "status", "status": get_status("active")})
+                    return
 
-            # ── Phase 1.5: SCAFFOLD — the daemon writes the pinned Next.js
-            # skeleton itself (first generation only) so the model's entire
-            # token budget goes to the APP, not boilerplate. A background
-            # npm install starts downloading deps while the LLM works.
+                # ── Step 2: DRAFT PLAN ────────────────────────────────────
+                set_active("chief", "drafting the plan")
+                activity("Chief Agent — drafting plan", "active")
+                plan_text = chief.draft_plan(prompt)
+                activity("Chief Agent — drafting plan", "done")
+
+                # ── Step 3: THE APPROVAL LOOP (state machine) ─────────────
+                while True:
+                    self._mark(task_id, "AWAITING_APPROVAL")
+                    set_active("awaiting_approval", "waiting for your approval")
+                    approval_upsert(task_id, plan_text, "pending", "")
+                    # Show the plan as the assistant's own message (the AI
+                    # presents its proposal — nothing hardcoded).
+                    append_chat("assistant", plan_text,
+                                {"task_id": task_id, "kind": "plan"})
+                    emit({"type": "chat", "message": recent_chat(1)[0]})
+                    with _APPROVAL_LOCK:
+                        _AWAITING_TASK = task_id
+                    decision = approval_wait(task_id)
+                    with _APPROVAL_LOCK:
+                        if _AWAITING_TASK == task_id:
+                            _AWAITING_TASK = None
+                    if decision is None:
+                        self._mark_failed(task_id,
+                                          "approval timed out — the plan expired "
+                                          "without a decision")
+                        return
+                    if decision["action"] == "approve":
+                        approval_upsert(task_id, plan_text, "approved", "")
+                        break
+                    feedback = str(decision.get("feedback", "")).strip()
+                    if not feedback:
+                        feedback = "(no changes specified — plan returned as-is)"
+                    set_active("chief", "refining the plan")
+                    activity("Chief Agent — refining plan", "active", feedback[:120])
+                    plan_text = chief.refine_plan(plan_text, feedback)
+                    activity("Chief Agent — refining plan", "done")
+            else:
+                plan_text = recovered_plan
+
+            # ── Step 4: LOCK plan.md (verbatim — no additions, no removals)
+            with open(PLAN_PATH, "w", encoding="utf-8") as fh:
+                fh.write(plan_text)
+            upsert_file(PLAN_PATH, task_id, "create")
+            emit({"type": "plan_locked", "task_id": task_id, "path": PLAN_PATH,
+                  "plan": plan_text})
+            emit({"type": "files", "task_id": task_id,
+                  "files": [{"path": PLAN_PATH, "action": "create"}]})
+            activity("Chief Agent — plan.md locked", "done",
+                     "the approved plan is now the contract")
+
+            # ── Step 5: SWARM MODE ─────────────────────────────────────────
+            self._mark(task_id, "running")
             if not follow_up:
                 seed_scaffold(task_id)
-
-            # ── Phase 2: DEVELOPER ────────────────────────────────────────
-            set_active("developer", "Writing code")
-            activity("Writing code", "active")
-            files, deletes = self._developer(prompt, plan, follow_up)
-            written = self._write_files(files, task_id)
-            deleted = self._delete_files(deletes, task_id)
-            all_changes = written + deleted
-            emit({"type": "files", "task_id": task_id, "files": all_changes})
-            activity("Writing code", "done", f"{len(written)} files")
-
-            # ── Phase 3: VERIFY + REPAIR LOOP ─────────────────────────────
-            #    The old "debugger" never involved the LLM: when checks
-            #    failed, the run just ended with ok=false. Now failures are
-            #    fed BACK to the model with real command output, it patches
-            #    the files, and verification re-runs — up to N rounds.
-            set_active("debugger", "Verifying the build")
-            activity("Verifying", "active")
-            debug = self._debugger(written, task_id)
-            repairs: Dict[str, Any] = {"rounds": 0, "diagnoses": []}
-            if not debug["ok"]:
-                activity("Verifying", "done", "issues found — self-repairing")
-                debug, repairs = self._repair_loop(task_id, debug, written)
-            activity("Verifying", "done",
-                     "all checks passed" if debug["ok"] else f"issues: {debug['issues'][:200]}")
+            swarm = run_swarm(task_id, prompt, plan_text)
 
             # ── Complete ──────────────────────────────────────────────────
-            summary = plan.get("summary") or "Build finished."
-            if repairs["rounds"]:
-                if debug["ok"]:
-                    summary += (f" (self-repaired {repairs['rounds']} round(s): "
-                                + "; ".join(repairs["diagnoses"])[:300] + ")")
-                else:
-                    summary += (f" (attempted {repairs['rounds']} self-repair round(s); "
-                                "some issues remain — see checks)")
+            app_port = (get_status("app") or {}).get("port")
             result = {
-                "summary": summary,
-                "files": [f["path"] for f in written],
-                "checks": {"ok": debug["ok"], "issues": debug["issues"]},
-                "repairs": repairs,
+                "summary": swarm["summary"],
+                "kind": "app",
+                "files": [],  # the file journal (files table) has the truth
+                "checks": {"ok": swarm["verdict"] == "pass",
+                           "issues": "" if swarm["verdict"] == "pass"
+                           else "see debugger report"},
+                "repairs": {"rounds": swarm["repairs"], "diagnoses": []},
+                "verdict": swarm["verdict"],
+                "agents": swarm["agents"],
+                "plan": plan_text[:4000],
                 "duration_ms": int((time.time() - started) * 1000),
                 "model": LLM_MODEL,
-                # Port the app dev-server is serving on (null when none) —
-                # the studio re-fetches agent-info on task_done and iframes
-                # the SIGNED preview URL for this port (the REAL preview).
-                "app_port": debug.get("app_port"),
+                "app_port": app_port,
             }
             with _db_lock, db() as conn:
                 conn.execute(
                     "UPDATE task_queue SET status='done', result_json=? WHERE id=?",
-                    (json.dumps(result), task_id),
-                )
-            append_chat("assistant", summary, {"task_id": task_id, "result": result})
+                    (json.dumps(result), task_id))
+            append_chat("assistant", result["summary"],
+                        {"task_id": task_id, "result": result})
             emit({"type": "chat", "message": recent_chat(1)[0]})
             emit({"type": "task_done", "task_id": task_id, "result": result})
             set_active("idle")
             emit({"type": "status", "status": get_status("active")})
-            # Post-task checkpoint — every successful generation is a
-            # rollback point (git log / git checkout in the terminal).
             git_checkpoint(f"arcforge: {prompt[:100]}")
-            log.info("task %s done in %.1fs (%d files, %d repair rounds)", task_id,
-                     time.time() - started, len(written), repairs["rounds"])
+            log.info("task %s done in %.1fs (verdict=%s, repairs=%d)", task_id,
+                     time.time() - started, swarm["verdict"], swarm["repairs"])
         except Exception as exc:
             log.exception("task %s failed", task_id)
             self._mark_failed(task_id, str(exc))
 
-    # ── pipeline phases ─────────────────────────────────────────────────────
-
-    def _architect(self, prompt: str, follow_up: bool = False) -> Dict[str, Any]:
-        """Phase 1 — produce a compact build plan.
-
-        v2: the architect now SEES the workspace (tree + recent history) and
-        knows whether this is a first generation or a follow-up, so plans
-        build on what exists instead of silently rewriting from scratch."""
-        history = recent_chat(20)
-        convo = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in history[-8:])
-        system = (
-            "You are the Architect of ArcForge, an autonomous in-VM build agent. "
-            "Plan the requested app. PLATFORM MANDATE: the frontend MUST be "
-            "Next.js (App Router, TypeScript); you CHOOSE the backend language "
-            "and framework that best serves the app (e.g. Python/Flask, "
-            "Node/Express — or none for a purely static site). "
-            "Reply with ONLY a JSON object: "
-            '{"summary": "<one-paragraph user-facing summary of what you will build>", '
-            '"components": ["<short list of major components>"], '
-            '"stack": {"frontend": "Next.js 14 (App Router, TypeScript)", '
-            '"backend": "<your chosen language+framework, or none>"}}'
-        )
-        skills = skills_prompt_block()
-        if skills:
-            system += "\n\n" + skills
-        user = f"Conversation so far:\n{convo}\n\nNew request: {prompt}"
-        if follow_up:
-            user += (
-                "\n\nIMPORTANT: this is a FOLLOW-UP on an EXISTING app. Current "
-                f"workspace files:\n{workspace_tree_text()}\n"
-                "The plan must PRESERVE existing behaviour and extend/modify it — "
-                "not rewrite the app."
-            )
-        try:
-            reply = llm_chat(
-                [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                json_mode=True, max_tokens=1000,  # tiny reply — keeps TPM pacing short
-            )
-            return _extract_json(reply)
-        except Exception as exc:
-            append_log(None, "architect", "warn", f"planning degraded: {exc}")
-            return {"summary": f"Building: {prompt[:200]}", "components": [], "stack": {}}
-
-    def _developer(self, prompt: str, plan: Dict[str, Any],
-                   follow_up: bool = False) -> tuple[Dict[str, str], List[str]]:
-        """Phase 2 — produce the file set as ({path: content}, [paths to delete]).
-
-        v2 (2026-08-27) — two paths, chosen by workspace state:
-
-        FIRST GENERATION (no app code on disk yet):
-          The daemon has already seeded the pinned Next.js skeleton
-          (package.json / tsconfig / next.config / app/layout.tsx) — the
-          model is told NOT to emit boilerplate, so its whole budget goes
-          to the app itself. One lean one-shot (fast), chunked fallback.
-
-        FOLLOW-UP (app code exists):
-          The OLD code regenerated blind: the developer never saw the
-          existing files, so "polish it" produced a from-scratch rewrite
-          that silently dropped previous work. Now the model gets the
-          file tree + key file contents, lists exactly which files to
-          create/modify, and each modified file is generated WITH its
-          current content in the prompt (targeted whole-file edit).
-
-        GROQ TPM REALITY (live-measured): this tier's FLOOR is 8,000 tokens
-        per request (prompt + max_tokens) — every request stays under 8k.
-        """
-        standards = skills_prompt_block()
-
-        # ── FIRST GENERATION: one lean one-shot over the seeded scaffold ──
-        if not follow_up:
-            fast_sys = (
-                "You are the Developer of ArcForge. The pinned Next.js 14 "
-                "scaffold ALREADY EXISTS on disk (frontend/package.json, "
-                "tsconfig.json, next.config.mjs, app/layout.tsx, .gitignore) "
-                "with deps next 14.2.35 / react 18.3.1 / typescript 5.5.4 — "
-                "do NOT emit those files. Spend your ENTIRE budget on the "
-                "APP. Reply with ONLY a JSON object: "
-                '{"summary": "<user-facing summary of what was built>", '
-                '"frontend": {"<path>": "<full file content>"}, '
-                '"backend": {"<path>": "<full file content>"}, '
-                '"delete": ["<path to remove>", ...]}. '
-                "Paths are relative under frontend/ or backend/. Write "
-                "app/page.tsx plus focused components/ and lib/ files "
-                "(typically 4-8 files). STYLES: no .css files, no css "
-                "imports — inline style props and a <style> tag only. "
-                "EVERY file using hooks/event handlers MUST start with "
-                '"use client". Next 14 <Link> takes NO nested <a>. '
-                "NO comments, NO blank-line padding — every line is code. "
-                "NO create-react-app, NO Vite, NO index.html. "
-                "BACKEND only if the app truly needs a server (pick ONE "
-                "language: Python Flask w/ requirements.txt, or Node "
-                "Express w/ backend/package.json + server.js)."
-            )
-            user = (
-                f"Plan: {json.dumps(plan, ensure_ascii=False)}\n\n"
-                f"Original request: {prompt}\n\nProduce the app files now."
-            )
-            try:
-                pace_for_tpm()
-                reply = llm_chat(
-                    [{"role": "system", "content": fast_sys + "\n\n" + standards},
-                     {"role": "user", "content": user}],
-                    json_mode=True, max_tokens=6800,
-                )
-                files, summary, deletes = self._parse_dev_reply(reply)
-                if files:
-                    plan["summary"] = summary or plan.get("summary")
-                    append_log(None, "developer", "info",
-                               f"fast path produced {len(files)} files in one shot "
-                               "(scaffold pre-seeded)")
-                    return files, deletes
-                raise RuntimeError("fast path yielded no files")
-            except Exception as exc:
-                append_log(None, "developer", "warn",
-                           f"one-shot developer path failed ({str(exc)[:180]}) — "
-                           "falling back to chunked per-file generation")
-
-        # ── TARGETED EDIT PATH (follow-ups; also the first-gen fallback) ──
-        # Manifest: which files to create/modify/delete. Then one small call
-        # per file, WITH the current content when modifying.
-        manifest_sys = (
-            "You are the Developer of ArcForge planning precise file changes. "
-            "The frontend is Next.js 14 App Router (TypeScript; tsconfig + "
-            "pinned deps already on disk; NO .css files — inline styles/"
-            "<style> tags only; files using hooks need \"use client\"). "
-            "Reply with ONLY a JSON object: "
-            '{"summary": "<one line>", "files": ['
-            '{"path": "frontend/app/page.tsx", "action": "modify", '
-            '"purpose": "<exactly what changes and why, precisely>"}'
-            "], \"delete\": [\"frontend/old.tsx\"]}. List ONLY files that must "
-            "change — untouched files stay as-is on disk. Be surgical: modify "
-            "the fewest files that fully implement the request."
-        )
-        ctx = workspace_context_text(5000 if follow_up else 800)
-        user = (
-            f"Plan: {json.dumps(plan, ensure_ascii=False)}\n\n"
-            f"Request: {prompt}\n\n{ctx}\n\n"
-            "List the files to create/modify/delete."
-        )
-        pace_for_tpm()
-        manifest_reply = llm_chat(
-            [{"role": "system", "content": manifest_sys + "\n\n" + standards},
-             {"role": "user", "content": user}],
-            json_mode=True, max_tokens=1500,
-        )
-        manifest = _extract_json(manifest_reply)
-        specs = [f for f in (manifest.get("files") or [])
-                 if isinstance(f, dict) and f.get("path")]
-        if not specs:
-            raise RuntimeError("the developer manifest produced no files")
-
-        files: Dict[str, str] = {}
-        deletes: List[str] = [str(p) for p in (manifest.get("delete") or [])
-                              if isinstance(p, str) and p.strip()]
-        for i, spec in enumerate(specs, 1):
-            rel = str(spec["path"]).strip().lstrip("/")
-            purpose = str(spec.get("purpose") or "")[:400]
-            action = str(spec.get("action") or ("modify" if follow_up else "create"))
-            exists = os.path.exists(os.path.join(WORKSPACE, rel))
-            append_log(None, "developer", "info",
-                       f"generating file {i}/{len(specs)}: {rel} ({action})")
-            current = read_file_for_edit(rel) if (exists and action == "modify") else ""
-            for attempt in range(3):
-                pace_for_tpm(30.0)
-                try:
-                    cur_block = (f"\nCURRENT CONTENT of {rel}:\n```\n{current}\n```\n"
-                                 "Rewrite the COMPLETE file implementing the change "
-                                 "(keep everything else intact).\n") if current else ""
-                    r = llm_chat(
-                        [{"role": "system", "content": (
-                            "You are the Developer of ArcForge. Write the "
-                            "COMPLETE content of one file. Reply with ONLY "
-                            "a JSON object: "
-                            '{"path": "<the path>", "content": "<full file '
-                            'content>"}. No placeholders, no TODOs, no '
-                            "explanations.")},
-                         {"role": "user", "content":
-                          f"Project: {prompt}\nFile: {rel}\nPurpose: {purpose}\n"
-                          f"{cur_block}Write the complete {rel} now."}],
-                        json_mode=True, max_tokens=6000,
-                    )
-                    data = _extract_json(r)
-                    content = data.get("content")
-                    if isinstance(content, str) and content.strip():
-                        files[rel] = _repair_double_escaped(content)
-                        break
-                    raise RuntimeError("empty content")
-                except Exception as exc:
-                    if attempt == 2:
-                        append_log(None, "developer", "warn",
-                                   f"giving up on {rel}: {str(exc)[:150]}")
-                    else:
-                        time.sleep(10)
-        if not files:
-            raise RuntimeError("the chunked developer phase produced no files")
-        plan["summary"] = manifest.get("summary") or plan.get("summary")
-        append_log(None, "developer", "info",
-                   f"edit path produced {len(files)}/{len(specs)} files "
-                   f"(+{len(deletes)} deletions)")
-        return files, deletes
-
-    def _parse_dev_reply(self, reply: str) -> tuple[Dict[str, str], str, List[str]]:
-        """Parse a one-shot developer JSON reply into
-        ({path: content}, summary, [paths to delete]).
-
-        GROUP-RELATIVE PATH FIX (caught by the v2 integration test): the
-        reply schema groups files under "frontend"/"backend", and models
-        legitimately use group-relative keys ("app.py" inside the backend
-        group). The old writer dumped those under frontend/ — a silent
-        misroute that starved pip of requirements.txt and py-checked files
-        in the wrong tree. Keys are now normalized into their group."""
-        data = _extract_json(reply)
-        files: Dict[str, str] = {}
-        for group in ("backend", "frontend"):
-            blob = data.get(group)
-            if isinstance(blob, dict):
-                for path, content in blob.items():
-                    if not (isinstance(path, str) and isinstance(content, str)
-                            and content.strip()):
-                        continue
-                    rel = path.strip().lstrip("/")
-                    if not rel.startswith(("frontend/", "backend/", "git/")):
-                        rel = f"{group}/{rel}"
-                    files[rel] = _repair_double_escaped(content)
-        flat = data.get("files")
-        if isinstance(flat, dict) and not files:
-            for path, content in flat.items():
-                if isinstance(path, str) and isinstance(content, str) and content.strip():
-                    files[path.strip().lstrip("/")] = _repair_double_escaped(content)
-        deletes = [str(p).strip().lstrip("/") for p in (data.get("delete") or [])
-                   if isinstance(p, str) and p.strip()]
-        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
-        return files, summary, deletes
-
-    def _write_files(self, files: Dict[str, str], task_id: str) -> List[Dict[str, str]]:
-        """Native writes into /workspace — instant inotify for dev-server HMR."""
-        written: List[Dict[str, str]] = []
-        for rel, content in files.items():
-            # Route into the mandatory blueprint dirs.
-            if rel.startswith(("frontend/", "backend/", "git/")):
-                dest = os.path.join(WORKSPACE, rel)
-            elif rel == "logo.png":
-                dest = os.path.join(WORKSPACE, "logo.png")
-            else:
-                dest = os.path.join(WORKSPACE, "frontend", rel)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            existed = os.path.exists(dest)
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            action = "edit" if existed else "create"
-            upsert_file(dest, task_id, action)
-            written.append({"path": dest, "action": action})
-            append_log(task_id, "developer", "info",
-                       f"wrote {dest} ({len(content)} bytes)")
-        return written
-
-    def _delete_files(self, deletes: List[str], task_id: str) -> List[Dict[str, str]]:
-        """Remove files the model explicitly asked to delete (v2)."""
-        removed: List[Dict[str, str]] = []
-        for rel in deletes or []:
-            rel = rel.strip().lstrip("/")
-            if not rel or ".." in rel or rel.startswith((".system", ".git")):
-                continue
-            dest = os.path.join(WORKSPACE, rel)
-            if os.path.isfile(dest):
-                try:
-                    os.remove(dest)
-                    upsert_file(dest, task_id, "delete")
-                    removed.append({"path": dest, "action": "delete"})
-                    append_log(task_id, "developer", "info", f"deleted {dest}")
-                except OSError as exc:
-                    append_log(task_id, "developer", "warn", f"delete failed {dest}: {exc}")
-        return removed
-
-    def _debugger(self, written: List[Dict[str, str]], task_id: str) -> Dict[str, Any]:
-        """Phase 3 — syntax checks, dependency install, dev-server launch."""
-        ok = True
-        issues: List[str] = []
-        ran: List[Dict[str, Any]] = []
-
-        def shell(cmd: str, cwd: str, source: str, timeout: int = 120) -> Dict[str, Any]:
-            nonlocal ok
-            try:
-                proc = subprocess.run(
-                    cmd, shell=True, cwd=cwd, capture_output=True, text=True,
-                    timeout=timeout,
-                )
-                out = {"command": cmd, "exit_code": proc.returncode,
-                       "stdout": (proc.stdout or "")[-2000:],
-                       "stderr": (proc.stderr or "")[-2000:]}
-            except subprocess.TimeoutExpired:
-                out = {"command": cmd, "exit_code": -1, "stdout": "",
-                       "stderr": f"timed out after {timeout}s"}
-            append_log(task_id, source, "info" if out["exit_code"] == 0 else "warn",
-                       f"$ {cmd}\n{out['stdout'] or out['stderr']}")
-            ran.append(out)
-            if out["exit_code"] != 0:
-                ok = False
-                issues.append(
-                    f"{cmd}: exit {out['exit_code']} — {(out['stderr'] or '')[:150]}")
-            return out
-
-        # 1) Syntax checks. NOTE: this VM's node binary SIGABRTs (exit 134,
-        #    core dumped) on `node --check` for unrelated reasons — that is
-        #    an INCONCLUSIVE checker, not a syntax error (real syntax errors
-        #    exit 1 with a SyntaxError message). Demote 134 to a warning so
-        #    the build isn't failed by a crashing linter.
-        for f in written:
-            path = f["path"]
-            if path.endswith(".py"):
-                shell(f'python3 -m py_compile "{path}"', WORKSPACE, "debugger", 30)
-            elif path.endswith((".js", ".mjs", ".cjs")):
-                check = shell(f'node --check "{path}"', WORKSPACE, "debugger", 30)
-                if check.get("exit_code") == 134:
-                    ok = True  # undo the failure the shell() helper recorded
-                    issues = [i for i in issues if not i.startswith(f'node --check "{path}"')]
-                    append_log(task_id, "debugger", "warn",
-                               f"node --check aborted (VM node binary quirk) — "
-                               f"treated as inconclusive for {path}")
-
-        # 2) Frontend deps + dev server — framework-aware.
-        #    The mandate is Next.js, but legacy Vite apps (older generations)
-        #    are still served. Detection: package.json deps contain "next".
-        #    Next dev binds 0.0.0.0 so the SIGNED Daytona preview URL for the
-        #    app port can reach it (that URL is what the studio Preview tab
-        #    iframes — the REAL live preview).
-        fe = os.path.join(WORKSPACE, "frontend")
-        app_port: Optional[int] = None
-        if os.path.exists(os.path.join(fe, "package.json")):
-            try:
-                with open(os.path.join(fe, "package.json"), "r", encoding="utf-8") as fh:
-                    pkg = json.load(fh)
-                deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
-                is_next = "next" in deps or any(p.endswith("next.config.mjs") or p.endswith("next.config.js") for p in [f["path"] for f in written])
-            except Exception:
-                is_next = False
-            def _probe_up(port: int) -> bool:
-                """Is something already serving on `port`? Pure check — a
-                down server before launch is EXPECTED, never a failure."""
-                try:
-                    proc = subprocess.run(
-                        f"curl -s -o /dev/null -w '%{{http_code}}' "
-                        f"http://localhost:{port}/ --max-time 3",
-                        shell=True, cwd=fe, capture_output=True, text=True,
-                        timeout=10,
-                    )
-                    append_log(task_id, "debugger", "info",
-                               f"probe :{port} -> {str(proc.stdout or '').strip()}")
-                    return str(proc.stdout or "").strip().startswith(("2", "3"))
-                except Exception:
-                    return False
-
-            if is_next:
-                app_port = NEXT_DEV_PORT
-                shell("npm install --no-audit --no-fund --loglevel=error",
-                      fe, "debugger", 600)
-                # ALWAYS restart the dev server on a new generation: a
-                # server left over from a previous generation holds a
-                # stale module graph (files were rewritten underneath it)
-                # and serves cached 500s. Purge the stale build cache and
-                # any leftover files' ghosts too.
-                shell(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1",
-                      fe, "debugger", 15)
-                shell("rm -rf .next node_modules/.cache", fe, "debugger", 30)
-                shell(
-                    f"nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
-                    f"> /tmp/frontend-dev.log 2>&1 < /dev/null &",
-                    fe, "debugger", 20,
-                )
-                # Next dev cold-boots + compiles the first route on the
-                # first request — give it room, then warm it with a real
-                # request so the first user page load is fast.
-                for _ in range(4):
-                    shell("sleep 5", fe, "debugger", 10)
-                    warm = shell(
-                        f"curl -s -o /dev/null -w '%{{http_code}}' "
-                        f"http://localhost:{NEXT_DEV_PORT}/ --max-time 20",
-                        fe, "debugger", 30,
-                    )
-                    if str(warm.get("stdout", "")).strip().startswith(("2", "3")):
-                        break
-                # v2: RUNTIME VERIFICATION — an HTTP 200 from Next dev does
-                # NOT prove the app renders (error pages also answer 200).
-                # Fetch the actual HTML and look for the dev-overlay/runtime
-                # error markers; any hit becomes repair-loop input.
-                probe = shell(
-                    f"curl -s http://localhost:{NEXT_DEV_PORT}/ --max-time 20",
-                    fe, "debugger", 30,
-                )
-                html = str(probe.get("stdout", ""))
-                err_markers = (
-                    "Application error", "__next_error__",
-                    "Unhandled Runtime", "Missing required error pages",
-                    "Module not found", "Cannot find module",
-                    "SyntaxError", "TypeError",
-                )
-                hits = [m for m in err_markers if m in html]
-                if hits:
-                    ok = False
-                    snippet = html[max(0, html.find(hits[0]) - 120):
-                                   html.find(hits[0]) + 380].replace("\n", " ")
-                    issues.append(
-                        f"runtime error on / (markers: {', '.join(hits[:3])}): {snippet}")
-                # The dev-server log is even richer than the HTML — surface
-                # compile/runtime errors from the tail.
-                logtail = shell("tail -n 40 /tmp/frontend-dev.log 2>/dev/null",
-                                fe, "debugger", 15)
-                logtxt = str(logtail.get("stdout", "")) + str(logtail.get("stderr", ""))
-                for marker in ("Failed to compile", "SyntaxError", "Module not found",
-                               "Unhandled Runtime", "TypeError:"):
-                    if marker in logtxt:
-                        line = next((l for l in logtxt.splitlines() if marker in l), "")
-                        issues.append(f"next dev log: {line[:300]}")
-                        ok = False
-                        break
-            else:
-                # Legacy Vite app — serve on the Vite port as before.
-                app_port = VITE_DEV_PORT
-                shell("npm install --no-audit --no-fund --loglevel=error",
-                      fe, "debugger", 300)
-                already_up = _probe_up(VITE_DEV_PORT)
-                if not already_up:
-                    # Launch detached — the dev server outlives the daemon AND
-                    # every WebSocket client.
-                    shell(
-                        f"nohup npx vite --port {VITE_DEV_PORT} --host --strictPort "
-                        f"> /tmp/frontend-dev.log 2>&1 < /dev/null &",
-                        fe, "debugger", 20,
-                    )
-                    shell("sleep 4", fe, "debugger", 10)
-                    shell(
-                        f"curl -s -o /dev/null -w '%{{http_code}}' "
-                        f"http://localhost:{VITE_DEV_PORT}/ --max-time 3",
-                        fe, "debugger", 10,
-                    )
-
-        # 3) Backend deps + server (language chosen by the model).
-        be = os.path.join(WORKSPACE, "backend")
-        if os.path.exists(os.path.join(be, "requirements.txt")):
-            shell("pip install -q -r requirements.txt", be, "debugger", 300)
-        be_pkg = os.path.join(be, "package.json")
-        if os.path.exists(be_pkg) and not os.path.exists(os.path.join(be, "app.py")) \
-                and not os.path.exists(os.path.join(be, "main.py")) \
-                and not os.path.exists(os.path.join(be, "server.py")):
-            # Node backend — install + start via its scripts (npm start, else dev).
-            shell("npm install --no-audit --no-fund --loglevel=error",
-                  be, "debugger", 600)
-            try:
-                with open(be_pkg, "r", encoding="utf-8") as fh:
-                    bpkg = json.load(fh)
-                bscript = "start" if "start" in (bpkg.get("scripts") or {}) else \
-                          ("dev" if "dev" in (bpkg.get("scripts") or {}) else None)
-            except Exception:
-                bscript = None
-            if bscript:
-                shell(
-                    f"nohup npm run {bscript} > /tmp/backend-dev.log 2>&1 < /dev/null &",
-                    be, "debugger", 20,
-                )
-        for entry in ("app.py", "main.py", "server.py"):
-            if os.path.exists(os.path.join(be, entry)):
-                shell(
-                    f"nohup python3 {entry} > /tmp/backend-dev.log 2>&1 < /dev/null &",
-                    be, "debugger", 20,
-                )
-                break
-        # v2: backend crash detection — a Python backend that dies on boot
-        # writes a Traceback; surface it as repair-loop input instead of
-        # silently pretending the backend is up.
-        if os.path.exists("/tmp/backend-dev.log"):
-            time.sleep(2)
-            bt = shell("tail -n 25 /tmp/backend-dev.log 2>/dev/null",
-                       be, "debugger", 15)
-            btxt = str(bt.get("stdout", ""))
-            if "Traceback (most recent call last)" in btxt:
-                ok = False
-                tail_lines = [l for l in btxt.splitlines() if l.strip()][-6:]
-                issues.append(
-                    "python backend crashed at boot: " + " | ".join(tail_lines)[:400])
-
-        # 4) Publish the app-server state — the frontend re-fetches
-        #    agent-info on task_done and gets a SIGNED preview URL for this
-        #    port; broadcasting it also live-updates any connected studio.
-        if app_port is not None:
-            set_status("app", {"port": app_port, "up": True, "task_id": task_id})
-            emit({"type": "status", "status": get_status("app")})
-
-        return {"ok": ok, "issues": "; ".join(issues)[:1000], "commands": ran,
-                "app_port": app_port}
-
-    # ── v2 REPAIR LOOP ────────────────────────────────────────────────────
-
-    def _repair_loop(self, task_id: str, report: Dict[str, Any],
-                     written: List[Dict[str, str]],
-                     max_rounds: int = 3) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        """THE missing agent step (2026-08-27).
-
-        The old pipeline ENDED when checks failed — the model never learned
-        its build was broken. Now each round feeds the REAL failures
-        (command output, dev-server log lines, runtime HTML markers) plus
-        the relevant source files back to the LLM; it returns patched file
-        contents; verification re-runs. Converges or honestly reports the
-        remaining issues after max_rounds.
-
-        Token budget per repair call (Groq 8k floor): issues ≤1,500 chars +
-        ≤2 files ×3,000 chars + max_tokens 5,000 → prompt ≈2,400 tokens.
-        """
-        diagnoses: List[str] = []
-        rounds_used = 0
-
-        def _relevant_files(report_issues: str) -> List[str]:
-            """Files written this task, prioritized by mention in the errors."""
-            rels = [os.path.relpath(f["path"], WORKSPACE) for f in written
-                    if f["path"].endswith(_SRC_EXTS)]
-            mentioned = [r for r in rels if r in report_issues]
-            # Last-written first: later files depend on earlier ones, so the
-            # culprit for a compile failure is usually the most recent edit.
-            others = list(reversed([r for r in rels if r not in mentioned]))
-            return (mentioned + others)[:2]
-
-        for round_no in range(1, max_rounds + 1):
-            if report.get("ok"):
-                break
-            rounds_used = round_no
-            set_status("active", {"state": "repair", "detail":
-                                  f"self-repair round {round_no}", "task_id": task_id})
-            emit({"type": "status", "status": get_status("active")})
-            activity_detail = f"self-repair round {round_no}"
-            append_log(task_id, "repair", "info",
-                       f"{activity_detail} — issues: {report.get('issues', '')[:300]}")
-
-            # Assemble evidence: failing commands + outputs, then files.
-            evidence: List[str] = [f"ISSUES:\n{report.get('issues', '')}"]
-            for cmd in (report.get("commands") or []):
-                if cmd.get("exit_code") not in (0, None):
-                    evidence.append(
-                        f"$ {cmd.get('command', '')}\nexit {cmd.get('exit_code')}\n"
-                        f"{str(cmd.get('stderr') or '')[:700]}"
-                        f"{str(cmd.get('stdout') or '')[:500]}")
-            file_blocks: List[str] = []
-            for rel in _relevant_files(report.get("issues", "")):
-                content = read_file_for_edit(rel, cap=3000)
-                file_blocks.append(f"----- {rel} -----\n{content}")
-
-            try:
-                pace_for_tpm()
-                reply = llm_chat(
-                    [{"role": "system", "content": (
-                        "You are the Debugger of ArcForge, an autonomous "
-                        "in-VM agent. A build you are responsible for FAILED "
-                        "verification. Diagnose the ROOT CAUSE from the real "
-                        "command output, then return corrected FULL file "
-                        "contents. Reply with ONLY a JSON object: "
-                        '{"diagnosis": "<one sentence root cause>", '
-                        '"files": {"<path>": "<full corrected file content>"}, '
-                        '"delete": ["<path>"]}. Only include files that must '
-                        "change. Keep every working part of each file "
-                        "byte-identical where possible.")},
-                     {"role": "user", "content": (
-                         "\n\n".join(evidence + file_blocks)[:6000]
-                         + "\n\nFix the build.")}],
-                    json_mode=True, max_tokens=5000,
-                )
-                data = _extract_json(reply)
-                diagnosis = str(data.get("diagnosis") or "")[:200]
-                patches = {str(p).strip().lstrip("/"): _repair_double_escaped(c)
-                           for p, c in (data.get("files") or {}).items()
-                           if isinstance(p, str) and isinstance(c, str) and c.strip()}
-                if not patches:
-                    append_log(task_id, "repair", "warn",
-                               f"round {round_no}: model returned no patches "
-                               f"(diagnosis: {diagnosis or 'none'}) — stopping")
-                    diagnoses.append(diagnosis or "no patch produced")
-                    break
-                diagnoses.append(diagnosis or f"round {round_no} patch")
-                patched = self._write_files(patches, task_id)
-                deleted = self._delete_files(
-                    [str(p) for p in (data.get("delete") or []) if isinstance(p, str)],
-                    task_id)
-                written.extend(patched)
-                emit({"type": "files", "task_id": task_id,
-                      "files": patched + deleted})
-                append_log(task_id, "repair", "info",
-                           f"round {round_no}: applied {len(patched)} patch(es) "
-                           f"({', '.join(os.path.relpath(p['path'], WORKSPACE) for p in patched)})")
-                # Re-verify with the same debugger.
-                report = self._debugger(patched, task_id)
-                append_log(task_id, "repair", "info",
-                           f"round {round_no} re-verify: "
-                           + ("PASS" if report["ok"] else f"still failing — {report['issues'][:200]}"))
-            except Exception as exc:  # noqa: BLE001 — repair is best-effort
-                append_log(task_id, "repair", "warn",
-                           f"round {round_no} failed: {str(exc)[:200]}")
-                diagnoses.append(f"repair error: {str(exc)[:120]}")
-                break
-
-        return report, {"rounds": rounds_used, "diagnoses": diagnoses}
-
-
-# ---------------------------------------------------------------------------
-# Crash recovery — re-enqueue unfinished tasks after a daemon restart
-# ---------------------------------------------------------------------------
-
 
 def recover_pending_tasks() -> int:
-    """PM2 restarted us (or the VM rebooted). Any task that was pending or
-    running when we died is unfinished work — put it back on the queue."""
     recovered = 0
     with _db_lock, db() as conn:
         rows = conn.execute(
-            "SELECT id FROM task_queue WHERE status IN ('pending','running')"
+            "SELECT id FROM task_queue WHERE status IN "
+            "('pending','running','AWAITING_APPROVAL')"
         ).fetchall()
     for r in rows:
         task_queue.put(r["id"])
@@ -1876,15 +2062,11 @@ def recover_pending_tasks() -> int:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI application — REST + WebSocket surface
+# FastAPI application
 # ---------------------------------------------------------------------------
 
 from fastapi import (  # noqa: E402
-    FastAPI,
-    HTTPException,
-    Request,
-    WebSocket,
-    WebSocketDisconnect,
+    FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse  # noqa: E402
 
@@ -1892,11 +2074,8 @@ STARTED_AT = time.time()
 
 
 def _authorized(request: Request) -> bool:
-    """Bearer <AGENT_TOKEN> — the shared secret generated at workspace
-    creation. Only the platform (and the VM's owner via the platform) can
-    present it."""
     if not TOKEN:
-        return True  # dev mode — no token configured
+        return True
     header = request.headers.get("authorization", "")
     return secrets.compare_digest(header, f"Bearer {TOKEN}")
 
@@ -1909,8 +2088,24 @@ def _ws_authorized(ws: WebSocket) -> bool:
     return secrets.compare_digest(token, TOKEN) or secrets.compare_digest(header, TOKEN)
 
 
+def _pending_approval_payload() -> Optional[Dict[str, Any]]:
+    """The freshest pending approval (for sync replay after reconnect)."""
+    with _db_lock, db() as conn:
+        row = conn.execute(
+            "SELECT task_id, plan, updated_at FROM approvals WHERE status='pending' "
+            "ORDER BY updated_at DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    task_row = None
+    with _db_lock, db() as conn:
+        task_row = conn.execute(
+            "SELECT status FROM task_queue WHERE id=?", (row["task_id"],)).fetchone()
+    if not task_row or task_row["status"] != "AWAITING_APPROVAL":
+        return None
+    return {"task_id": row["task_id"], "plan": row["plan"]}
+
+
 def _sync_payload() -> Dict[str, Any]:
-    """The full state snapshot sent to every freshly connected terminal."""
     active = get_status("active") or {"state": "idle"}
     return {
         "type": "sync",
@@ -1918,11 +2113,17 @@ def _sync_payload() -> Dict[str, Any]:
         "active_status": active,
         "tasks": all_tasks(),
         "logs": recent_logs(LOG_TAIL_FOR_SYNC),
+        "pending_approval": _pending_approval_payload(),
         "server": {
             "uptime_s": int(time.time() - STARTED_AT),
             "model": LLM_MODEL,
+            "vlm_model": VLM_MODEL if VLM_ENABLED else None,
             "workspace": WORKSPACE,
             "llm_ready": LLM_READY,
+            "architecture": "swarm",
+            "skills": skills_catalog_summary(),
+            "browser": (browser_engine.health() if browser_engine is not None
+                        else {"playwright_installed": False}),
         },
     }
 
@@ -1932,7 +2133,8 @@ async def lifespan(app: FastAPI):
     global _LOOP
     _LOOP = asyncio.get_running_loop()
     init_db()
-    boot_note = f"orchestrator up on :{PORT} (db={DB_PATH})"
+    boot_note = (f"orchestrator v3 (swarm) up on :{PORT} (db={DB_PATH}, "
+                 f"model={LLM_MODEL}, vlm={VLM_MODEL if VLM_ENABLED else 'off'})")
     set_status("boot", {"ts": time.time(), "note": boot_note})
     append_log(None, "daemon", "info", boot_note)
     recover_pending_tasks()
@@ -1940,14 +2142,15 @@ async def lifespan(app: FastAPI):
     worker.start()
     log.info(boot_note)
     yield
+    if browser_engine is not None:
+        browser_engine.close()
 
 
-app = FastAPI(title="ArcForge Orchestrator", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="ArcForge Orchestrator", version="3.0.0", lifespan=lifespan)
 
 
 @app.get("/health")
 async def health():
-    """Unauthenticated liveness probe (no state leaked)."""
     return {"ok": True, "uptime_s": int(time.time() - STARTED_AT)}
 
 
@@ -1969,7 +2172,12 @@ async def status_route(request: Request):
         "tasks": counts,
         "connected_clients": len(manager.active),
         "model": LLM_MODEL,
+        "vlm_model": VLM_MODEL if VLM_ENABLED else None,
         "llm_ready": LLM_READY,
+        "architecture": "swarm",
+        "skills": skills_catalog_summary(),
+        "browser": (browser_engine.health() if browser_engine is not None
+                    else {"playwright_installed": False}),
     }
 
 
@@ -1987,28 +2195,35 @@ async def logs_route(request: Request, limit: int = 100, task_id: Optional[str] 
 
 @app.post("/prompt")
 async def prompt_route(request: Request):
-    """REST fallback for environments where WebSocket upgrades are blocked
-    (corporate proxies, some Daytona preview configurations). Same queue,
-    same autonomy — the client can poll /status + /history."""
     _guard(request)
     body = await request.json()
     text = str(body.get("message") or body.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "message is required"}, status_code=400)
+    if route_prompt_during_approval(text):
+        return {"routed": "approval_feedback", "queued": False}
     task_id = enqueue_task(text)
     return {"task_id": task_id, "queued": True}
 
 
+@app.post("/approval")
+async def approval_route(request: Request):
+    """REST fallback for the approval decision (WS is the primary path)."""
+    _guard(request)
+    body = await request.json()
+    task_id = str(body.get("task_id") or "").strip()
+    action = str(body.get("action") or "").strip()
+    feedback = str(body.get("feedback") or "").strip()
+    if not task_id or action not in ("approve", "change"):
+        return JSONResponse({"error": "task_id and action(approve|change) required"},
+                            status_code=400)
+    ok = approval_submit(task_id, action, feedback)
+    return {"accepted": ok}
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    """The dumb-terminal channel.
-
-    Handshake: client connects (token via ?token= or Authorization header);
-    on accept the daemon immediately pushes the full `sync` snapshot
-    (chat_history + active_status + tasks + recent logs). From then on the
-    client is a pure renderer: every state change is broadcast, and any
-    client that arrives late sees everything via its own sync.
-    """
+    """The dumb-terminal channel + the approval interaction surface."""
     if not _ws_authorized(ws):
         await ws.close(code=4401, reason="unauthorized")
         return
@@ -2028,11 +2243,23 @@ async def ws_endpoint(ws: WebSocket):
                 await ws.send_text(json.dumps(_sync_payload()))
             elif mtype == "prompt":
                 text = str(msg.get("text") or "").strip()
-                if text:
-                    task_id = enqueue_task(text)
+                if not text:
+                    continue
+                if route_prompt_during_approval(text):
                     await ws.send_text(json.dumps(
-                        {"type": "task_queued", "task_id": task_id, "prompt": text}
-                    ))
+                        {"type": "approval_feedback_accepted", "text": text[:200]}))
+                    continue
+                task_id = enqueue_task(text)
+                await ws.send_text(json.dumps(
+                    {"type": "task_queued", "task_id": task_id, "prompt": text}))
+            elif mtype == "approval_response":
+                task_id = str(msg.get("task_id") or "").strip()
+                action = str(msg.get("action") or "").strip()
+                feedback = str(msg.get("feedback") or "").strip()
+                ok = approval_submit(task_id, action, feedback)
+                await ws.send_text(json.dumps(
+                    {"type": "approval_response_ack", "task_id": task_id,
+                     "accepted": ok}))
     except WebSocketDisconnect:
         manager.disconnect(ws)
     except Exception:
@@ -2041,25 +2268,8 @@ async def ws_endpoint(ws: WebSocket):
 
 @app.websocket("/reverse-tunnel")
 async def reverse_tunnel_endpoint(ws: WebSocket):
-    """Inbound reverse-tunnel WS endpoint.
-
-    The BACKEND dials into this endpoint via the signed
-    *.daytonaproxy01.eu URL (the same proxy the frontend uses for /ws).
-    Auth is via the shared AGENT_PROXY_SECRET (TUNNEL_TOKEN env var) —
-    presented as `X-Agent-Token` header OR `?token=` query. The backend
-    uses the same secret for the existing /api/tunnel endpoint, so a VM
-    provisioned with its TUNNEL_TOKEN works for either transport.
-
-    Once accepted, the backend holds the WS open and waits for `req`
-    frames from this orchestrator (sent by the worker thread via
-    rt_mux.send_req when llm_chat is called). For each `req` frame,
-    the backend injects the real NVIDIA key, calls NVIDIA, and streams
-    res/chunk/done frames back. Those frames are dispatched into the
-    multiplexer to resolve the in-flight futures.
-
-    See the "REVERSE TUNNEL" section above for the full protocol.
-    """
-    # Auth — X-Agent-Token (preferred) OR ?token= query.
+    """Inbound reverse-tunnel WS (the backend dials in through the signed
+    daytonaproxy01.eu URL). Text + VLM LLM requests flow out through it."""
     if RT_TOKEN:
         header_tok = ws.headers.get("x-agent-token", "") or ""
         query_tok = ws.query_params.get("token", "") or ""
@@ -2069,17 +2279,12 @@ async def reverse_tunnel_endpoint(ws: WebSocket):
             log.warning("reverse-tunnel: rejected upgrade (bad/missing token)")
             return
     await ws.accept()
-    # If a previous backend WS is still tracked, fail its in-flight
-    # requests and mark it stale — the new connection replaces it.
-    # (We don't actively close the old WS object — its recv loop will
-    # exit on its own when it receives a close frame or hits a timeout;
-    # we just stop routing new req frames to it.)
     if rt_mux._ws is not None and rt_mux._ws is not ws:
-        log.info("reverse-tunnel: new dial-in superseding previous connection — failing in-flight reqs")
+        log.info("reverse-tunnel: new dial-in superseding previous connection")
         rt_mux.fail_all("reverse-tunnel: new connection superseded")
     rt_mux._ws = ws
     rt_mux._ws_connected.set()
-    log.info("reverse-tunnel: backend dialed in — LLM bridge is live")
+    log.info("reverse-tunnel: backend dialed in — LLM/VLM bridge is live")
     try:
         while True:
             raw = await ws.receive_text()
@@ -2112,25 +2317,17 @@ async def reverse_tunnel_endpoint(ws: WebSocket):
     except Exception as exc:  # noqa: BLE001
         log.warning("reverse-tunnel: WS handler crashed: %s", exc)
     finally:
-        # COMPARE-AND-SWAP: only clear the global WS state if it still
-        # points to THIS ws. If a newer connection has already replaced
-        # us (rt_mux._ws != ws), leave the global state alone — the
-        # newer connection is the source of truth. This prevents a
-        # stale disconnect handler from clearing the active backend
-        # connection (e.g. when a transient rogue client dials in and
-        # out, the real backend's WS must NOT be torn down).
         if rt_mux._ws is ws:
             rt_mux._ws = None
             rt_mux._ws_connected.clear()
             rt_mux.fail_all("reverse-tunnel WS disconnected")
             log.info("reverse-tunnel: backend disconnected")
         else:
-            log.info("reverse-tunnel: stale handler exiting (a newer "
-                     "connection is active — leaving rt_mux intact)")
+            log.info("reverse-tunnel: stale handler exiting (newer connection active)")
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint — uvicorn, bound to 0.0.0.0 so the Daytona proxy can reach us
+# Entrypoint
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
