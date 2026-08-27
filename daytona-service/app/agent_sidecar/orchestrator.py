@@ -231,9 +231,10 @@ AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "14"))
 #   * stagnation — the SAME gap signature across consecutive QA rounds,
 #     surviving ONE context escalation (which mandates a different
 #     approach), or
-#   * the wall-clock safety net (default 45 min — several multiples of a
-#     healthy run, so only a genuinely stuck loop ever sees it).
-CONVERGE_MAX_S = float(os.environ.get("ORCH_CONVERGE_MAX_S", "2700"))
+#   * the wall-clock safety net (default 90 min — live-calibrated:
+#     nemotron-ultra agent runs alone take 10-25 min, so a deep but
+#     PROGRESSING run must never be cut short; only a stuck one sees it).
+CONVERGE_MAX_S = float(os.environ.get("ORCH_CONVERGE_MAX_S", "5400"))
 CONVERGE_STAGNATION = int(os.environ.get("ORCH_CONVERGE_STAGNATION", "2"))
 # Graph super-step budget: each QA round costs ~4 super-steps (chief →
 # fix tool → chief → debugger), so 240 supports ~50 convergence rounds —
