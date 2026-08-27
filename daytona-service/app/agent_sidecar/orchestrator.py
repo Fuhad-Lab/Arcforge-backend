@@ -106,6 +106,13 @@ if not LLM_USE_REVERSE_TUNNEL:
         LLM_URL = f"{LLM_URL}/chat/completions"
 LLM_KEY = os.environ.get("ORCH_LLM_KEY", "tunnel-injected")
 LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "openai/gpt-oss-120b")
+# HYBRID MODEL ROUTING (2026-08-28, live-measured): gpt-oss-120b is a
+# brilliant single-turn planner but a poor multi-turn tool-caller (it takes
+# shortcuts after 1 call and intermittently empties content into its
+# reasoning channel). deepseek-v4-flash runs clean, disciplined JSON tool
+# loops every turn (~60-100s/call). So: the CHIEF (classify/plan/refine/
+# briefs/triage/summary) uses LLM_MODEL; SUB-AGENT LOOPS use AGENT_MODEL.
+AGENT_MODEL = os.environ.get("ORCH_AGENT_MODEL", "deepseek-ai/deepseek-v4-flash-0731")
 LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "900"))
 LLM_READY = os.environ.get("ORCH_LLM_READY", "1") == "1"
 
@@ -121,7 +128,9 @@ LOG_FILE = os.environ.get("ORCH_LOG_FILE", os.path.join(SYSTEM_DIR, "orchestrato
 
 # Swarm tuning
 APPROVAL_TIMEOUT_S = float(os.environ.get("ORCH_APPROVAL_TIMEOUT_S", str(6 * 3600)))
-AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "26"))
+# Agent-loop step budget: the agent model is thorough but ~60-100s/call —
+# these caps keep a single agent run inside ~15-20 min worst case.
+AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "14"))
 DEBUG_MAX_ROUNDS = int(os.environ.get("ORCH_DEBUG_MAX_ROUNDS", "2"))
 
 API_CONTRACT_PATH = os.path.join(WORKSPACE, ".system", "api_contract.json")
@@ -761,21 +770,21 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
 
 
 def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
-             max_tokens: int = 16384) -> str:
-    """Text LLM (the swarm's brain). Raises RuntimeError with a readable msg.
+             max_tokens: int = 16384, model: Optional[str] = None) -> str:
+    """Text LLM (the swarm's brain). `model` overrides LLM_MODEL (the agent
+    loops route to AGENT_MODEL — see the hybrid note above).
 
-    EMPTY-CONTENT RETRY: gpt-oss-120b is a reasoning model — occasionally it
-    concludes entirely inside the reasoning channel and returns null content
-    (observed live 2026-08-27: "LLM returned an empty message" killed whole
-    agent runs at step 2). One immediate retry resolves the transient case;
-    real errors (HTTP/auth/model) propagate immediately."""
-    body: Dict[str, Any] = {"model": LLM_MODEL, "messages": messages,
+    EMPTY-CONTENT RETRY: reasoning models occasionally conclude entirely
+    inside the reasoning channel and return null content (observed live:
+    "LLM returned an empty message" killed whole agent runs at step 2).
+    Up to two immediate retries; real errors propagate immediately."""
+    body: Dict[str, Any] = {"model": model or LLM_MODEL, "messages": messages,
                             "temperature": 0, "max_tokens": max_tokens}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     global _last_llm_done_ts, _last_llm_cost_tokens
     last_err: Optional[Exception] = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             content = _llm_call_impl(body)
             _last_llm_done_ts = time.time()
@@ -784,8 +793,8 @@ def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
         except RuntimeError as exc:
             _last_llm_done_ts = time.time()
             _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
-            if "empty message" in str(exc) and attempt == 0:
-                log.warning("llm returned empty content — retrying once")
+            if "empty message" in str(exc) and attempt < 2:
+                log.warning("llm returned empty content — retry %d/2", attempt + 1)
                 last_err = exc
                 time.sleep(2)
                 continue
@@ -1089,16 +1098,19 @@ def run_agent_loop(
     task_prompt: str,
     toolset: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
     max_steps: int = AGENT_MAX_STEPS,
-    max_tokens: int = 4500,
+    max_tokens: int = 6000,
 ) -> Dict[str, Any]:
     """Run one agent: LLM ↔ tools until it replies {"tool":"done", ...} or
     hits the step limit. Every tool call is journaled + broadcast as an
-    activity line (the agent's REAL stream)."""
+    activity line (the agent's REAL stream). Runs on AGENT_MODEL — the
+    disciplined multi-turn tool-caller (see the hybrid routing note)."""
     tool_names = ", ".join(sorted(toolset.keys()))
     sys_full = (f"{system_prompt}\n\nAVAILABLE TOOLS: {tool_names}.\n"
                 'Reply with ONLY a JSON object per step: {"tool":"<name>", <args…>} '
-                'or to finish: {"tool":"done","report":"<what you did and the outcome>"}'
-                + ("" if len(toolset) < 14 else ""))
+                'or to finish: {"tool":"done","report":"<what you did and the outcome>"}. '
+                "Work step by step — NEVER declare done before every part of "
+                "the task is complete and verified. Batch related files into "
+                "ONE write_files call.")
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": sys_full},
         {"role": "user", "content": task_prompt},
@@ -1107,14 +1119,10 @@ def run_agent_loop(
     for step in range(1, max_steps + 1):
         pace_for_tpm()
         try:
-            # json_mode is deliberately OFF for agent loops: gpt-oss-120b is a
-            # reasoning model — with response_format=json_object it concludes
-            # into the reasoning channel after the first tool call and returns
-            # EMPTY content on every subsequent turn (observed live: every
-            # agent died at step 2). Without it the model emits proper JSON
-            # content each turn and _extract_json parses it leniently.
-            reply = llm_chat(_compact_history(messages), json_mode=False,
-                             max_tokens=max_tokens)
+            # AGENT_MODEL (deepseek-v4-flash) — proven reliable multi-turn
+            # JSON tool-caller; json_mode is fine for it (non-reasoning).
+            reply = llm_chat(_compact_history(messages), json_mode=True,
+                             max_tokens=max_tokens, model=AGENT_MODEL)
         except Exception as exc:  # noqa: BLE001
             ctx.say(f"{ctx.label} LLM call failed at step {step}: {str(exc)[:200]}")
             return {"tool": "done", "report": f"LLM failure at step {step}: "
@@ -1170,6 +1178,27 @@ def _fs_toolset(ctx: AgentContext, scope_dir: str,
             ctx.files_written.append(r["path"])
         return r
 
+    def write_files(a: Dict[str, Any]) -> Dict[str, Any]:
+        """Batched write — one call, many files ({"files": {path: content}}).
+        Cuts agent-loop steps (the agent model is thorough but ~60-100s
+        per call, so batching matters)."""
+        files = a.get("files")
+        if not isinstance(files, dict) or not files:
+            return {"ok": False, "error": 'files object required: {"files": {"path": "content"}}'}
+        results, ok_count = [], 0
+        for path, content in list(files.items())[:12]:
+            if not isinstance(content, str) or not content.strip():
+                results.append({"path": path, "ok": False, "error": "empty content"})
+                continue
+            r = write_workspace_file(str(path), content, ctx.task_id,
+                                     allowed_prefixes=prefixes)
+            if r.get("ok"):
+                ok_count += 1
+                ctx.files_written.append(r["path"])
+            results.append(r)
+        return {"ok": ok_count > 0, "written": ok_count,
+                "files": results[:12]}
+
     def edit_file(a: Dict[str, Any]) -> Dict[str, Any]:
         path, find, replace = a.get("path", ""), a.get("find", ""), a.get("replace", "")
         dest = safe_join(WORKSPACE, path) if path.startswith(("frontend", "backend")) else None
@@ -1211,8 +1240,9 @@ def _fs_toolset(ctx: AgentContext, scope_dir: str,
               "files": [{"path": dest, "action": "delete"}]})
         return {"ok": True, "deleted": path}
 
-    return {"write_file": write_file, "edit_file": edit_file,
-            "read_file": read_file, "delete_file": delete_file}
+    return {"write_file": write_file, "write_files": write_files,
+            "edit_file": edit_file, "read_file": read_file,
+            "delete_file": delete_file}
 
 
 def _terminal_tool(ctx: AgentContext, cwd: str) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
@@ -1385,7 +1415,7 @@ HARD RULES:
 - You NEVER touch frontend/ files and never use a browser. Your world is backend/ + the API contract.
 - The approved plan.md is the binding contract. Implement exactly what it specifies.
 - YOUR TASK IS NOT DONE until you have called api_contract_update with your EXACT endpoints (method, path, description, response) and port — the Frontend Agent is forbidden from guessing and depends on the contract.
-WORKFLOW: read the plan → write the code (small focused files) → lsp_diagnostics → install deps + start the server via terminal (nohup, background) → smoke-test endpoints with curl → api_contract_update {contract:{base_url,port,endpoints:[{method,path,description,response}]}} → mailbox_send to frontend (contract ready) → done.
+WORKFLOW: read the plan → write the code (batch files in ONE write_files call) → lsp_diagnostics → install deps + start the server via terminal (nohup, background) → smoke-test endpoints with curl → api_contract_update {contract:{base_url,port,endpoints:[{method,path,description,response}]}} → mailbox_send to frontend (contract ready) → done.
 BACKEND CHOICE: Python Flask (requirements.txt + app.py, port 8000, enable CORS for localhost:3000) unless the plan says otherwise.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
@@ -1419,7 +1449,7 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
             f"CURRENT backend/ TREE:\n{workspace_tree_text() or '(empty)'}")
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_backend_toolset(ctx),
-                            max_tokens=4500)
+                            max_tokens=6500)
 
     # STRUCTURAL POST-CHECK — the Integration Link is not optional: if the
     # agent wrote backend code but never published the contract, the
@@ -1437,7 +1467,7 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
                   "(read your files with read_file if unsure). Then done.")
         pace_for_tpm()
         result = run_agent_loop(ctx, system, repair, build_backend_toolset(ctx),
-                                max_steps=6, max_tokens=1800)
+                                max_steps=6, max_tokens=4000)
         if not os.path.exists(API_CONTRACT_PATH):
             ctx.say("Backend Agent: contract STILL missing after enforcement — "
                     "fit check will report the integration gap")
@@ -1473,7 +1503,7 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
                 f"CURRENT frontend/ TREE:\n{workspace_tree_text() or '(scaffold only)'}")
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_frontend_toolset(ctx),
-                            max_tokens=4500)
+                            max_tokens=6500)
 
     # STRUCTURAL POST-CHECK — Next.js App Router only serves frontend/app/*.
     # If the agent put the UI anywhere else (App.tsx — observed live: the app
@@ -1492,7 +1522,7 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
                     "(you may import your existing components), then done.")
         pace_for_tpm()
         result = run_agent_loop(ctx, system, repair, build_frontend_toolset(ctx),
-                                max_steps=6, max_tokens=4000)
+                                max_steps=6, max_tokens=5500)
 
     ctx.activity("Frontend Agent — finished", "done",
                  str(result.get("report", ""))[:200])
@@ -1509,7 +1539,7 @@ def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
             "browser interactions, then give your verdict.")
     pace_for_tpm()
     result = run_agent_loop(ctx, DEBUGGER_SYSTEM, user,
-                            build_debugger_toolset(ctx), max_tokens=3000)
+                            build_debugger_toolset(ctx), max_tokens=4000)
     report = str(result.get("report", ""))
     status = "pass" if (result.get("status") == "pass" or
                         re.search(r"\bstatus\D{0,12}pass\b", report, re.I)) else "fail"
