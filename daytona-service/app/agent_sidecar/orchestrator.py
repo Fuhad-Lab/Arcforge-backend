@@ -3727,6 +3727,7 @@ class TaskWorker(threading.Thread):
                            else (miss_line or "see verification report")},
                 "repairs": {"rounds": swarm["repairs"], "diagnoses": []},
                 "verdict": swarm["verdict"],
+                "convergence": swarm.get("convergence", {}),
                 "missing": missing_feats,
                 "agents": swarm["agents"],
                 "plan": plan_text[:4000],
