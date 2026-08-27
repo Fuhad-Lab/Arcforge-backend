@@ -1715,11 +1715,14 @@ class ChiefAgent:
     # -- step 5: final user-facing summary ----------------------------------
     def summarize(self, prompt: str, plan_title: str, reports: Dict[str, Any],
                   verdict: str) -> str:
+        def rep(key: str) -> str:
+            r = reports.get(key)
+            return str((r or {}).get("report", "(not run)"))[:400]
         user = (f"USER REQUEST: {prompt[:300]}\nPLAN: {plan_title}\n"
-                f"BACKEND REPORT: {str(reports.get('backend',{}).get('report','(none)'))[:400]}\n"
-                f"FRONTEND REPORT: {str(reports.get('frontend',{}).get('report','(none)'))[:400]}\n"
+                f"BACKEND REPORT: {rep('backend')}\n"
+                f"FRONTEND REPORT: {rep('frontend')}\n"
                 f"DEBUGGER VERDICT: {verdict}\n"
-                f"DEBUGGER REPORT: {str(reports.get('debugger',{}).get('report','(none)'))[:400]}\n"
+                f"DEBUGGER REPORT: {rep('debugger')}\n"
                 "Write the completion message.")
         try:
             pace_for_tpm()
