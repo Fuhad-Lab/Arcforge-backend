@@ -885,20 +885,38 @@ def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
     now = time.time()
     active = [m for m in chain if _MODEL_DEMOTED.get(m, 0) < now] or chain
     last_err: Optional[Exception] = None
-    for i, m in enumerate(active):
+    i = 0
+    window_waited = False
+    while i < len(active):
+        m = active[i]
         try:
             return _llm_chat_single(messages, json_mode, max_tokens, m)
         except RuntimeError as exc:
             msg = str(exc)
             last_err = exc
-            demotable = ("LLM HTTP 429" in msg or "LLM HTTP 404" in msg
-                         or "LLM HTTP 503" in msg or "empty message" in msg)
-            if i < len(active) - 1 and demotable:
+            # Match BOTH error shapes: direct ("LLM HTTP 429: …") and
+            # reverse-tunnel-relayed ("reverse-tunnel: LLM upstream HTTP
+            # 429: …" — live: this shape BYPASSED the old substring check
+            # and 429s killed whole agent loops instead of failing over).
+            demotable = bool(re.search(r"HTTP (429|404|503)\b", msg)) \
+                or "empty message" in msg
+            if demotable and i < len(active) - 1:
                 _MODEL_DEMOTED[m] = time.time() + _MODEL_DEMOTE_S
                 log.warning("model %s unusable (%s…) — demoted for %ss, "
                             "falling back to %s",
                             m, msg[:110], int(_MODEL_DEMOTE_S), active[i + 1])
+                i += 1
                 continue
+            # Lone-model chain (no fallback) hit a 429: sleep out ONE
+            # rate-limit window and retry — a lone model must not insta-die
+            # on a transient limit (empty-content was already retried twice
+            # inside _llm_chat_single, so only 429s earn the window wait).
+            if "HTTP 429" in msg and not window_waited:
+                window_waited = True
+                log.warning("llm_chat: %s rate-limited with no fallback — "
+                            "sleeping out the window once", m)
+                time.sleep(65)
+                continue  # retry the same model
             raise
     raise last_err or RuntimeError("LLM failed")
 
@@ -1247,16 +1265,23 @@ def run_agent_loop(
                       "error": f"unknown tool '{tool}' — you have: {tool_names}"}
         else:
             args = {k: v for k, v in data.items() if k != "tool"}
-            # UNWRAP OpenAI-style {"tool": name, "arguments": {...}} — models
-            # intermittently wrap their args this way; without unwrapping every
-            # tool saw an empty arg dict (live: read_file/terminal failed with
-            # 'read scope'/'command required' on perfectly valid calls).
-            if isinstance(args.get("arguments"), dict):
-                merged = dict(args["arguments"])
-                for k, v in args.items():
-                    if k != "arguments" and k not in merged:
-                        merged[k] = v
-                args = merged
+            # UNWRAP nested argument wrappers — models intermittently emit
+            #   {"tool": name, "arguments": {...}}   (OpenAI style)
+            #   {"tool": name, "args": {...}}        (live 2026-09-27:
+            #     deepseek-v4-pro AND minimax-m3 both wrap this way — every
+            #     tool saw an empty arg dict and both agents burned whole
+            #     step budgets on 'command required'/'read scope' loops)
+            #   {"tool": name, "parameters": {...}}  (older OpenAI style)
+            # Without unwrapping, perfectly valid calls look empty to the
+            # tool functions.
+            for _wrapper in ("arguments", "args", "parameters"):
+                if isinstance(args.get(_wrapper), dict):
+                    merged = dict(args[_wrapper])
+                    for k, v in args.items():
+                        if k != _wrapper and k not in merged:
+                            merged[k] = v
+                    args = merged
+                    break
             # Redact giant echo-backs from the journaled args
             display_args = {k: (v if not (isinstance(v, str) and len(v) > 90)
                                 else v[:90] + "…") for k, v in args.items()}
