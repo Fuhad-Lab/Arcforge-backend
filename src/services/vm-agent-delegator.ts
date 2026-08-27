@@ -55,7 +55,12 @@ const STATUS_POLL_INTERVAL_MS = 2_000;
  * app as JSON) takes ~6-10 min once reasoning + code are produced. 15 min
  * matches the nvidia-forwarder fetch cap + gives the full pipeline (architect
  * ~20s + developer ~6-10min + debugger ~30s) room to complete. */
-const PIPELINE_TIMEOUT_MS = 900_000;  // 15 min
+const PIPELINE_TIMEOUT_MS = 75 * 60_000;  // 75 min — must OUTLIVE real builds:
+// rate-limited models (NVIDIA per-model limits + 10-min demotion windows)
+// stretch builds past an hour; the old 15-min cap expired while the VM swarm
+// was still mid-build, the delegation mark cleared, and the tunnel sweeper
+// eventually dropped the LLM bridge out from under the running agents
+// (live: HabitFlow lost its tunnel at minute 55 during fix round 2).
 /** HTTP timeout for each individual call to the VM's orchestrator. */
 const VM_HTTP_TIMEOUT_MS = 15_000;
 

@@ -68,6 +68,13 @@ const DAEMON_PROBE_TIMEOUT_MS = 8_000;
  *  moment the project shows fresh activity or a delegation starts. */
 const parked = new Map<string, number>();
 
+/** Consecutive probe FAILURES (unreachable daemon) per sandbox. Probe
+ *  failures must not insta-park — a transient network blip (or, live on
+ *  2026-09-27, a probe that 401'd because it sent the WRONG AUTH HEADER)
+ *  must not kill a mid-build tunnel. 3 consecutive failures → park. */
+const probeFails = new Map<string, number>();
+const PROBE_FAIL_PARK_THRESHOLD = 3;
+
 let sweeping = false;
 let started = false;
 
@@ -77,7 +84,14 @@ interface ProjectRow {
   updated_at: string;
 }
 
-/** Fetch the daemon's orchestrator state ("idle" when nothing runs). */
+/** Fetch the daemon's orchestrator state ("idle" when nothing runs).
+ *
+ * AUTH: the orchestrator's `_authorized` accepts ONLY
+ * `Authorization: Bearer <token>` — the original probe sent
+ * `X-Agent-Token`, so EVERY probe 401'd → the sweeper read null → parked
+ * + disconnected the tunnel of BUSY sandboxes mid-build (live: the
+ * HabitFlow build lost its LLM bridge during fix round 2 and the last
+ * debugger round died "backend hasn't dialed in"). */
 async function probeDaemonState(
   url: string,
   token: string,
@@ -86,7 +100,7 @@ async function probeDaemonState(
   const timer = setTimeout(() => controller.abort(), DAEMON_PROBE_TIMEOUT_MS);
   try {
     const res = await fetch(`${url.replace(/\/+$/, "")}/status`, {
-      headers: { "X-Agent-Token": token },
+      headers: { "Authorization": `Bearer ${token}` },
       signal: controller.signal,
     });
     if (!res.ok) return null;
@@ -135,6 +149,7 @@ export async function sweepTunnels(): Promise<void> {
       // 1. In-flight backend delegation — always keep.
       if (delegationActive) {
         parked.delete(sandboxId);
+        probeFails.delete(sandboxId);
         await ensureTunnelFor(sandboxId);
         kept += 1;
         continue;
@@ -145,6 +160,7 @@ export async function sweepTunnels(): Promise<void> {
       // 2. Recent project activity — keep, and un-park.
       if (age <= ACTIVE_WINDOW_MS) {
         parked.delete(sandboxId);
+        probeFails.delete(sandboxId);
         await ensureTunnelFor(sandboxId);
         kept += 1;
         continue;
@@ -183,13 +199,30 @@ export async function sweepTunnels(): Promise<void> {
         continue;
       }
       const state = await probeDaemonState(info.url, info.token);
-      if (state !== null && state !== "idle") {
+      if (state === null) {
+        // Probe FAILED (unreachable/transient) — count it; only park after
+        // PROBE_FAIL_PARK_THRESHOLD consecutive failures so a blip can't
+        // kill a mid-build tunnel. No tunnel action this sweep.
+        const fails = (probeFails.get(sandboxId) ?? 0) + 1;
+        probeFails.set(sandboxId, fails);
+        if (fails >= PROBE_FAIL_PARK_THRESHOLD) {
+          logger.warn(
+            { sandboxId, fails },
+            "tunnel sweeper: daemon unreachable repeatedly — parking",
+          );
+          parked.set(sandboxId, Date.now());
+          if (disconnectReverseTunnelIfPresent(sandboxId)) disconnected += 1;
+        }
+        continue;
+      }
+      probeFails.delete(sandboxId);
+      if (state !== "idle") {
         // The swarm is working (VM-driven build, approval wait, debugger) —
         // its LLM calls need the tunnel even though the project row is stale.
         await ensureReverseTunnel(sandboxId, info.url);
         kept += 1;
       } else {
-        // Daemon idle (or unreachable): park + disconnect so the sandbox
+        // Daemon CONFIRMED idle: park + disconnect so the sandbox
         // can finally idle out and be reaped.
         parked.set(sandboxId, Date.now());
         if (disconnectReverseTunnelIfPresent(sandboxId)) disconnected += 1;
@@ -199,6 +232,9 @@ export async function sweepTunnels(): Promise<void> {
     // Prune parked entries for sandboxes no longer in the project list.
     for (const id of parked.keys()) {
       if (!seen.has(id)) parked.delete(id);
+    }
+    for (const id of probeFails.keys()) {
+      if (!seen.has(id)) probeFails.delete(id);
     }
 
     if (kept > 0 || disconnected > 0) {
