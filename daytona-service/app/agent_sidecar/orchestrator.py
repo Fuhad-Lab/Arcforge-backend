@@ -83,7 +83,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
@@ -105,16 +105,74 @@ if not LLM_USE_REVERSE_TUNNEL:
     if not LLM_URL.endswith("/chat/completions"):
         LLM_URL = f"{LLM_URL}/chat/completions"
 LLM_KEY = os.environ.get("ORCH_LLM_KEY", "tunnel-injected")
-LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "openai/gpt-oss-120b")
-# HYBRID MODEL ROUTING (2026-08-28, live-measured head-to-head on the REAL
-# tool loops): gpt-oss-120b = brilliant single-turn planner, terrible
-# multi-turn tool-caller (shortcuts + reasoning-channel empty content).
-# deepseek-v4-flash = disciplined but 60-900s/call (a big write_files
-# streamed 14+ minutes — unusable). nemotron-3-super-120b-a12b (MoE, 12B
-# active) = disciplined JSON tool loops at 2-20s/call (full 3-file frontend
-# task: 24s). So: the CHIEF (classify/plan/refine/briefs/triage/summary)
-# uses LLM_MODEL; SUB-AGENT LOOPS use AGENT_MODEL.
+LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+# ─────────────────────────────────────────────────────────────────────────
+# ROLE-ROUTED MODEL CHAINS (2026-09-26, NVIDIA API, live-measured head-to-
+# head on the REAL tool loops — see worklog Task 28):
+#   CHIEF      = nemotron-3-ultra-550b-a55b (550B MoE/55B active — the big
+#                planning brain; drifts from JSON schemas occasionally and
+#                503s under load → falls back to gpt-oss-120b, the proven
+#                planner: 8.3s plans with acceptance criteria).
+#   FRONTEND   = minimaxai/minimax-m3 (genuinely good JSON tool-caller that
+#                writes real React AND is multimodal — described a UI
+#                screenshot accurately in 6.7s; BUT the account's rate
+#                limit on it is tight: sustained 429s after ~2 rapid calls
+#                → sticky demotion falls back to nemotron-3-super).
+#   BACKEND    = deepseek-ai/deepseek-v4-pro-0813 (dominated the field:
+#                3-5 steps at 0.7-12s/call, real Express code, recovered
+#                from an injected missing-dependency error, published the
+#                api contract unprompted. The nemotron-3-super baseline
+#                flailed to its step limit on the same task).
+#   DEBUGGER   = nemotron-3-super-120b-a12b (BOTH user-picks failed live:
+#                deepseek-v4-flash timed out at 160s+ on its FIRST call,
+#                nemotron-3.5-lightning burned 2184 reasoning tokens on
+#                call 1 and hit the step limit without finishing).
+#                nemotron-3-super stays the proven browser-tool caller.
+# Fallbacks engage on HTTP 429/404/503 or repeated empty content, with
+# sticky per-model demotion (ORCH_MODEL_DEMOTE_S, default 10 min) so a
+# rate-limited primary doesn't tax every subsequent step.
+# ─────────────────────────────────────────────────────────────────────────
 AGENT_MODEL = os.environ.get("ORCH_AGENT_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+CHIEF_FALLBACK_MODEL = os.environ.get(
+    "ORCH_CHIEF_FALLBACK_MODEL", "openai/gpt-oss-120b")
+FRONTEND_MODEL = os.environ.get(
+    "ORCH_FRONTEND_MODEL", "minimaxai/minimax-m3")
+BACKEND_MODEL = os.environ.get(
+    "ORCH_BACKEND_MODEL", "deepseek-ai/deepseek-v4-pro-0813")
+DEBUGGER_MODEL = os.environ.get(
+    "ORCH_DEBUGGER_MODEL", AGENT_MODEL)
+
+
+def _model_chain(*candidates: Optional[str]) -> List[str]:
+    """Ordered, de-duplicated model chain (primaries first, fallbacks last)."""
+    seen: set = set()
+    chain: List[str] = []
+    for m in candidates:
+        if m and m not in seen:
+            seen.add(m)
+            chain.append(m)
+    return chain
+
+
+CHIEF_MODELS = _model_chain(LLM_MODEL, CHIEF_FALLBACK_MODEL)
+FRONTEND_MODELS = _model_chain(FRONTEND_MODEL, AGENT_MODEL)
+BACKEND_MODELS = _model_chain(BACKEND_MODEL, AGENT_MODEL)
+DEBUGGER_MODELS = _model_chain(DEBUGGER_MODEL, AGENT_MODEL)
+
+# Observability: the full routing table (surfaced in /status + task results).
+MODEL_ROUTING = {
+    "chief": CHIEF_MODELS,
+    "frontend": FRONTEND_MODELS,
+    "backend": BACKEND_MODELS,
+    "debugger": DEBUGGER_MODELS,
+}
+
+# Sticky demotion: model-id → epoch-until. While demoted, the model is
+# skipped entirely (the chain's fallback serves the call). Re-armed after
+# the window so a transient rate limit doesn't exile a model forever.
+_MODEL_DEMOTED: Dict[str, float] = {}
+_MODEL_DEMOTE_S = float(os.environ.get("ORCH_MODEL_DEMOTE_S", "600"))
+
 LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "900"))
 LLM_READY = os.environ.get("ORCH_LLM_READY", "1") == "1"
 
@@ -739,15 +797,19 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
                 preview = raw[:400]
                 tpm_limited = status == 413 and (
                     "rate_limit_exceeded" in preview or "tokens per minute" in preview)
-                if (status == 429 or tpm_limited) and attempt < 3:
+                # ONE rate-limit sleep-out, then raise so the role-model
+                # CHAIN fallback in llm_chat engages quickly (sustained
+                # per-model limits — live: minimax-m3 — must not burn
+                # 3×65s inside every step before the fallback fires).
+                if (status == 429 or tpm_limited) and attempt < 2:
                     last_err = RuntimeError(f"LLM HTTP {status}: {preview[:200]}")
-                    log.warning("llm rate-limited (HTTP %s) — sleeping out the window", status)
+                    log.warning("llm rate-limited (HTTP %s) — sleeping out the window once", status)
                     time.sleep(65)
                     continue
                 raise RuntimeError(f"LLM HTTP {status}: {preview}")
             return _parse_chat_completion(raw)
         except HTTPError as exc:
-            if exc.code in (429, 413) and attempt < 3:
+            if exc.code in (429, 413) and attempt < 2:
                 last_err = exc
                 time.sleep(20 * (attempt + 1))
                 continue
@@ -771,16 +833,15 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
     raise RuntimeError(f"LLM failed after retries: {last_err}")
 
 
-def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
-             max_tokens: int = 16384, model: Optional[str] = None) -> str:
-    """Text LLM (the swarm's brain). `model` overrides LLM_MODEL (the agent
-    loops route to AGENT_MODEL — see the hybrid note above).
+def _llm_chat_single(messages: List[Dict[str, str]], json_mode: bool,
+                     max_tokens: int, model: str) -> str:
+    """One llm_chat attempt against ONE model id.
 
     EMPTY-CONTENT RETRY: reasoning models occasionally conclude entirely
     inside the reasoning channel and return null content (observed live:
     "LLM returned an empty message" killed whole agent runs at step 2).
     Up to two immediate retries; real errors propagate immediately."""
-    body: Dict[str, Any] = {"model": model or LLM_MODEL, "messages": messages,
+    body: Dict[str, Any] = {"model": model, "messages": messages,
                             "temperature": 0, "max_tokens": max_tokens}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
@@ -799,6 +860,44 @@ def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
                 log.warning("llm returned empty content — retry %d/2", attempt + 1)
                 last_err = exc
                 time.sleep(2)
+                continue
+            raise
+    raise last_err or RuntimeError("LLM failed")
+
+
+def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
+             max_tokens: int = 16384,
+             model: Optional[Union[str, List[str]]] = None) -> str:
+    """Text LLM (the swarm's brain).
+
+    `model` may be a single id or an ordered CHAIN [primary, fallback…]
+    (role routing — CHIEF/FRONTEND/BACKEND/DEBUGGER_MODELS above). On a
+    retryable failure of one model (HTTP 429 rate-limit, 404 not-on-account,
+    503 overloaded, or persistent empty content) the model is sticky-demoted
+    for ORCH_MODEL_DEMOTE_S seconds and the next model in the chain serves
+    the call — so a rate-limited primary (live-observed: minimax-m3 429s
+    after ~2 rapid calls) never taxes every subsequent step of a build."""
+    chain: List[str] = ([m for m in model if m]
+                        if isinstance(model, (list, tuple))
+                        else [model or LLM_MODEL]) or [LLM_MODEL]
+    # Skip sticky-demoted models entirely (unless ALL are demoted — then
+    # try the chain as-is: a rate-limited attempt beats no attempt).
+    now = time.time()
+    active = [m for m in chain if _MODEL_DEMOTED.get(m, 0) < now] or chain
+    last_err: Optional[Exception] = None
+    for i, m in enumerate(active):
+        try:
+            return _llm_chat_single(messages, json_mode, max_tokens, m)
+        except RuntimeError as exc:
+            msg = str(exc)
+            last_err = exc
+            demotable = ("LLM HTTP 429" in msg or "LLM HTTP 404" in msg
+                         or "LLM HTTP 503" in msg or "empty message" in msg)
+            if i < len(active) - 1 and demotable:
+                _MODEL_DEMOTED[m] = time.time() + _MODEL_DEMOTE_S
+                log.warning("model %s unusable (%s…) — demoted for %ss, "
+                            "falling back to %s",
+                            m, msg[:110], int(_MODEL_DEMOTE_S), active[i + 1])
                 continue
             raise
     raise last_err or RuntimeError("LLM failed")
@@ -1101,11 +1200,13 @@ def run_agent_loop(
     toolset: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
     max_steps: int = AGENT_MAX_STEPS,
     max_tokens: int = 12000,
+    model: Optional[Union[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """Run one agent: LLM ↔ tools until it replies {"tool":"done", ...} or
     hits the step limit. Every tool call is journaled + broadcast as an
-    activity line (the agent's REAL stream). Runs on AGENT_MODEL — the
-    disciplined multi-turn tool-caller (see the hybrid routing note)."""
+    activity line (the agent's REAL stream). `model` is the ROLE-ROUTED
+    chain (FRONTEND/BACKEND/DEBUGGER_MODELS — see the routing note at the
+    top); None → AGENT_MODEL chain."""
     tool_names = ", ".join(sorted(toolset.keys()))
     sys_full = (f"{system_prompt}\n\nAVAILABLE TOOLS: {tool_names}.\n"
                 'Reply with ONLY a JSON object per step: {"tool":"<name>", <args…>} '
@@ -1121,11 +1222,12 @@ def run_agent_loop(
     for step in range(1, max_steps + 1):
         pace_for_tpm()
         try:
-            # AGENT_MODEL (nemotron-3-super-120b) — proven reliable multi-turn
-            # JSON tool-caller at 2-20s/call; json_mode is fine (its visible
-            # chain-of-thought preamble is handled by lenient _extract_json).
+            # Role-routed chain — e.g. FRONTEND_MODELS = [minimax-m3,
+            # nemotron-3-super]. json_mode is fine (visible chain-of-thought
+            # preambles are handled by the lenient _extract_json).
             reply = llm_chat(_compact_history(messages), json_mode=True,
-                             max_tokens=max_tokens, model=AGENT_MODEL)
+                             max_tokens=max_tokens,
+                             model=model or AGENT_MODEL)
         except Exception as exc:  # noqa: BLE001
             ctx.say(f"{ctx.label} LLM call failed at step {step}: {str(exc)[:200]}")
             return {"tool": "done", "report": f"LLM failure at step {step}: "
@@ -1524,7 +1626,7 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
             f"CURRENT backend/ TREE:\n{workspace_tree_text() or '(empty)'}")
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_backend_toolset(ctx),
-                            max_tokens=12000)
+                            max_tokens=12000, model=BACKEND_MODELS)
 
     # STRUCTURAL POST-CHECK — the Integration Link is not optional: if the
     # agent wrote backend code but never published the contract, the
@@ -1542,7 +1644,8 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
                   "(read your files with read_file if unsure). Then done.")
         pace_for_tpm()
         result = run_agent_loop(ctx, system, repair, build_backend_toolset(ctx),
-                                max_steps=6, max_tokens=8000)
+                                max_steps=6, max_tokens=8000,
+                                model=BACKEND_MODELS)
         if not os.path.exists(API_CONTRACT_PATH):
             ctx.say("Backend Agent: contract STILL missing after enforcement — "
                     "fit check will report the integration gap")
@@ -1578,7 +1681,7 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
                 f"CURRENT frontend/ TREE:\n{workspace_tree_text() or '(scaffold only)'}")
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_frontend_toolset(ctx),
-                            max_tokens=12000)
+                            max_tokens=12000, model=FRONTEND_MODELS)
 
     # STRUCTURAL POST-CHECK — Next.js App Router only serves frontend/app/*.
     # If the agent put the UI anywhere else (App.tsx — observed live: the app
@@ -1597,7 +1700,8 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
                     "(you may import your existing components), then done.")
         pace_for_tpm()
         result = run_agent_loop(ctx, system, repair, build_frontend_toolset(ctx),
-                                max_steps=6, max_tokens=9000)
+                                max_steps=6, max_tokens=9000,
+                                model=FRONTEND_MODELS)
 
     ctx.activity("Frontend Agent — finished", "done",
                  str(result.get("report", ""))[:200])
@@ -1676,7 +1780,8 @@ def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
             "then give your verdict.")
     pace_for_tpm()
     result = run_agent_loop(ctx, DEBUGGER_SYSTEM, user,
-                            build_debugger_toolset(ctx), max_tokens=4000)
+                            build_debugger_toolset(ctx), max_tokens=4000,
+                            model=DEBUGGER_MODELS)
     report = str(result.get("report", ""))
     status = "pass" if (result.get("status") == "pass" or
                         re.search(r"\bstatus\D{0,12}pass\b", report, re.I)) else "fail"
@@ -1834,7 +1939,7 @@ class ChiefAgent:
             data = _extract_json(llm_chat(
                 [{"role": "system", "content": CHIEF_CLASSIFY_SYSTEM},
                  {"role": "user", "content": user}],
-                json_mode=True, max_tokens=1100))
+                json_mode=True, max_tokens=1100, model=CHIEF_MODELS))
             if data.get("kind") == "answer" and str(data.get("reply", "")).strip():
                 return {"kind": "answer", "reply": str(data["reply"])}
             if data.get("kind") == "app":
@@ -1857,7 +1962,7 @@ class ChiefAgent:
         return llm_chat(
             [{"role": "system", "content": CHIEF_PLAN_SYSTEM},
              {"role": "user", "content": user}],
-            json_mode=False, max_tokens=3600).strip()
+            json_mode=False, max_tokens=3600, model=CHIEF_MODELS).strip()
 
     def refine_plan(self, plan: str, feedback: str) -> str:
         # The exact injection template the user mandated.
@@ -1868,7 +1973,7 @@ class ChiefAgent:
         return llm_chat(
             [{"role": "system", "content": CHIEF_REFINE_SYSTEM},
              {"role": "user", "content": user}],
-            json_mode=False, max_tokens=3600).strip()
+            json_mode=False, max_tokens=3600, model=CHIEF_MODELS).strip()
 
     # -- step 3: dispatch briefs (sub-agents as the chief's tools) ---------
     def brief(self, agent: str, plan_text: str, extra: str = "") -> Optional[str]:
@@ -1890,7 +1995,7 @@ class ChiefAgent:
             data = _extract_json(llm_chat(
                 [{"role": "system", "content": CHIEF_BRIEF_SYSTEM},
                  {"role": "user", "content": user}],
-                json_mode=True, max_tokens=1400))
+                json_mode=True, max_tokens=1400, model=CHIEF_MODELS))
             if data.get("skip"):
                 append_log(self.ctx.task_id, "chief", "info",
                            f"chief skipped {agent} agent: {data.get('reason','')}")
@@ -1916,7 +2021,7 @@ class ChiefAgent:
             data = _extract_json(llm_chat(
                 [{"role": "system", "content": CHIEF_TRIAGE_SYSTEM},
                  {"role": "user", "content": user}],
-                json_mode=True, max_tokens=1400))
+                json_mode=True, max_tokens=1400, model=CHIEF_MODELS))
             dels = [d for d in (data.get("delegations") or [])
                     if isinstance(d, dict) and d.get("agent") in ("frontend", "backend")
                     and str(d.get("task", "")).strip()]
@@ -1942,7 +2047,7 @@ class ChiefAgent:
             return llm_chat(
                 [{"role": "system", "content": CHIEF_SUMMARY_SYSTEM},
                  {"role": "user", "content": user}],
-                json_mode=False, max_tokens=900).strip()
+                json_mode=False, max_tokens=900, model=CHIEF_MODELS).strip()
         except Exception:  # noqa: BLE001
             return (f"{plan_title} — build finished. Debugger verdict: {verdict}. "
                     "Open the preview to try it.")
@@ -2263,7 +2368,8 @@ class TaskWorker(threading.Thread):
                               "files": [], "checks": {"ok": True, "issues": ""},
                               "repairs": {"rounds": 0, "diagnoses": []},
                               "duration_ms": int((time.time() - started) * 1000),
-                              "model": LLM_MODEL, "app_port": None}
+                              "model": LLM_MODEL, "models": MODEL_ROUTING,
+                              "app_port": None}
                     with _db_lock, db() as conn:
                         conn.execute(
                             "UPDATE task_queue SET status='done', result_json=? WHERE id=?",
@@ -2345,6 +2451,7 @@ class TaskWorker(threading.Thread):
                 "plan": plan_text[:4000],
                 "duration_ms": int((time.time() - started) * 1000),
                 "model": LLM_MODEL,
+                "models": MODEL_ROUTING,
                 "app_port": app_port,
             }
             with _db_lock, db() as conn:
@@ -2438,6 +2545,7 @@ def _sync_payload() -> Dict[str, Any]:
         "server": {
             "uptime_s": int(time.time() - STARTED_AT),
             "model": LLM_MODEL,
+            "models": MODEL_ROUTING,
             "vlm_model": VLM_MODEL if VLM_ENABLED else None,
             "workspace": WORKSPACE,
             "llm_ready": LLM_READY,
@@ -2455,7 +2563,8 @@ async def lifespan(app: FastAPI):
     _LOOP = asyncio.get_running_loop()
     init_db()
     boot_note = (f"orchestrator v3 (swarm) up on :{PORT} (db={DB_PATH}, "
-                 f"model={LLM_MODEL}, vlm={VLM_MODEL if VLM_ENABLED else 'off'})")
+                 f"models={json.dumps(MODEL_ROUTING)}, "
+                 f"vlm={VLM_MODEL if VLM_ENABLED else 'off'})")
     set_status("boot", {"ts": time.time(), "note": boot_note})
     append_log(None, "daemon", "info", boot_note)
     recover_pending_tasks()
@@ -2493,6 +2602,7 @@ async def status_route(request: Request):
         "tasks": counts,
         "connected_clients": len(manager.active),
         "model": LLM_MODEL,
+        "models": MODEL_ROUTING,
         "vlm_model": VLM_MODEL if VLM_ENABLED else None,
         "llm_ready": LLM_READY,
         "architecture": "swarm",

@@ -88,10 +88,25 @@ class AgentInstaller:
         """
         t0 = time.monotonic()
         token = secrets.token_urlsafe(32)
+        # ROLE-ROUTED MODELS (2026-09-26 NVIDIA routing — live head-to-head,
+        # see orchestrator.py's routing note + worklog Task 28). The chief
+        # primary rides in from the backend (llm_config.model — Render's
+        # SINGLE_MODE_MODEL); the per-agent roles are deployment constants,
+        # each overridable via this daytona-service's own env vars.
         llm = {
             "url": (llm_config or {}).get("url", ""),
             "key": (llm_config or {}).get("key", ""),
-            "model": (llm_config or {}).get("model", "openai/gpt-oss-120b"),
+            "model": (llm_config or {}).get("model", "nvidia/nemotron-3-ultra-550b-a55b"),
+            "chief_fallback_model": os.environ.get(
+                "ORCH_CHIEF_FALLBACK_MODEL", "openai/gpt-oss-120b"),
+            "agent_model": os.environ.get(
+                "ORCH_AGENT_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
+            "frontend_model": os.environ.get(
+                "ORCH_FRONTEND_MODEL", "minimaxai/minimax-m3"),
+            "backend_model": os.environ.get(
+                "ORCH_BACKEND_MODEL", "deepseek-ai/deepseek-v4-pro-0813"),
+            "debugger_model": os.environ.get(
+                "ORCH_DEBUGGER_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
         }
         result: dict[str, Any] = {
             "installed": False,
@@ -259,9 +274,15 @@ class AgentInstaller:
                 # the real NVIDIA Bearer token server-side).
                 "ORCH_LLM_KEY=tunnel-injected",
                 f"ORCH_LLM_MODEL={llm['model']}",
-                # Sub-agent tool loops run on the disciplined multi-turn
-                # tool-caller (see orchestrator.py hybrid routing note).
-                "ORCH_AGENT_MODEL=nvidia/nemotron-3-super-120b-a12b",
+                # ROLE-ROUTED MODEL CHAINS (see orchestrator.py): chief gets
+                # a fallback (503/schema-drift), each agent role its primary
+                # + the proven nemotron-3-super fallback. Sustained 429s or
+                # 503s sticky-demote a primary for 10 min (ORCH_MODEL_DEMOTE_S).
+                f"ORCH_CHIEF_FALLBACK_MODEL={llm['chief_fallback_model']}",
+                f"ORCH_AGENT_MODEL={llm['agent_model']}",
+                f"ORCH_FRONTEND_MODEL={llm['frontend_model']}",
+                f"ORCH_BACKEND_MODEL={llm['backend_model']}",
+                f"ORCH_DEBUGGER_MODEL={llm['debugger_model']}",
                 # 1 = clients (frontend) route generation through the in-VM
                 # agent. In reverse mode this is ALWAYS 1 because the path
                 # doesn't depend on the VM's egress filter.
@@ -576,7 +597,11 @@ class AgentInstaller:
             '        ORCH_LLM_URL: "reverse-tunnel://",\n'
             '        ORCH_LLM_KEY: "tunnel-injected",\n'
             f'        ORCH_LLM_MODEL: "{llm["model"]}",\n'
-            '        ORCH_AGENT_MODEL: "nvidia/nemotron-3-super-120b-a12b",\n'
+            f'        ORCH_CHIEF_FALLBACK_MODEL: "{llm["chief_fallback_model"]}",\n'
+            f'        ORCH_AGENT_MODEL: "{llm["agent_model"]}",\n'
+            f'        ORCH_FRONTEND_MODEL: "{llm["frontend_model"]}",\n'
+            f'        ORCH_BACKEND_MODEL: "{llm["backend_model"]}",\n'
+            f'        ORCH_DEBUGGER_MODEL: "{llm["debugger_model"]}",\n'
             '        ORCH_LLM_READY: "1",\n'
             '        ORCH_VLM_MODEL: "meta/llama-3.2-11b-vision-instruct",\n'
             '        ORCH_VLM_ENABLED: "1",\n'

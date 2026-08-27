@@ -55,18 +55,18 @@ export interface ForwardParams {
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /**
- * Resolve the upstream LLM base URL + API key (GROQ since 2026-08-27;
- * NVIDIA kept only as a legacy fallback).
+ * Resolve the upstream LLM base URL + API key (NVIDIA-first since
+ * 2026-09-26 — the role-routed swarm models all live on
+ * integrate.api.nvidia.com; Groq kept only as a legacy fallback).
  *
  * Priority:
- *  1. `GROQ_API_KEY` (+ optional `GROQ_BASE_URL`, default
- *     `https://api.groq.com/openai/v1`) — the primary provider.
- *  2. `NVIDIA_NIM_API_KEY` + `NVIDIA_NIM_BASE_URL` env vars (legacy
- *     tunnel-only config — kept so a stale Render env var can still
- *     intentionally pin the old provider).
- *  3. `getSingleModeLlmConfig()` from `agent-platform.ts` — the shared
- *     source of truth for url+key+model used by the existing
- *     `/api/llm/chat` HTTP proxy (now Groq-first too).
+ *  1. `NVIDIA_API_KEY` / `NVIDIA_NIM_API_KEY` (+ optional
+ *     `NVIDIA_NIM_BASE_URL`, default `https://integrate.api.nvidia.com/v1`)
+ *     — the primary provider.
+ *  2. `getSingleModeLlmConfig()` from `agent-platform.ts` — the shared
+ *     url+key+model config used by the existing `/api/llm/chat` HTTP
+ *     proxy (also NVIDIA on this deployment).
+ *  3. `GROQ_API_KEY` (+ optional `GROQ_BASE_URL`) — legacy.
  *
  * All provider URLs are FULL chat endpoints
  * (`https://api.groq.com/openai/v1/chat/completions`), so we strip the
@@ -79,21 +79,23 @@ export interface ForwardParams {
 function resolveLlmEndpoint(): { baseUrl: string; key: string } {
   const cfg = getSingleModeLlmConfig();
 
+  const nvidiaKey = process.env.NVIDIA_API_KEY || process.env.NVIDIA_NIM_API_KEY;
   const groqKey = process.env.GROQ_API_KEY;
-  const nimKey = process.env.NVIDIA_NIM_API_KEY;
-  const nimBase = process.env.NVIDIA_NIM_BASE_URL;
 
   let base: string;
   let key: string;
-  if (groqKey) {
+  if (nvidiaKey) {
+    key = nvidiaKey;
+    base = (
+      process.env.NVIDIA_NIM_BASE_URL ||
+      "https://integrate.api.nvidia.com/v1"
+    ).trim();
+  } else if (groqKey) {
     key = groqKey;
     base = (process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1").trim();
-  } else if (nimKey) {
-    key = nimKey;
-    base = (nimBase || cfg.url || "https://integrate.api.nvidia.com/v1").trim();
   } else {
     key = cfg.key;
-    base = (cfg.url || "https://api.groq.com/openai/v1").trim();
+    base = (cfg.url || "https://integrate.api.nvidia.com/v1").trim();
   }
 
   // 1) Trim trailing slashes.
@@ -229,7 +231,7 @@ export async function* forwardToNvidia(
   if (!key) {
     throw new Error(
       "LLM API key not configured on the tunnel server " +
-        "(set GROQ_API_KEY, or legacy NVIDIA_NIM_API_KEY/SINGLE_MODE_API_KEY).",
+        "(set NVIDIA_API_KEY or NVIDIA_NIM_API_KEY; GROQ_API_KEY is legacy).",
     );
   }
 
