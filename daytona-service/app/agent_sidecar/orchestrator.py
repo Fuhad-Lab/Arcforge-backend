@@ -133,7 +133,7 @@ APPROVAL_TIMEOUT_S = float(os.environ.get("ORCH_APPROVAL_TIMEOUT_S", str(6 * 360
 # Agent-loop step budget: the agent model is thorough but ~60-100s/call —
 # these caps keep a single agent run inside ~15-20 min worst case.
 AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "14"))
-DEBUG_MAX_ROUNDS = int(os.environ.get("ORCH_DEBUG_MAX_ROUNDS", "2"))
+DEBUG_MAX_ROUNDS = int(os.environ.get("ORCH_DEBUG_MAX_ROUNDS", "3"))
 
 API_CONTRACT_PATH = os.path.join(WORKSPACE, ".system", "api_contract.json")
 PLAN_PATH = os.path.join(WORKSPACE, "plan.md")
@@ -2080,11 +2080,49 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
         if verdict == "pass":
             break
         set_active("swarm", f"triaging failures (round {round_no})")
-        delegations = chief.triage(plan_text, debug,
-                                   mailbox_db_read(task_id, "chief"))
+        # DETERMINISTIC issues bypass the chief's triage LLM — their evidence
+        # is precise (dev-log error lines, crash tracebacks); routing them
+        # verbatim to the owning twin beats a lossy rephrase (live: the chief
+        # re-briefed fixes that dropped the actual error text, and 2 rounds
+        # fixed nothing). Only genuinely ambiguous issues go through triage.
+        det_issues = [i for i in debug.get("issues", [])
+                      if isinstance(i, dict)
+                      and i.get("suspect") in ("frontend", "backend")
+                      and str(i.get("observation", "")).strip()]
+        vague_issues = [i for i in debug.get("issues", [])
+                        if i not in det_issues]
+        delegations = []
+        for i in det_issues:
+            side = str(i["suspect"])
+            obs = str(i["observation"])[:500]
+            if side == "frontend":
+                task = (
+                    f"FIX (deterministic evidence from the live server):\n{obs}\n\n"
+                    "Repair the frontend so http://localhost:3000/ returns 200. Read the "
+                    "referenced file(s) first, fix the EXACT cause (missing import / "
+                    "missing file / syntax error), then VERIFY with browser_tool "
+                    "navigate http://localhost:3000 — you may not report done while "
+                    "it returns >=400."
+                )
+            else:
+                task = (
+                    f"FIX (deterministic evidence from the live server):\n{obs}\n\n"
+                    "Repair the backend so its contracted endpoints answer 2xx. Read "
+                    "your files first, fix the EXACT cause (e.g. deprecated Flask API "
+                    "— Flask 3 removed before_first_request, initialise at module "
+                    "scope or use with app.app_context() instead), restart the server "
+                    "via terminal (kill the old process first: fuser -k 8000/tcp), "
+                    "then VERIFY with terminal curl of the endpoint — you may not "
+                    "report done while it errors."
+                )
+            delegations.append({"agent": side, "task": task})
+        if vague_issues:
+            delegations += chief.triage(plan_text,
+                                        {"status": "fail", "issues": vague_issues},
+                                        mailbox_db_read(task_id, "chief"))
         if not delegations:
             break
-        for d in delegations:
+        for d in delegations[:3]:
             repairs += 1
             chief.ctx.activity(
                 f"Chief Agent — fix round {round_no}: {d['agent']} Agent", "active",
