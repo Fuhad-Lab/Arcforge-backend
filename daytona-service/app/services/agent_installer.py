@@ -261,7 +261,7 @@ class AgentInstaller:
                 f"ORCH_LLM_MODEL={llm['model']}",
                 # Sub-agent tool loops run on the disciplined multi-turn
                 # tool-caller (see orchestrator.py hybrid routing note).
-                "ORCH_AGENT_MODEL=deepseek-ai/deepseek-v4-flash-0731",
+                "ORCH_AGENT_MODEL=nvidia/nemotron-3-super-120b-a12b",
                 # 1 = clients (frontend) route generation through the in-VM
                 # agent. In reverse mode this is ALWAYS 1 because the path
                 # doesn't depend on the VM's egress filter.
@@ -576,7 +576,7 @@ class AgentInstaller:
             '        ORCH_LLM_URL: "reverse-tunnel://",\n'
             '        ORCH_LLM_KEY: "tunnel-injected",\n'
             f'        ORCH_LLM_MODEL: "{llm["model"]}",\n'
-            '        ORCH_AGENT_MODEL: "deepseek-ai/deepseek-v4-flash-0731",\n'
+            '        ORCH_AGENT_MODEL: "nvidia/nemotron-3-super-120b-a12b",\n'
             '        ORCH_LLM_READY: "1",\n'
             '        ORCH_VLM_MODEL: "meta/llama-3.2-11b-vision-instruct",\n'
             '        ORCH_VLM_ENABLED: "1",\n'

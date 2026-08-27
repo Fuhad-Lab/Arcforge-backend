@@ -106,13 +106,15 @@ if not LLM_USE_REVERSE_TUNNEL:
         LLM_URL = f"{LLM_URL}/chat/completions"
 LLM_KEY = os.environ.get("ORCH_LLM_KEY", "tunnel-injected")
 LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "openai/gpt-oss-120b")
-# HYBRID MODEL ROUTING (2026-08-28, live-measured): gpt-oss-120b is a
-# brilliant single-turn planner but a poor multi-turn tool-caller (it takes
-# shortcuts after 1 call and intermittently empties content into its
-# reasoning channel). deepseek-v4-flash runs clean, disciplined JSON tool
-# loops every turn (~60-100s/call). So: the CHIEF (classify/plan/refine/
-# briefs/triage/summary) uses LLM_MODEL; SUB-AGENT LOOPS use AGENT_MODEL.
-AGENT_MODEL = os.environ.get("ORCH_AGENT_MODEL", "deepseek-ai/deepseek-v4-flash-0731")
+# HYBRID MODEL ROUTING (2026-08-28, live-measured head-to-head on the REAL
+# tool loops): gpt-oss-120b = brilliant single-turn planner, terrible
+# multi-turn tool-caller (shortcuts + reasoning-channel empty content).
+# deepseek-v4-flash = disciplined but 60-900s/call (a big write_files
+# streamed 14+ minutes — unusable). nemotron-3-super-120b-a12b (MoE, 12B
+# active) = disciplined JSON tool loops at 2-20s/call (full 3-file frontend
+# task: 24s). So: the CHIEF (classify/plan/refine/briefs/triage/summary)
+# uses LLM_MODEL; SUB-AGENT LOOPS use AGENT_MODEL.
+AGENT_MODEL = os.environ.get("ORCH_AGENT_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 LLM_TIMEOUT_S = float(os.environ.get("ORCH_LLM_TIMEOUT_S", "900"))
 LLM_READY = os.environ.get("ORCH_LLM_READY", "1") == "1"
 
@@ -1098,7 +1100,7 @@ def run_agent_loop(
     task_prompt: str,
     toolset: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
     max_steps: int = AGENT_MAX_STEPS,
-    max_tokens: int = 6000,
+    max_tokens: int = 12000,
 ) -> Dict[str, Any]:
     """Run one agent: LLM ↔ tools until it replies {"tool":"done", ...} or
     hits the step limit. Every tool call is journaled + broadcast as an
@@ -1119,8 +1121,9 @@ def run_agent_loop(
     for step in range(1, max_steps + 1):
         pace_for_tpm()
         try:
-            # AGENT_MODEL (deepseek-v4-flash) — proven reliable multi-turn
-            # JSON tool-caller; json_mode is fine for it (non-reasoning).
+            # AGENT_MODEL (nemotron-3-super-120b) — proven reliable multi-turn
+            # JSON tool-caller at 2-20s/call; json_mode is fine (its visible
+            # chain-of-thought preamble is handled by lenient _extract_json).
             reply = llm_chat(_compact_history(messages), json_mode=True,
                              max_tokens=max_tokens, model=AGENT_MODEL)
         except Exception as exc:  # noqa: BLE001
@@ -1179,18 +1182,30 @@ def _fs_toolset(ctx: AgentContext, scope_dir: str,
         return r
 
     def write_files(a: Dict[str, Any]) -> Dict[str, Any]:
-        """Batched write — one call, many files ({"files": {path: content}}).
-        Cuts agent-loop steps (the agent model is thorough but ~60-100s
-        per call, so batching matters)."""
+        """Batched write — one call, many files. Accepts BOTH shapes the
+        models naturally produce:
+          {"files": {"path": "content", ...}}          (object map)
+          {"files": [{"path": p, "content": c}, ...]}   (array of objects)
+        Cuts agent-loop steps (each LLM call costs 5-120s depending on
+        model, so batching matters)."""
         files = a.get("files")
-        if not isinstance(files, dict) or not files:
-            return {"ok": False, "error": 'files object required: {"files": {"path": "content"}}'}
+        items: List[Tuple[str, str]] = []
+        if isinstance(files, dict):
+            items = [(str(p), str(c)) for p, c in files.items()
+                     if isinstance(c, str) and c.strip()]
+        elif isinstance(files, list):
+            for f in files:
+                if isinstance(f, dict) and isinstance(f.get("path"), str) \
+                        and isinstance(f.get("content"), str) and f["content"].strip():
+                    items.append((f["path"], f["content"]))
+        if not items:
+            return {"ok": False,
+                    "error": 'files required: {"files": {"path": "content"}} or '
+                             '{"files": [{"path": p, "content": c}]}. At least one '
+                             'non-empty file.'}
         results, ok_count = [], 0
-        for path, content in list(files.items())[:12]:
-            if not isinstance(content, str) or not content.strip():
-                results.append({"path": path, "ok": False, "error": "empty content"})
-                continue
-            r = write_workspace_file(str(path), content, ctx.task_id,
+        for path, content in items[:12]:
+            r = write_workspace_file(path, content, ctx.task_id,
                                      allowed_prefixes=prefixes)
             if r.get("ok"):
                 ok_count += 1
@@ -1449,7 +1464,7 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
             f"CURRENT backend/ TREE:\n{workspace_tree_text() or '(empty)'}")
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_backend_toolset(ctx),
-                            max_tokens=6500)
+                            max_tokens=12000)
 
     # STRUCTURAL POST-CHECK — the Integration Link is not optional: if the
     # agent wrote backend code but never published the contract, the
@@ -1467,7 +1482,7 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
                   "(read your files with read_file if unsure). Then done.")
         pace_for_tpm()
         result = run_agent_loop(ctx, system, repair, build_backend_toolset(ctx),
-                                max_steps=6, max_tokens=4000)
+                                max_steps=6, max_tokens=8000)
         if not os.path.exists(API_CONTRACT_PATH):
             ctx.say("Backend Agent: contract STILL missing after enforcement — "
                     "fit check will report the integration gap")
@@ -1503,7 +1518,7 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
                 f"CURRENT frontend/ TREE:\n{workspace_tree_text() or '(scaffold only)'}")
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_frontend_toolset(ctx),
-                            max_tokens=6500)
+                            max_tokens=12000)
 
     # STRUCTURAL POST-CHECK — Next.js App Router only serves frontend/app/*.
     # If the agent put the UI anywhere else (App.tsx — observed live: the app
@@ -1522,7 +1537,7 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
                     "(you may import your existing components), then done.")
         pace_for_tpm()
         result = run_agent_loop(ctx, system, repair, build_frontend_toolset(ctx),
-                                max_steps=6, max_tokens=5500)
+                                max_steps=6, max_tokens=9000)
 
     ctx.activity("Frontend Agent — finished", "done",
                  str(result.get("report", ""))[:200])
