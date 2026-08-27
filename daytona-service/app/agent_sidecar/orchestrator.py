@@ -686,9 +686,17 @@ def _parse_chat_completion(raw: str) -> str:
 
 def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
                    direct_url: Optional[str] = None) -> str:
-    """Dispatch on transport: reverse-tunnel or direct urllib. Retries 429/413."""
+    """Dispatch on transport: reverse-tunnel or direct urllib. Retries 429/413.
+
+    TUNNEL-DROP TOLERANCE: backend redeploys restart the reverse-tunnel
+    client, leaving a ~30-60s window where the WS is down before the
+    backend re-dials. ConnectionError retries use PROGRESSIVE backoff
+    (5/15/30/60s ≈ 110s total) so in-flight swarm tasks survive deploys
+    instead of dying mid-agent (observed live: a refine_plan call failed
+    'backend hasn't dialed in' during a deploy restart)."""
+    _CONNECT_BACKOFF_S = (5, 15, 30, 60)
     last_err: Optional[Exception] = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             if LLM_USE_REVERSE_TUNNEL:
                 status, raw = _tunnel_request(path, body)
@@ -706,7 +714,7 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
                 preview = raw[:400]
                 tpm_limited = status == 413 and (
                     "rate_limit_exceeded" in preview or "tokens per minute" in preview)
-                if (status == 429 or tpm_limited) and attempt < 2:
+                if (status == 429 or tpm_limited) and attempt < 3:
                     last_err = RuntimeError(f"LLM HTTP {status}: {preview[:200]}")
                     log.warning("llm rate-limited (HTTP %s) — sleeping out the window", status)
                     time.sleep(65)
@@ -714,22 +722,25 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
                 raise RuntimeError(f"LLM HTTP {status}: {preview}")
             return _parse_chat_completion(raw)
         except HTTPError as exc:
-            if exc.code in (429, 413) and attempt < 2:
+            if exc.code in (429, 413) and attempt < 3:
                 last_err = exc
                 time.sleep(20 * (attempt + 1))
                 continue
             detail = exc.read().decode("utf-8", "replace")[:500]
             raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
-        except (URLError, TimeoutError, OSError, ConnectionError, RuntimeError) as exc:
-            # Retry transient failures (WS drop, timeout, rate-limit RuntimeError)
-            msg = str(exc)
-            if attempt < 2 and not msg.startswith("LLM HTTP 4"):
+        except (URLError, TimeoutError, OSError, ConnectionError) as exc:
+            # Transport-level failure — retry with PROGRESSIVE backoff so a
+            # reverse-tunnel re-dial (backend deploy restart) is survived.
+            wait = _CONNECT_BACKOFF_S[min(attempt, len(_CONNECT_BACKOFF_S) - 1)]
+            if attempt < 3:
                 last_err = exc
-                time.sleep(5)
+                log.warning("llm transport failure (attempt %d): %s — retrying in %ss",
+                            attempt + 1, str(exc)[:120], wait)
+                time.sleep(wait)
                 continue
-            if isinstance(exc, RuntimeError):
-                raise
             raise RuntimeError(f"LLM unreachable: {exc}") from exc
+        except RuntimeError:
+            raise
     raise RuntimeError(f"LLM failed after retries: {last_err}")
 
 
