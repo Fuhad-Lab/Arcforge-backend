@@ -1248,6 +1248,15 @@ def _fs_toolset(ctx: AgentContext, scope_dir: str,
         path = a.get("path", "")
         if path.startswith(("frontend", "backend")) or path == "plan.md":
             dest = safe_join(WORKSPACE, path)
+            if dest and os.path.isdir(dest):
+                # Directories return a LISTING (models ask for these;
+                # raising IsADirectoryError just burned their steps).
+                try:
+                    entries = sorted(os.listdir(dest))[:60]
+                    return {"ok": True, "directory": path,
+                            "entries": entries}
+                except OSError as exc:
+                    return {"ok": False, "error": str(exc)}
             if dest and os.path.exists(dest):
                 with open(dest, "r", encoding="utf-8", errors="replace") as fh:
                     return {"ok": True, "content": fh.read()[:7000]}
@@ -1596,13 +1605,75 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
     return result
 
 
+def _deterministic_issues() -> List[Dict[str, str]]:
+    """Orchestrator-side probes used when the Debugger agent fails to
+    produce actionable issues — the chief ALWAYS gets evidence to delegate
+    (live bug: the debugger burned its steps, the chief got 'fail' with no
+    issues, repairs=0 while the app 500'd and the backend crashed)."""
+    issues: List[Dict[str, str]] = []
+    # 1) Frontend probe — navigate / and surface the dev-log reason on >=400.
+    if browser_engine is not None:
+        nav = browser_engine.navigate(f"http://localhost:{NEXT_DEV_PORT}")
+        status = int(nav.get("http_status") or 0)
+        if status >= 400:
+            hint = str(nav.get("server_error_hint") or "")
+            first_err = next((ln.strip() for ln in hint.splitlines()
+                              if "Error" in ln or "error" in ln.lower()
+                              and "at " not in ln), "")[:220]
+            issues.append({
+                "criterion": "App loads at '/'",
+                "observation": f"Frontend serves HTTP {status}. "
+                               + (first_err or hint[:200]),
+                "suspect": "frontend",
+            })
+    # 2) Backend probe — curl the first contracted GET endpoint.
+    if os.path.exists(API_CONTRACT_PATH):
+        try:
+            with open(API_CONTRACT_PATH, "r", encoding="utf-8") as fh:
+                contract = json.load(fh)
+            eps = [e for e in (contract.get("endpoints") or [])
+                   if isinstance(e, dict) and str(e.get("method", "GET")).upper() == "GET"]
+            base = str(contract.get("base_url") or "http://localhost:8000").rstrip("/")
+            if eps:
+                path = str(eps[0].get("path", "/"))
+                probe = shell_run(f"curl -s -o /dev/null -w '%{{http_code}}' "
+                                  f"{base}{path} --max-time 8", WORKSPACE, 20)
+                code = str(probe.get("stdout", "")).strip()
+                if code in ("000", ""):
+                    crash = shell_run("tail -n 15 /tmp/backend-dev.log 2>/dev/null",
+                                      WORKSPACE, 10)
+                    tb = [ln for ln in (crash.get("stdout") or "").splitlines()
+                          if ln.strip()][-4:]
+                    issues.append({
+                        "criterion": f"GET {path} answers",
+                        "observation": "Backend unreachable on " + base
+                                       + (". Traceback: " + " | ".join(tb)[:260] if tb else ""),
+                        "suspect": "backend",
+                    })
+                elif code.startswith("5"):
+                    issues.append({
+                        "criterion": f"GET {path} answers",
+                        "observation": f"Backend returns HTTP {code} on {path}",
+                        "suspect": "backend",
+                    })
+        except Exception:  # noqa: BLE001 — probes are best-effort
+            pass
+    return issues
+
+
 def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
     ctx = AgentContext(task_id, "debugger")
     ctx.activity("Debugger Agent — E2E verification", "active",
                  "testing the live app against plan.md")
-    user = ("Verify the live app at http://localhost:3000 against plan.md "
-            "(read it first). Work through every acceptance criterion with "
-            "browser interactions, then give your verdict.")
+    # The plan rides IN the prompt — the agent no longer burns its step
+    # budget on repeated read_file(plan.md) calls (live: one run spent 7
+    # consecutive steps re-reading the same file and hit the limit).
+    user = ("Verify the live app at http://localhost:3000 against this APPROVED "
+            "PLAN (you already have it — do NOT re-read plan.md; go straight "
+            "to the browser):\n\n"
+            f"{plan_text[:3200]}\n\n"
+            "Work through every acceptance criterion with browser interactions, "
+            "then give your verdict.")
     pace_for_tpm()
     result = run_agent_loop(ctx, DEBUGGER_SYSTEM, user,
                             build_debugger_toolset(ctx), max_tokens=4000)
@@ -1612,9 +1683,17 @@ def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
     issues = result.get("issues")
     if not isinstance(issues, list):
         issues = []
-    if status == "fail" and not issues:
-        issues = [{"criterion": "overall", "observation": report[:400],
-                   "suspect": "unclear"}]
+    if status == "fail":
+        # DETERMINISTIC FALLBACK — probe the servers ourselves so the chief
+        # always receives actionable, evidence-based issues.
+        det = _deterministic_issues()
+        seen = {json.dumps(i, sort_keys=True) for i in issues}
+        for i in det:
+            if json.dumps(i, sort_keys=True) not in seen:
+                issues.append(i)
+        if not issues:
+            issues = [{"criterion": "overall", "observation": report[:400],
+                       "suspect": "unclear"}]
     ctx.activity("Debugger Agent — verdict", "done", status.upper())
     ctx.say(f"Debugger verdict: {status.upper()} — {report[:400]}")
     return {"status": status, "issues": issues, "report": report}
