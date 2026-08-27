@@ -2328,7 +2328,10 @@ def _deterministic_issues() -> List[Dict[str, str]]:
     (live bug: the debugger burned its steps, the chief got 'fail' with no
     issues, repairs=0 while the app 500'd and the backend crashed)."""
     issues: List[Dict[str, str]] = []
-    # 1) Frontend probe — navigate / and surface the dev-log reason on >=400.
+    # 1) Frontend probe — navigate / and surface the dev-log reason on >=400;
+    #    a refused connection (status 0) means the dev server is DOWN (live
+    #    2026-08-27: the server-down case flowed through the gap path as
+    #    "App must be running" instead of a crash-class start-the-server fix).
     if browser_engine is not None:
         nav = browser_engine.navigate(f"http://localhost:{NEXT_DEV_PORT}")
         status = int(nav.get("http_status") or 0)
@@ -2341,6 +2344,16 @@ def _deterministic_issues() -> List[Dict[str, str]]:
                 "criterion": "App loads at '/'",
                 "observation": f"Frontend serves HTTP {status}. "
                                + (first_err or hint[:200]),
+                "suspect": "frontend",
+            })
+        elif status == 0:
+            issues.append({
+                "criterion": "App loads at '/'",
+                "observation": (f"The frontend dev server is NOT running — "
+                                f"http://localhost:{NEXT_DEV_PORT} refuses "
+                                "connections. Start it (nohup npx next dev "
+                                f"-p {NEXT_DEV_PORT} -H 0.0.0.0 & from "
+                                "frontend/) and confirm it answers before done."),
                 "suspect": "frontend",
             })
     # 2) Backend probe — curl the first contracted GET endpoint.
@@ -2435,7 +2448,11 @@ def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
     if status == "pass" and missing:
         # Inconsistent verdict: features marked missing cannot be a pass.
         status = "fail"
-    ctx.activity("Verification complete", "done", status.upper())
+    ctx.activity("Verification complete", "done",
+                 (f"FAIL — missing: "
+                  + "; ".join(str(m.get("feature", "?"))[:60]
+                               for m in missing[:6]))
+                 if status == "fail" and missing else status.upper())
     if status == "fail" and missing:
         feats = "; ".join(str(m.get("feature", "?"))[:60] for m in missing[:4])
         ctx.say(f"Verification: FAIL — missing from the plan: {feats}")
