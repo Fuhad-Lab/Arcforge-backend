@@ -2870,9 +2870,21 @@ def agent_dispatcher(state: Dict[str, Any]) -> Dict[str, str]:
             [{"role": "system", "content": CHIEF_DISPATCH_SYSTEM},
              {"role": "user", "content": user}],
             json_mode=True, max_tokens=1200, model=CHIEF_MODELS))
-        proposal = {"tool": str(data.get("tool", "")).strip().lower(),
-                    "task": str(data.get("task", "")).strip(),
-                    "reason": str(data.get("reason", ""))[:200]}
+        # UNWRAP the OpenAI-style wrapper the chief model intermittently
+        # emits (live 2026-09-28: {"tool": {"name": ..., "arguments":
+        # {...}}} parsed as tool=dict → strict read failed → guardrails
+        # had to save the route). Same family as the agent-loop unwrap.
+        raw_tool = data.get("tool")
+        raw_task, raw_reason = data.get("task", ""), data.get("reason", "")
+        if isinstance(raw_tool, dict):
+            args = raw_tool.get("arguments") or raw_tool.get("args") or {}
+            if isinstance(args, dict):
+                raw_task = raw_task or args.get("task", "")
+                raw_reason = raw_reason or args.get("reason", "")
+            raw_tool = raw_tool.get("name") or raw_tool.get("tool")
+        proposal = {"tool": str(raw_tool or "").strip().lower(),
+                    "task": str(raw_task or "").strip(),
+                    "reason": str(raw_reason or "")[:200]}
     except Exception as exc:  # noqa: BLE001 — guardrails route alone
         append_log(task_id, "chief", "warn",
                    f"dispatch decision degraded ({exc}) — guardrails routing")
