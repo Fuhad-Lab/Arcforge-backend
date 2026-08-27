@@ -54,6 +54,24 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+
+def _dev_log_tails(max_lines: int = 25) -> str:
+    """Tails of the dev-server logs — the 'why' behind a non-2xx page.
+    Server-side errors (Module not found, SyntaxError, tracebacks) land in
+    these logs, never in the browser console."""
+    parts: List[str] = []
+    for name, path in (("frontend-dev.log", "/tmp/frontend-dev.log"),
+                       ("backend-dev.log", "/tmp/backend-dev.log")):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+            tail = "".join(lines[-max_lines:]).strip()
+            if tail:
+                parts.append(f"--- {name} (tail) ---\n{tail}")
+        except OSError:
+            continue
+    return "\n".join(parts)[-3000:] or "(no dev logs found)"
+
 SCREENSHOT_DIR = os.environ.get(
     "ORCH_SCREENSHOT_DIR",
     os.path.join(os.environ.get("ORCH_SYSTEM_DIR", "/home/daytona/.system"),
@@ -214,13 +232,20 @@ class BrowserEngine:
             title = page.title() or "(untitled)"
             tree = self._a11y_tree(page)
             status = resp.status if resp else 0
-            return {
+            out: Dict[str, Any] = {
                 "ok": True,
                 "title": title,
                 "http_status": status,
                 "accessibility_tree": tree,
                 "note": "Use console_spy next to see errors/warnings.",
             }
+            # A non-2xx page is a SERVER-side error — the reason lives in the
+            # dev-server logs, not the console. Attach the relevant tails so
+            # the agent sees 'Module not found' etc. directly (live fix: the
+            # fit check saw a 500 but had no way to learn WHY).
+            if status >= 400:
+                out["server_error_hint"] = _dev_log_tails()
+            return out
         except Exception as exc:
             return {"ok": False, "error": f"navigate failed: {str(exc)[:300]}"}
 

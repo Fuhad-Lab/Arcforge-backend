@@ -1655,25 +1655,35 @@ def ensure_servers_up(task_id: str) -> Dict[str, Any]:
     if os.path.isdir(be):
         if os.path.exists(os.path.join(be, "requirements.txt")):
             sh("pip install -q -r requirements.txt 2>&1 | tail -n 2", be, 420)
-        be_pkg = os.path.join(be, "package.json")
+        # Kill ANY stale backend process first — a leftover server from an
+        # earlier round keeps serving OLD code on :8000 while the new one
+        # fails to bind silently (live bug: 2 repair rounds rewrote app.py
+        # but curl kept hitting the stale process).
+        sh("fuser -k 8000/tcp 2>/dev/null; sleep 1", be, 15)
+        # Flask/Python backend (the platform's preferred choice) takes
+        # precedence over any leftover Node backend from older rounds.
         started = False
-        if os.path.exists(be_pkg):
-            sh("npm install --no-audit --no-fund --loglevel=error", be, 600)
-            try:
-                with open(be_pkg, "r", encoding="utf-8") as fh:
-                    bpkg = json.load(fh)
-                bscript = ("start" if "start" in (bpkg.get("scripts") or {})
-                           else "dev" if "dev" in (bpkg.get("scripts") or {}) else None)
-            except Exception:  # noqa: BLE001
-                bscript = None
-            if bscript:
-                sh(f"nohup npm run {bscript} > /tmp/backend-dev.log 2>&1 < /dev/null &", be, 20)
-                started = True
         for entry in ("app.py", "main.py", "server.py"):
             if os.path.exists(os.path.join(be, entry)):
-                sh(f"nohup python3 {entry} > /tmp/backend-dev.log 2>&1 < /dev/null &", be, 20)
+                sh(f"nohup python3 {entry} > /tmp/backend-dev.log 2>&1 < /dev/null &",
+                   be, 20)
                 started = True
                 break
+        if not started:
+            be_pkg = os.path.join(be, "package.json")
+            if os.path.exists(be_pkg):
+                sh("npm install --no-audit --no-fund --loglevel=error", be, 600)
+                try:
+                    with open(be_pkg, "r", encoding="utf-8") as fh:
+                        bpkg = json.load(fh)
+                    bscript = ("start" if "start" in (bpkg.get("scripts") or {})
+                               else "dev" if "dev" in (bpkg.get("scripts") or {}) else None)
+                except Exception:  # noqa: BLE001
+                    bscript = None
+                if bscript:
+                    sh(f"nohup npm run {bscript} > /tmp/backend-dev.log 2>&1 < /dev/null &",
+                       be, 20)
+                    started = True
         if started:
             time.sleep(3)
             crash = shell_run("tail -n 20 /tmp/backend-dev.log 2>/dev/null", be, 15)
