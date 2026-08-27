@@ -735,17 +735,35 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
 
 def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
              max_tokens: int = 16384) -> str:
-    """Text LLM (the swarm's brain). Raises RuntimeError with a readable msg."""
+    """Text LLM (the swarm's brain). Raises RuntimeError with a readable msg.
+
+    EMPTY-CONTENT RETRY: gpt-oss-120b is a reasoning model — occasionally it
+    concludes entirely inside the reasoning channel and returns null content
+    (observed live 2026-08-27: "LLM returned an empty message" killed whole
+    agent runs at step 2). One immediate retry resolves the transient case;
+    real errors (HTTP/auth/model) propagate immediately."""
     body: Dict[str, Any] = {"model": LLM_MODEL, "messages": messages,
                             "temperature": 0, "max_tokens": max_tokens}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
-    try:
-        return _llm_call_impl(body)
-    finally:
-        global _last_llm_done_ts, _last_llm_cost_tokens
-        _last_llm_done_ts = time.time()
-        _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
+    global _last_llm_done_ts, _last_llm_cost_tokens
+    last_err: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            content = _llm_call_impl(body)
+            _last_llm_done_ts = time.time()
+            _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
+            return content
+        except RuntimeError as exc:
+            _last_llm_done_ts = time.time()
+            _last_llm_cost_tokens = _estimate_cost_tokens(messages, max_tokens)
+            if "empty message" in str(exc) and attempt == 0:
+                log.warning("llm returned empty content — retrying once")
+                last_err = exc
+                time.sleep(2)
+                continue
+            raise
+    raise last_err or RuntimeError("LLM failed")
 
 
 def llm_vlm(image_path: str, question: str, max_tokens: int = 420) -> str:
@@ -1062,7 +1080,13 @@ def run_agent_loop(
     for step in range(1, max_steps + 1):
         pace_for_tpm()
         try:
-            reply = llm_chat(_compact_history(messages), json_mode=True,
+            # json_mode is deliberately OFF for agent loops: gpt-oss-120b is a
+            # reasoning model — with response_format=json_object it concludes
+            # into the reasoning channel after the first tool call and returns
+            # EMPTY content on every subsequent turn (observed live: every
+            # agent died at step 2). Without it the model emits proper JSON
+            # content each turn and _extract_json parses it leniently.
+            reply = llm_chat(_compact_history(messages), json_mode=False,
                              max_tokens=max_tokens)
         except Exception as exc:  # noqa: BLE001
             ctx.say(f"{ctx.label} LLM call failed at step {step}: {str(exc)[:200]}")
@@ -1333,7 +1357,7 @@ BACKEND_SYSTEM = """You are the Backend Agent of ArcForge — an autonomous back
 HARD RULES:
 - You NEVER touch frontend/ files and never use a browser. Your world is backend/ + the API contract.
 - The approved plan.md is the binding contract. Implement exactly what it specifies.
-- After your server code works, you MUST publish the integration contract (api_contract_update) so the Frontend Agent can integrate — it is forbidden from guessing your endpoints.
+- YOUR TASK IS NOT DONE until you have called api_contract_update with your EXACT endpoints (method, path, description, response) and port — the Frontend Agent is forbidden from guessing and depends on the contract.
 WORKFLOW: read the plan → write the code (small focused files) → lsp_diagnostics → install deps + start the server via terminal (nohup, background) → smoke-test endpoints with curl → api_contract_update {contract:{base_url,port,endpoints:[{method,path,description,response}]}} → mailbox_send to frontend (contract ready) → done.
 BACKEND CHOICE: Python Flask (requirements.txt + app.py, port 8000, enable CORS for localhost:3000) unless the plan says otherwise.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
@@ -1341,8 +1365,9 @@ If this is a follow-up, preserve existing behaviour — modify only what the tas
 FRONTEND_SYSTEM = """You are the Frontend Agent of ArcForge — an autonomous frontend developer working inside a Linux VM.
 HARD RULES:
 - You NEVER touch backend/ files. Your world is frontend/ (Next.js 14 App Router + TypeScript — the pinned scaffold with deps already exists).
+- FILE LAYOUT (critical): the home page MUST be frontend/app/page.tsx — the Next.js App Router only serves files under frontend/app/ (page.tsx, layout.tsx, route.ts). NEVER create App.tsx, index.tsx, index.html, or src/ — those are NOT served and the app will 404.
 - INTEGRATION LINK (law): you are FORBIDDEN from guessing API URLs. If the plan has a backend, call api_contract_read FIRST and write frontend/lib/api_client.ts from the contract. Every fetch goes through that client.
-- After writing code: lsp_diagnostics (tsc) until clean; start the dev server via terminal: nohup npx next dev -p 3000 -H 0.0.0.0 & ; then VERIFY with browser_tool: navigate http://localhost:3000 → console_spy → fix every error (yours) or report it to the backend agent (mailbox_send: what you called, what you expected, what you got). You cannot report done while console errors exist.
+- After writing code: lsp_diagnostics (tsc) until clean; start the dev server via terminal: nohup npx next dev -p 3000 -H 0.0.0.0 & ; then VERIFY with browser_tool: navigate http://localhost:3000 → console_spy → fix every error (yours) or report it to the backend agent (mailbox_send: what you called, what you expected, what you got). You cannot report done while console errors exist OR while http://localhost:3000 shows a 404.
 UI STANDARDS: inline styles or one <style> tag only (NO .css files); every file using hooks/handlers starts with 'use client'; Next 14 <Link> takes NO nested <a>; no lorem ipsum — realistic copy; responsive; loading + empty states.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
@@ -1368,6 +1393,28 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_backend_toolset(ctx),
                             max_tokens=4500)
+
+    # STRUCTURAL POST-CHECK — the Integration Link is not optional: if the
+    # agent wrote backend code but never published the contract, the
+    # Frontend Agent is stranded (it may not guess endpoints). One pointed
+    # repair round; if it still fails, the fit check/debugger surface it.
+    has_backend_code = any(rel.startswith("backend/") for rel in _iter_source_files())
+    if has_backend_code and not os.path.exists(API_CONTRACT_PATH):
+        ctx.activity("Backend Agent — contract post-check", "active",
+                     "api_contract.json missing — enforcing publication")
+        repair = ("STRUCTURAL CHECK FAILED: you wrote backend code but never "
+                  "published the API contract — the Frontend Agent CANNOT "
+                  "integrate without it. Call api_contract_update NOW with "
+                  "{contract:{base_url,port,endpoints:[{method,path,description,"
+                  "response}]}} describing the server you actually wrote "
+                  "(read your files with read_file if unsure). Then done.")
+        pace_for_tpm()
+        result = run_agent_loop(ctx, system, repair, build_backend_toolset(ctx),
+                                max_steps=6, max_tokens=1800)
+        if not os.path.exists(API_CONTRACT_PATH):
+            ctx.say("Backend Agent: contract STILL missing after enforcement — "
+                    "fit check will report the integration gap")
+
     ctx.activity("Backend Agent — finished", "done",
                  str(result.get("report", ""))[:200])
     ctx.say(f"Backend Agent report: {str(result.get('report',''))[:400]}")
@@ -1400,6 +1447,26 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
     pace_for_tpm()
     result = run_agent_loop(ctx, system, user, build_frontend_toolset(ctx),
                             max_tokens=4500)
+
+    # STRUCTURAL POST-CHECK — Next.js App Router only serves frontend/app/*.
+    # If the agent put the UI anywhere else (App.tsx — observed live: the app
+    # 404'd), one pointed repair round moves it into place.
+    if not fit_check and not os.path.exists(os.path.join(WORKSPACE, "frontend", "app", "page.tsx")):
+        stray = [rel for rel in _iter_source_files()
+                 if rel.startswith("frontend/") and not rel.startswith("frontend/app/")
+                 and rel.endswith((".tsx", ".ts")) and "lib/" not in rel and "components/" not in rel]
+        ctx.activity("Frontend Agent — layout post-check", "active",
+                     "frontend/app/page.tsx missing — the app would 404")
+        repair = ("STRUCTURAL CHECK FAILED: frontend/app/page.tsx does not "
+                  "exist, so Next.js serves a 404 at '/'. The App Router ONLY "
+                  "serves files under app/ (page.tsx per route). "
+                  + (f"You wrote the UI into {', '.join(stray[:3])} — that is NOT served. " if stray else "")
+                  + "Create frontend/app/page.tsx now with the full home page "
+                    "(you may import your existing components), then done.")
+        pace_for_tpm()
+        result = run_agent_loop(ctx, system, repair, build_frontend_toolset(ctx),
+                                max_steps=6, max_tokens=4000)
+
     ctx.activity("Frontend Agent — finished", "done",
                  str(result.get("report", ""))[:200])
     ctx.say(f"Frontend Agent report: {str(result.get('report',''))[:400]}")
