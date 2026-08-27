@@ -39,7 +39,7 @@ from app.daytona_client import (
     get_daytona,
 )
 from app.models import CodeRunResult
-from app.services.quota_reaper import is_quota_error, reap_idle_workspaces
+from app.services.quota_reaper import is_quota_error, reap_idle_workspaces, force_free_quota
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,15 @@ class DaytonaWorkspaceManager:
             # sandboxes silently ate 8/10 GiB of org memory quota and every
             # new workspace failed with HTTP 500 — surfaced to users as
             # "the studio page doesn't connect".
+            #
+            # Incident 2026-08-27 ("sandbox is full, again"): the idle reap
+            # alone was not enough — the backend tunnel sweeper kept every
+            # sandbox's lastActivityAt permanently fresh, so the reaper
+            # found NOTHING idle and the retry failed again. When that
+            # happens, fall back to force_free_quota: delete the OLDEST
+            # workspace sandboxes (never this user's own) and retry one
+            # final time. A quota-blocked NEW build must not lose to
+            # abandoned corpses.
             if is_quota_error(exc):
                 logger.warning(
                     "Sandbox creation rejected by an org quota limit (%s) — "
@@ -163,6 +172,17 @@ class DaytonaWorkspaceManager:
                     except Exception as retry_exc:
                         exc = retry_exc
                         sandbox = None
+                if sandbox is None:
+                    freed = await force_free_quota(exclude_user_id=user_id)
+                    if freed:
+                        try:
+                            sandbox = await asyncio.to_thread(
+                                daytona.create, params=params,
+                                timeout=settings.daytona_default_timeout,
+                            )
+                        except Exception as force_retry_exc:
+                            exc = force_retry_exc
+                            sandbox = None
             # create() raises "entered error state" when the sandbox fails to
             # boot during the SDK's wait — the sandbox STILL EXISTS server-side
             # as an Error corpse holding CPU quota. Look it up by its unique

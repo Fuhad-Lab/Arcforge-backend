@@ -46,6 +46,21 @@ class Settings(BaseSettings):
     default_disk: str = "10Gi"
     sandbox_idle_timeout_seconds: int = 1800  # 30 minutes
 
+    # --- Quota hygiene (incident 2026-08-27: "sandbox is full, again") ---
+    # The quota reaper's periodic schedule MUST be LONGER than
+    # sandbox_idle_timeout_seconds: every Daytona list/read refreshes
+    # lastActivityAt for the listed sandboxes (asynchronously), so a reaper
+    # that lists more often than the idle threshold would keep every
+    # sandbox looking fresh and never reap anything (self-poisoning).
+    reaper_interval_seconds: int = 2100  # 35 minutes > 1800s idle timeout
+    reaper_first_run_delay_seconds: int = 90
+    # Absolute lifetime cap for workspace sandboxes regardless of activity
+    # (immune to lastActivityAt poisoning). 0 disables the cap.
+    sandbox_max_lifetime_seconds: int = 43200  # 12 hours
+    # How many oldest sandboxes the emergency force-free path may delete
+    # when a quota-blocked creation must not fail (never the requester's own).
+    quota_force_free_max: int = 3
+
     # --- Module 3 Browser Engine (Playwright-in-VM) ---
     browser_install_timeout_s: int = 300   # max time to install Chromium (~150MB download + deps)
     browser_audit_timeout_s: int = 120     # max time for one audit run (launch + goto + screenshot)

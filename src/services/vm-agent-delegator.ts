@@ -40,6 +40,7 @@
  */
 import { getAgentInfo } from "./daytona-workspace";
 import { ensureReverseTunnel, isReverseTunnelConnected } from "./reverse-tunnel-client";
+import { markVmDelegationActive, markVmDelegationIdle } from "./vm-delegation-registry";
 import { logger } from "../lib/logger";
 
 // ─── Configuration ──────────────────────────────────────────────────────
@@ -235,6 +236,20 @@ function emitStateActivity(
 
 // ─── Main delegator ─────────────────────────────────────────────────────
 export async function delegateGenerationToVmAgent(opts: DelegationOpts): Promise<DelegationResult> {
+  // Register the in-flight delegation so the tunnel sweeper keeps this
+  // sandbox's reverse tunnel eligible (and never parks/reaps it mid-build).
+  // EVERY exit path — including the early failure returns below — clears
+  // the mark via finally, otherwise a failed build would keep the sandbox
+  // protected from quota hygiene forever.
+  markVmDelegationActive(opts.sandboxId);
+  try {
+    return await delegateGenerationInner(opts);
+  } finally {
+    markVmDelegationIdle(opts.sandboxId);
+  }
+}
+
+async function delegateGenerationInner(opts: DelegationOpts): Promise<DelegationResult> {
   const { sandboxId, prompt, emit } = opts;
   const started = Date.now();
 

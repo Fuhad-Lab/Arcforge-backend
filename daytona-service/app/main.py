@@ -5,9 +5,10 @@ Wires together routers, middleware, and lifecycle hooks.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
 from fastapi import FastAPI
@@ -23,6 +24,7 @@ from app.routers import (
     sandboxes,
     workspace,
 )
+from app.services.quota_reaper import reap_forever
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,7 +53,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.service_version,
         settings.debug,
     )
+    # Quota hygiene (incident 2026-08-27 "sandbox is full, again"): the
+    # reaper existed but was NEVER SCHEDULED — dead code. Idle workspace
+    # sandboxes accumulated until the 10 GiB org quota was exhausted and
+    # every new build failed. The interval (default 35 min) deliberately
+    # exceeds sandbox_idle_timeout_seconds (30 min) so the reaper's own
+    # list() calls cannot self-poison the idle clock (see quota_reaper).
+    reaper_task = asyncio.create_task(reap_forever())
     yield
+    reaper_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await reaper_task
     logger.info("Shutting down %s", settings.service_name)
 
 

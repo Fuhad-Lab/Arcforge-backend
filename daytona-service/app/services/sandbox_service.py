@@ -27,7 +27,7 @@ from app.daytona_client import (
     extract_sandbox_data,
     get_daytona,
 )
-from app.services.quota_reaper import is_quota_error, reap_idle_workspaces
+from app.services.quota_reaper import is_quota_error, reap_idle_workspaces, force_free_quota
 from app.models import (
     BulkActionResponse,
     CreateSandboxRequest,
@@ -113,6 +113,14 @@ async def create_sandbox(req: CreateSandboxRequest) -> SandboxResponse:
                 "reaping idle workspaces and retrying once", exc,
             )
             reaped = await reap_idle_workspaces()
+            if not reaped:
+                # Idle reap freed nothing (idle clocks can be kept fresh by
+                # external probes — see quota_reaper). Emergency fallback:
+                # delete the OLDEST workspace sandboxes (never the
+                # requester's own, which may be mid-build) and retry once.
+                requester = (req.labels or {}).get("user_id")
+                freed = await force_free_quota(exclude_user_id=requester)
+                reaped = reaped or freed
             if not reaped:
                 logger.exception("Failed to create sandbox (quota exhausted, nothing reaped)")
                 raise _wrap("sandbox creation", exc) from exc

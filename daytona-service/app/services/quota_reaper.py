@@ -96,9 +96,12 @@ async def reap_idle_workspaces(
 ) -> list[str]:
     """Delete idle workspace sandboxes to free org quota.
 
-    Deletes any sandbox labeled type=workspace that is EITHER:
+    Deletes any sandbox labeled type=workspace that is ANY of:
       - in Error state (a boot corpse holding quota), or
-      - idle (last_activity_at older than min_age_seconds).
+      - idle (last_activity_at older than min_age_seconds), or
+      - older than sandbox_max_lifetime_seconds since CREATION (an
+        absolute cap immune to lastActivityAt poisoning — see the
+        incident note below).
 
     Never touches sandboxes without the workspace label, and never
     touches recently-active workspaces. Returns the ids deleted.
@@ -106,6 +109,7 @@ async def reap_idle_workspaces(
     min_age = min_age_seconds if min_age_seconds is not None else int(
         settings.sandbox_idle_timeout_seconds
     )
+    max_lifetime = int(settings.sandbox_max_lifetime_seconds)
     daytona = get_daytona()
 
     def _list_all() -> list[Any]:
@@ -133,6 +137,11 @@ async def reap_idle_workspaces(
             reason = "error-state corpse"
         elif _is_idle(sbx, now, min_age):
             reason = f"idle > {min_age}s"
+        elif max_lifetime > 0 and _is_older_than(sbx, now, max_lifetime):
+            # Absolute lifetime cap: catches sandboxes whose lastActivityAt
+            # is kept artificially fresh by periodic probes (see the sweeper
+            # incident) — creation time cannot be refreshed by anyone.
+            reason = f"created > {max_lifetime}s ago (lifetime cap)"
         else:
             continue  # Healthy and recently active — keep it.
 
@@ -148,3 +157,100 @@ async def reap_idle_workspaces(
     if not reaped:
         logger.info("Reaper: nothing to delete (%d sandboxes scanned)", len(sandboxes))
     return reaped
+
+
+async def reap_forever() -> None:
+    """Periodic reaping loop — scheduled from app.main's lifespan.
+
+    Runs every settings.reaper_interval_seconds (default 35 min), which
+    MUST exceed sandbox_idle_timeout_seconds: each run's list() call
+    refreshes every sandbox's lastActivityAt server-side (verified live),
+    so listing more often than the idle threshold would reset the very
+    clock the idle rule depends on (self-poisoning) and nothing would
+    ever look idle again.
+    """
+    interval = max(60, int(settings.reaper_interval_seconds))
+    delay = max(5, int(settings.reaper_first_run_delay_seconds))
+
+    async def _run() -> None:
+        try:
+            reaped = await reap_idle_workspaces()
+            if reaped:
+                logger.warning("Reaper loop: deleted %d idle sandbox(es)", len(reaped))
+        except Exception:
+            logger.exception("Reaper loop: run failed")
+
+    await asyncio.sleep(delay)
+    while True:
+        await _run()
+        await asyncio.sleep(interval)
+
+
+def _is_older_than(sandbox: Any, now: datetime, max_age_s: int) -> bool:
+    """True when the sandbox was CREATED more than max_age_s ago.
+
+    Creation time is the one clock nobody can refresh — the reliable
+    backstop when lastActivityAt is being kept fresh by external probes.
+    """
+    created = _parse_iso(getattr(sandbox, "created_at", None))
+    if created is None:
+        return False
+    age = (now - created.astimezone(timezone.utc)).total_seconds()
+    return age >= max_age_s
+
+
+async def force_free_quota(exclude_user_id: str | None = None) -> list[str]:
+    """EMERGENCY quota release for quota-blocked sandbox creation.
+
+    Deletes the OLDEST workspace sandboxes (by created_at) — never any
+    labeled with exclude_user_id (the requesting user's own sandboxes,
+    which may be mid-build) — up to settings.quota_force_free_max.
+
+    Only invoked after reap_idle_workspaces() failed to free enough
+    quota for a retry to succeed: the alternative is failing the user's
+    NEW build while corpses hold the org quota hostage. Oldest-first
+    minimizes the chance of hitting an in-flight build (builds are
+    minutes old, corpses are hours old).
+    """
+    max_deletes = max(0, int(settings.quota_force_free_max))
+    if max_deletes == 0:
+        return []
+
+    daytona = get_daytona()
+
+    def _list_all() -> list[Any]:
+        return list(daytona.list())
+
+    try:
+        sandboxes = await asyncio.to_thread(_list_all)
+    except Exception:
+        logger.exception("force_free_quota: failed to list sandboxes")
+        return []
+
+    candidates: list[tuple[datetime, Any, str]] = []
+    for sbx in sandboxes:
+        labels = getattr(sbx, "labels", None) or {}
+        if labels.get("type") != "workspace":
+            continue
+        if exclude_user_id and labels.get("user_id") == exclude_user_id:
+            continue  # Never free the requester's own sandboxes.
+        created = _parse_iso(getattr(sbx, "created_at", None))
+        if created is None:
+            continue
+        candidates.append((created.astimezone(timezone.utc), sbx, str(getattr(sbx, "id", "?"))))
+
+    # Oldest first.
+    candidates.sort(key=lambda c: c[0])
+
+    freed: list[str] = []
+    for _created, sbx, sbx_id in candidates[:max_deletes]:
+        try:
+            await asyncio.to_thread(daytona.delete, sbx, 60, False)
+            freed.append(sbx_id)
+            logger.warning(
+                "force_free_quota: deleted sandbox %s (%s) — quota-blocked creation",
+                sbx_id, getattr(sbx, "name", "?"),
+            )
+        except Exception:
+            logger.exception("force_free_quota: failed to delete sandbox %s", sbx_id)
+    return freed
