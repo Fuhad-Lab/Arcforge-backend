@@ -73,9 +73,12 @@ THE DEBUGGER tool audits the live app against plan.md FEATURE BY
 FEATURE and reports exactly WHAT IS MISSING (a plan-coverage
 checklist, not just errors). The chief receives that checklist and
 DECIDES which of its tools builds each gap; crash-class evidence rides
-to the owner verbatim. The cycle continues until the app matches the
-approved plan — or budgets end, in which case the honest-fail verdict
-names the remaining gaps.
+to the owner verbatim. The cycle continues until the app MATCHES the
+approved plan — there is NO fixed round cap (v5). It ends early only
+when progress PROVABLY stops — the same gap signature across
+consecutive QA rounds surviving ONE context escalation — or the
+wall-clock guard trips; then the honest-fail verdict names the
+remaining gaps.
 
 Browser Vision Engine (vm_browser.py): Playwright bridge with
 navigate / console_spy / interact / screenshot (+ VLM review through the
@@ -220,13 +223,27 @@ LOG_FILE = os.environ.get("ORCH_LOG_FILE", os.path.join(SYSTEM_DIR, "orchestrato
 # Build-graph tuning
 APPROVAL_TIMEOUT_S = float(os.environ.get("ORCH_APPROVAL_TIMEOUT_S", str(6 * 3600)))
 # Agent-loop step budget: the agent model is thorough but ~60-100s/call —
-# these caps keep a single agent run inside ~15-20 min worst case.
+# this keeps a single agent run inside ~15-20 min worst case.
 AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "14"))
-DEBUG_MAX_ROUNDS = int(os.environ.get("ORCH_DEBUG_MAX_ROUNDS", "3"))
-# The dispatcher budget: total sub-agent invocations (builds + fixes) one
-# task may consume before the graph forces the QA gate / an honest finish.
+# v5 CONVERGENCE (user-mandated 2026-08-27): the QA loop has NO fixed
+# round cap. It runs until the debugger's OBSERVATION of the live app
+# MATCHES plan.md. Early exit only when progress PROVABLY stops:
+#   * stagnation — the SAME gap signature across consecutive QA rounds,
+#     surviving ONE context escalation (which mandates a different
+#     approach), or
+#   * the wall-clock safety net (default 45 min — several multiples of a
+#     healthy run, so only a genuinely stuck loop ever sees it).
+CONVERGE_MAX_S = float(os.environ.get("ORCH_CONVERGE_MAX_S", "2700"))
+CONVERGE_STAGNATION = int(os.environ.get("ORCH_CONVERGE_STAGNATION", "2"))
+# Graph super-step budget: each QA round costs ~4 super-steps (chief →
+# fix tool → chief → debugger), so 240 supports ~50 convergence rounds —
+# never the binding constraint.
+GRAPH_RECURSION_LIMIT = int(os.environ.get("ORCH_GRAPH_RECURSION_LIMIT", "240"))
+# The dispatcher budget bounds the BUILD phase (the dispatcher LLM's fresh
+# build decisions). Fix dispatches from failed QA rounds do NOT consume
+# it — those are bounded by the convergence safety nets above, so the
+# loop can run as many QA rounds as real progress justifies.
 MAX_DISPATCHES = int(os.environ.get("ORCH_MAX_DISPATCHES", "8"))
-MAX_FIXES = int(os.environ.get("ORCH_MAX_FIXES", "6"))
 # LSP daemon timeouts (first tsserver load is slow — later calls are fast).
 LSP_INIT_TIMEOUT_S = float(os.environ.get("ORCH_LSP_INIT_TIMEOUT_S", "45"))
 LSP_DIAG_TIMEOUT_S = float(os.environ.get("ORCH_LSP_DIAG_TIMEOUT_S", "30"))
@@ -2721,8 +2738,13 @@ class ChiefAgent:
                  {"role": "user", "content": user}],
                 json_mode=False, max_tokens=900, model=CHIEF_MODELS).strip()
         except Exception:  # noqa: BLE001
-            return (f"{plan_title} — the build is finished. End-to-end "
-                    f"verification: {verdict}. Open the preview to try it.")
+            if verdict == "pass":
+                return (f"{plan_title} — the build is finished and verified "
+                        "end to end against the approved plan. Open the "
+                        "preview to try it.")
+            return (f"{plan_title} — I'm not fully done yet. Open the preview "
+                    "to try what's there, and tell me to continue and I'll "
+                    "pick up where I left off.")
 
 
 # ---------------------------------------------------------------------------
@@ -2829,6 +2851,12 @@ class AgentState(TypedDict, total=False):
     debug_pending: bool               # fixes applied — QA re-run is due
     debug_rounds: int
     repairs: int
+    # v5 convergence tracking (NO fixed round cap — see CONVERGE_*):
+    last_gap_sig: str                  # signature of the last QA gap set
+    stagnation: int                    # consecutive identical gap signatures
+    escalated: bool                    # escalation context already injected
+    converge_started: float            # wall-clock anchor for the safety net
+    stop_reason: str                   # matched|stagnation|budget|no_gaps|''
     # outcome
     verdict: str                      # pass | fail
     missing: List[Dict[str, Any]]     # the debugger's plan-gap checklist
@@ -3050,8 +3078,23 @@ def _dispatch_guardrails(state: Dict[str, Any],
     return tool, task
 
 
+def _gap_signature(debug: Dict[str, Any]) -> str:
+    """Signature of a QA result's gap set. IDENTICAL signatures across
+    consecutive QA rounds mean the dispatched fixes changed nothing — that
+    is the stagnation the v5 safety nets key on (a CHANGING gap set is
+    progress, and progress never stops the loop)."""
+    feats = sorted(str(m.get("feature", "")).strip().lower()[:60]
+                   for m in (debug.get("missing") or [])
+                   if isinstance(m, dict))
+    obs = sorted(str(i.get("observation", "")).strip()[:60]
+                 for i in (debug.get("issues") or [])
+                 if isinstance(i, dict))
+    return "|".join(f for f in feats if f) + "#" + "|".join(o for o in obs if o)
+
+
 def _fix_delegations(task_id: str, plan_text: str,
-                     debug_report: Dict[str, Any]) -> List[Dict[str, str]]:
+                     debug_report: Dict[str, Any],
+                     escalated: bool = False) -> List[Dict[str, str]]:
     """QA failed → THE CHIEF DECIDES which tool builds what's missing.
     CRASH-CLASS evidence (live-server errors: 500s, tracebacks) rides
     verbatim to the owning tool (live-proven: a lossy rephrase fixed
@@ -3127,7 +3170,20 @@ def _fix_delegations(task_id: str, plan_text: str,
                 plan_text, {"status": "fail", "issues": vague,
                             "missing": []},
                 mailbox_db_read(task_id, "chief"))
-    return delegations[:MAX_FIXES]
+    if escalated:
+        for d in delegations:
+            d["task"] = (str(d["task"])
+                         + "\n\nESCALATION: previous fix rounds did NOT "
+                           "close this gap — the SAME feature is still "
+                           "missing from the live app, so the approach taken "
+                           "before did not work. Take a DIFFERENT approach "
+                           "(new file, new route, different component "
+                           "structure) and confirm it renders in the browser "
+                           "before reporting done.")
+    # Per-ROUND bound only (each failed QA round re-triages from scratch).
+    # This is NOT a run cap: the run converges until the observation
+    # matches plan.md (v5).
+    return delegations[:6]
 
 
 # -- The nodes ----------------------------------------------------------------
@@ -3150,7 +3206,14 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
        (crash-class evidence rides verbatim to its owner);
     3. QA re-run is due after fixes (debug_pending);
     4. otherwise — the agent_dispatcher LLM decides the next tool call.
-    The node returns only state DELTAS (merged by the engine)."""
+    The node returns only state DELTAS (merged by the engine).
+
+    v5 CONVERGENCE: there is NO fixed QA-round or fix cap. The loop runs
+    until the debugger's observation of the live app MATCHES plan.md. It
+    ends early only when progress provably stops — the same gap
+    signature across consecutive QA rounds surviving ONE context
+    escalation — or the wall-clock guard trips; then the honest-fail
+    verdict names the remaining gaps."""
     task_id = str(state.get("task_id", ""))
     plan_text = str(state.get("plan", ""))
     reports = dict(state.get("reports") or {})
@@ -3160,6 +3223,19 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
     repairs = int(state.get("repairs") or 0)
     verdict = str(state.get("verdict") or "")
     update: Dict[str, Any] = {}
+
+    # 0) v5 wall-clock safety net — no NEW dispatches once the convergence
+    #    budget is spent (a draining fix queue is allowed to finish only
+    #    while time remains; the honest-fail path names what remains).
+    started = float(state.get("converge_started") or 0) or time.time()
+    if ((fix_queue or verdict == "fail")
+            and time.time() - started > CONVERGE_MAX_S):
+        append_log(task_id, "chief", "warn",
+                   f"convergence budget spent ({CONVERGE_MAX_S:.0f}s) after "
+                   f"{debug_rounds} QA rounds / {repairs} fix dispatches — "
+                   "reporting honestly")
+        return {"next_agent": "end", "verdict": verdict or "fail",
+                "debug_pending": False, "stop_reason": "budget"}
 
     # 1) Pending fixes from a triaged QA failure — next one, now.
     if fix_queue:
@@ -3178,31 +3254,48 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return update
 
     # 2) Fresh QA failure → the debugger's missing-features checklist goes
-    #    to the chief, which decides which tool builds what (or an honest
-    #    finish when budgets are spent).
+    #    to the chief, which decides which tool builds what. v5: NOT a
+    #    round-capped loop — stagnation (identical gap signature surviving
+    #    one escalation) is the only no-progress exit besides the budget.
     if verdict == "fail":
-        if debug_rounds >= DEBUG_MAX_ROUNDS or repairs >= MAX_FIXES:
-            update.update({"next_agent": "end", "verdict": verdict,
-                           "debug_pending": False})
-            append_log(task_id, "chief", "info",
-                       f"stopping after {debug_rounds} QA rounds / {repairs} "
-                       "fixes — reporting honestly")
-            return update
+        stagnation = int(state.get("stagnation") or 0)
+        escalated = bool(state.get("escalated"))
+        if stagnation >= CONVERGE_STAGNATION:
+            if not escalated:
+                escalated = True
+                stagnation = 0
+                append_log(task_id, "chief", "warn",
+                           f"the same gaps persisted across "
+                           f"{CONVERGE_STAGNATION + 1} QA rounds — escalating "
+                           "(mandating a different approach); NOT stopping")
+            else:
+                append_log(task_id, "chief", "warn",
+                           "no progress after escalation — reporting honestly")
+                return {"next_agent": "end", "verdict": verdict,
+                        "debug_pending": False,
+                        "stop_reason": "stagnation"}
         debug = reports.get("debugger") or {}
-        delegations = _fix_delegations(task_id, plan_text, debug)
+        delegations = _fix_delegations(task_id, plan_text, debug, escalated)
         if not delegations:
-            update.update({"next_agent": "end", "verdict": verdict,
-                           "debug_pending": False})
             append_log(task_id, "chief", "info",
                        "QA failed with no actionable gaps — reporting honestly")
-            return update
+            return {"next_agent": "end", "verdict": verdict,
+                    "debug_pending": False, "stop_reason": "no_gaps"}
         nxt = delegations.pop(0)
         dispatches.append(nxt["agent"])
+        feats = "; ".join(str(m.get("feature", "?"))[:50]
+                          for m in (debug.get("missing") or [])[:4])
+        gaps_txt = feats or "see issues"
+        append_log(task_id, "chief", "info",
+                   f"QA round {debug_rounds} failed (gaps: {gaps_txt}) — "
+                   "dispatching fixes; no round cap: converging until the "
+                   "app matches the plan")
         update.update({
             "verdict": "",  # consumed — fresh verdict comes from the QA re-run
             "debug_pending": True,
             "fix_queue": delegations, "dispatches": dispatches,
             "repairs": repairs + 1,
+            "escalated": escalated, "stagnation": stagnation,
             "next_agent": nxt["agent"], "dispatch_task": nxt["task"],
             "repo_map": generate_repo_map(),
             "file_system_state": file_system_state(task_id),
@@ -3214,7 +3307,8 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # 3) QA passed → finish.
     if verdict == "pass":
-        return {"next_agent": "end", "debug_pending": False}
+        return {"next_agent": "end", "debug_pending": False,
+                "stop_reason": "matched"}
 
     # 4) Fixes are applied (or nothing failed) and QA is due → run it.
     if state.get("debug_pending"):
@@ -3296,7 +3390,9 @@ def fit_check_node(state: Dict[str, Any]) -> Dict[str, Any]:
 def debugger_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """The QA gate: E2E verification against the approved plan. PASS → the
     graph ends; FAIL → back to the chief for triage (deterministic issues
-    ride verbatim)."""
+    ride verbatim). Also stamps the round's gap signature — identical
+    signatures across consecutive rounds are the stagnation the v5 safety
+    nets key on."""
     task_id = str(state.get("task_id", ""))
     reports = dict(state.get("reports") or {})
     set_status("active", {"state": "verifying",
@@ -3305,10 +3401,15 @@ def debugger_node(state: Dict[str, Any]) -> Dict[str, Any]:
     emit({"type": "status", "status": get_status("active")})
     debug = run_debugger_agent(task_id, str(state.get("plan", "")))
     reports["debugger"] = debug
+    sig = _gap_signature(debug)
+    prev_sig = str(state.get("last_gap_sig") or "")
+    stagnation = (int(state.get("stagnation") or 0) + 1
+                  if (sig and sig == prev_sig) else 0)
     return {"reports": reports, "verdict": str(debug.get("status", "fail")),
             "issues": debug.get("issues") or [],
             "missing": debug.get("missing") or [],
-            "debug_rounds": int(state.get("debug_rounds") or 0) + 1}
+            "debug_rounds": int(state.get("debug_rounds") or 0) + 1,
+            "last_gap_sig": sig, "stagnation": stagnation}
 
 
 def _route_from_chief(state: Dict[str, Any]) -> str:
@@ -3366,6 +3467,11 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
         "debug_pending": False,
         "debug_rounds": 0,
         "repairs": 0,
+        "last_gap_sig": "",
+        "stagnation": 0,
+        "escalated": False,
+        "converge_started": time.time(),
+        "stop_reason": "",
         "dispatch_budget": MAX_DISPATCHES,
         "verdict": "",
         "issues": [],
@@ -3373,7 +3479,8 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
     }
     graph = build_swarm_graph()
     try:
-        final = graph.invoke(initial, config={"recursion_limit": 80})
+        final = graph.invoke(initial,
+                             config={"recursion_limit": GRAPH_RECURSION_LIMIT})
     except Exception as exc:  # noqa: BLE001 — the graph never fails the task
         log.exception("build graph error (task %s)", task_id)
         append_log(task_id, "orchestrator", "error", f"graph error: {exc}")
@@ -3397,6 +3504,16 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
         "summary": summary,
         "verdict": verdict,
         "repairs": int(final.get("repairs") or 0),
+        # v5 convergence telemetry — how the run ended. stop_reason is
+        # "matched" when the debugger's observation matched plan.md; the
+        # safety nets (stagnation / budget / no_gaps) only trip when
+        # progress provably stopped.
+        "convergence": {
+            "qa_rounds": int(final.get("debug_rounds") or 0),
+            "stop_reason": str(final.get("stop_reason") or "")
+                           or ("matched" if verdict == "pass" else "ended"),
+            "escalated": bool(final.get("escalated")),
+        },
         "plan": plan_text,
         # The honest-fail contract: name exactly what's still missing.
         "missing": [m for m in ((reports.get("debugger") or {})
