@@ -480,7 +480,7 @@ def approval_get(task_id: str) -> Optional[Dict[str, Any]]:
 # -- agent mailbox (the Twins' communication channel) -------------------------
 
 
-def mailbox_send(task_id: str, from_agent: str, to_agent: str, message: str) -> None:
+def mailbox_db_send(task_id: str, from_agent: str, to_agent: str, message: str) -> None:
     with _db_lock, db() as conn:
         conn.execute(
             "INSERT INTO agent_mailbox (ts, task_id, from_agent, to_agent, message) "
@@ -489,7 +489,7 @@ def mailbox_send(task_id: str, from_agent: str, to_agent: str, message: str) -> 
         )
 
 
-def mailbox_read(task_id: str, agent: str) -> List[Dict[str, Any]]:
+def mailbox_db_read(task_id: str, agent: str) -> List[Dict[str, Any]]:
     with _db_lock, db() as conn:
         rows = conn.execute(
             "SELECT ts, from_agent, to_agent, message FROM agent_mailbox "
@@ -1307,6 +1307,8 @@ def _skills_toolset(role: str) -> Dict[str, Callable[[Dict[str, Any]], Dict[str,
 
 
 def _mailbox_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    # NOTE: the DB helpers are mailbox_db_send/mailbox_db_read — the tool
+    # fns below intentionally shadow the short names without breaking them.
     def mailbox_send(a: Dict[str, Any]) -> Dict[str, Any]:
         to = str(a.get("to") or "").strip().lower()
         if to not in ("backend", "frontend", "chief"):
@@ -1314,10 +1316,11 @@ def _mailbox_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], 
         msg = str(a.get("message") or a.get("text") or "").strip()
         if not msg:
             return {"ok": False, "error": "message required"}
-        mailbox_send(ctx.task_id, ctx.agent_name, to, msg)
+        mailbox_db_send(ctx.task_id, ctx.agent_name, to, msg)
         return {"ok": True, "delivered_to": to}
+
     def mailbox_read(_: Dict[str, Any]) -> Dict[str, Any]:
-        msgs = mailbox_read(ctx.task_id, ctx.agent_name)
+        msgs = mailbox_db_read(ctx.task_id, ctx.agent_name)
         return {"ok": True, "messages": msgs[-10:]}
     return {"mailbox_send": mailbox_send, "mailbox_read": mailbox_read}
 
@@ -1345,7 +1348,7 @@ def build_backend_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, An
         os.makedirs(os.path.dirname(API_CONTRACT_PATH), exist_ok=True)
         with open(API_CONTRACT_PATH, "w", encoding="utf-8") as fh:
             json.dump(contract, fh, indent=2)
-        mailbox_send(ctx.task_id, "backend", "frontend",
+        mailbox_db_send(ctx.task_id, "backend", "frontend",
                      "API CONTRACT PUBLISHED — read it with api_contract_read.")
         ctx.activity("Backend Agent — published api_contract.json", "done")
         return {"ok": True, "path": ".system/api_contract.json"}
@@ -1663,7 +1666,8 @@ The data model and EVERY API endpoint the backend will expose (method, path, pur
 File layout: frontend/ (Next.js 14 App Router + TypeScript — mandated) and backend/ (your chosen language/framework, only if needed).
 ## Acceptance Criteria
 Numbered, concrete, testable statements the Debugger will click through on the live app (e.g. "1. Typing text and pressing Add creates a new item in the list").
-Rules: specific enough to build from; no code; keep it under ~90 lines."""
+Rules: specific enough to build from; no code; keep it under ~90 lines.
+RUNTIME CONSTRAINTS (hard): the app runs inside a single Linux VM — a backend, if needed, must be Python Flask or Node Express with in-memory storage or SQLite ONLY (no MongoDB/Postgres/Redis or any external service — none exist in the VM). The frontend is Next.js 14 App Router + TypeScript, always."""
 
 CHIEF_REFINE_SYSTEM = """You are the Chief Agent of ArcForge. The user read your proposed plan and REJECTED it with change requests. Apply their changes and produce the FULL revised plan (same structure: Overview / Pages & UI / Data & API / Components / Acceptance Criteria). Keep everything they did NOT ask to change intact. The revised plan goes back to the user for approval."""
 
@@ -1916,7 +1920,7 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
     reports["fit_check"] = fit
     # Backend repairs requested via the mailbox during the fit check
     for _ in range(2):
-        backend_fix_msgs = mailbox_read(task_id, "backend")
+        backend_fix_msgs = mailbox_db_read(task_id, "backend")
         if not backend_fix_msgs:
             break
         repairs += 1
@@ -1940,7 +1944,7 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
             break
         set_active("swarm", f"triaging failures (round {round_no})")
         delegations = chief.triage(plan_text, debug,
-                                   mailbox_read(task_id, "chief"))
+                                   mailbox_db_read(task_id, "chief"))
         if not delegations:
             break
         for d in delegations:
