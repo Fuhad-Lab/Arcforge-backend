@@ -339,24 +339,40 @@ class AgentInstaller:
             # 5) Launch: PM2 preferred (manages BOTH tunnel-client +
             #    agent-brain), watchdog fallback. Both source the env file
             #    so the token/tunnel/LLM config never appears in `ps`.
-            # 4.5) BROWSER VISION ENGINE + LSP tooling (background, never
-            #      blocks the daemon): Playwright + Chromium for the
-            #      browser_tool (navigate/console_spy/interact/screenshot)
-            #      and pyflakes as the Python LSP diagnostics engine.
-            #      Best-effort — browser_tool degrades gracefully until ready.
+            # 4.5) THE AGENT TOOLBELT (background, never blocks the daemon):
+            #      · Playwright + Chromium — browser_tool (navigate/
+            #        console_spy/interact/screenshot)
+            #      · pyflakes — Python lint fallback
+            #      · langgraph + tree-sitter — the StateGraph orchestration
+            #        engine + repo-mapper (the daemon ships an identical
+            #        built-in engine + regex fallback until these land)
+            #      · typescript-language-server / pyright / bash-language-
+            #        server — real LSP daemons for verify_file (CLI cascade
+            #        answers until they land)
+            #      Best-effort — every layer degrades gracefully.
             try:
                 await asyncio.to_thread(
                     sandbox.process.exec,
-                    "nohup bash -c 'pip install --quiet --disable-pip-version-check "
+                    "nohup bash -c '"
+                    "pip install --quiet --disable-pip-version-check "
                     "playwright pyflakes 2>/dev/null; "
+                    "pip install --quiet --disable-pip-version-check "
+                    "langgraph tree-sitter 2>/dev/null && "
+                    "(pip install --quiet --disable-pip-version-check "
+                    "tree-sitter-languages 2>/dev/null || "
+                    "pip install --quiet --disable-pip-version-check "
+                    "tree-sitter-language-pack 2>/dev/null) || true; "
+                    "npm install -g typescript-language-server pyright "
+                    "bash-language-server >/dev/null 2>&1 || true; "
                     "python3 -m playwright install chromium --with-deps "
                     "> /home/daytona/.system/playwright-install.log 2>&1' "
-                    "> /dev/null 2>&1 < /dev/null &",
+                    "> /home/daytona/.system/toolbelt-install.log 2>&1 "
+                    "< /dev/null &",
                     "/home/daytona", None, 10,
                 )
-                logger.info("sidecar: browser engine install launched in background")
+                logger.info("sidecar: agent toolbelt install launched in background")
             except Exception as exc:  # noqa: BLE001
-                logger.info("sidecar: browser engine background install skipped: %s", exc)
+                logger.info("sidecar: agent toolbelt background install skipped: %s", exc)
 
             launch = (
                 # idempotent: stop any previous supervisor + daemons

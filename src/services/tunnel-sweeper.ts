@@ -104,8 +104,15 @@ async function probeDaemonState(
       signal: controller.signal,
     });
     if (!res.ok) return null;
-    const body = (await res.json()) as { state?: string };
-    return typeof body.state === "string" ? body.state : null;
+    // /status returns { active: { state } } — a top-level "state" never
+    // existed (live bug: every healthy daemon read as unreachable → parked
+    // + tunnel cut after 3 sweeps, even mid-build).
+    const body = (await res.json()) as {
+      state?: string;
+      active?: { state?: string };
+    };
+    const state = body.active?.state ?? body.state;
+    return typeof state === "string" ? state : null;
   } catch {
     return null;
   } finally {
