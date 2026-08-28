@@ -3044,7 +3044,7 @@ def ensure_servers_up(task_id: str) -> Dict[str, Any]:
 
 CHIEF_CLASSIFY_SYSTEM = """You are ArcForge — the user's build agent. Your FIRST job is routing their message:
 - "answer": a question / chat / explanation that needs NO code changes (e.g. "What is React?", "Why use TypeScript?"). You answer it directly — the build pipeline does NOT run.
-- "clarify": the request is missing a decision ONLY the user can make (which database, which provider, public or private, which of two directions) — and guessing would build the wrong thing. Ask ONE precise question with concrete options. Do NOT guess.
+- "clarify": the request is missing a decision ONLY the user can make (which database, which provider, public or private, which of two directions) — and guessing would build the wrong thing. This INCLUDES any request where the user explicitly tells you to ask them first, check with them, or wait for their choice. Ask ONE precise question with concrete options. Do NOT guess.
 - "app": a request to build, modify, extend or fix an application — it goes through the plan + approval + build pipeline.
 Reply with ONLY JSON:
 {"kind":"answer","reply":"<your direct answer to the user>"}
@@ -3137,6 +3137,16 @@ class ChiefAgent:
                 json_mode=True, max_tokens=1100, model=CHIEF_MODELS))
             if data.get("kind") == "answer" and str(data.get("reply", "")).strip():
                 return {"kind": "answer", "reply": str(data["reply"])}
+            # v7.4: "clarify" is a FIRST-CLASS verdict, not a suggestion.
+            # The old code only returned answer/app — a clarify reply from
+            # the model fell through to {"kind": "app"}, silently demoting
+            # the decision and making the TaskWorker's ask-and-fold loop
+            # unreachable (live: "Add a database" planned instead of asking).
+            if data.get("kind") == "clarify" and str(data.get("question", "")).strip():
+                return {"kind": "clarify",
+                        "question": str(data["question"]),
+                        "options": [str(o) for o in (data.get("options") or [])
+                                     if str(o).strip()][:6]}
             if data.get("kind") == "app":
                 return {"kind": "app", "intent": str(data.get("intent", prompt[:120]))}
         except Exception as exc:  # noqa: BLE001
@@ -5069,6 +5079,14 @@ async def status_route(request: Request):
         "vlm_model": VLM_MODEL if VLM_ENABLED else None,
         "llm_ready": LLM_READY,
         "architecture": "agent",
+        # v7.4: a pending user_question/secret_request is state the CALLER
+        # must see on ANY poll — the WS sync payload carries it for
+        # reconnecting studios, and REST /status carries it for polling
+        # clients (the vm-ops relay path and the e2e harness). Without
+        # this, a question asked while nobody watched was undiscoverable
+        # (live: the ask_user dispatch waited 15 min with no way to learn
+        # its question_id over REST).
+        "pending_interactions": pending_interactions(),
         "skills": skills_catalog_summary(),
         "browser": (browser_engine.health() if browser_engine is not None
                     else {"playwright_installed": False}),
