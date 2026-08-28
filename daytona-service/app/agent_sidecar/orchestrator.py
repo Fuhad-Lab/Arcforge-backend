@@ -249,6 +249,18 @@ LOG_FILE = os.environ.get("ORCH_LOG_FILE", os.path.join(SYSTEM_DIR, "orchestrato
 
 # Build-graph tuning
 APPROVAL_TIMEOUT_S = float(os.environ.get("ORCH_APPROVAL_TIMEOUT_S", str(6 * 3600)))
+# v7 (GROUP 1): mid-run user-question + secret-request interaction timeouts.
+QUESTION_TIMEOUT_S = float(os.environ.get("ORCH_QUESTION_TIMEOUT_S", str(30 * 60)))
+SECRET_TIMEOUT_S = float(os.environ.get("ORCH_SECRET_TIMEOUT_S", str(60 * 60)))
+# v7: the chief's OWN utility tools (terminal/vision/use_skill/ask_user/
+# request_secret/github) are lightweight and do NOT consume the build
+# dispatch budget — this separate cap is their loop safety valve.
+UTILITY_MAX_CALLS = int(os.environ.get("ORCH_UTILITY_MAX_CALLS", "16"))
+# v7 (C2): user-provided secrets land here — OUTSIDE the workspace (never in
+# git, never in agent FS scope), mode 600, sourced into dev-server boots so
+# the app reads process.env.<NAME>. The agent NEVER sees the value.
+SECRETS_ENV_PATH = os.path.join(SYSTEM_DIR, "secrets.env")
+_SECRET_ENV_SOURCE = f"set -a; . {SECRETS_ENV_PATH} 2>/dev/null; set +a; "
 # Agent-loop step budget: the agent model is thorough but ~60-100s/call —
 # this keeps a single agent run inside ~15-20 min worst case.
 AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "18"))
@@ -2142,6 +2154,12 @@ def _terminal_tool(ctx: AgentContext, cwd: str) -> Callable[[Dict[str, Any]], Di
             return {"ok": False, "error": "command required"}
         if any(bad in cmd for bad in ("rm -rf /", "mkfs", "shutdown", "reboot")):
             return {"ok": False, "error": "command rejected (unsafe)"}
+        # v7 (C2): the secrets file is NEVER readable from the agent's
+        # terminal — best-effort block matching the platform's secret policy.
+        if "secrets.env" in cmd:
+            return {"ok": False, "error": "command rejected (secrets are "
+                    "protected — reference them as environment variables, "
+                    "never read the store)"}
         out = shell_run(cmd, cwd, timeout=240)
         ok = out["exit_code"] == 0
         text = aci_paginate(
@@ -2213,7 +2231,9 @@ def _browser_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], 
             "navigate": navigate, "interact": interact, "screenshot": screenshot}
 
 
-def _skills_toolset(role: str) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+def _skills_toolset(role: str,
+                    gate: Optional[Dict[str, bool]] = None
+                    ) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
     if _skills_server_mod is None:
         return {}
     def mcp_list_skills(_: Dict[str, Any]) -> Dict[str, Any]:
@@ -2230,8 +2250,114 @@ def _skills_toolset(role: str) -> Dict[str, Callable[[Dict[str, Any]], Dict[str,
                 str(a.get("input") or a.get("question") or ""))
         except Exception:  # noqa: BLE001
             pass
+        # v7 (C4): mark the per-run gate — the write-tool bounce checks it.
+        if gate is not None and bool(result.get("ok")):
+            gate[skill] = True
         return result
     return {"mcp_list_skills": mcp_list_skills, "mcp_use_skill": mcp_use_skill}
+
+
+def _apply_skill_gate(tools: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]],
+                      required_skills: Tuple[str, ...],
+                      gate: Dict[str, bool]) -> None:
+    """v7 (C4) — MANDATORY skills, enforced at the output layer the way
+    Replit enforces prompt rules: the write tools BOUNCE until the run has
+    consulted its required skills. The bounce is a critique the model acts
+    on (it calls mcp_use_skill, then retries) — the model still controls
+    its own path; only the invariant (skills before code) is enforced."""
+    missing_now = [s for s in required_skills if not gate.get(s)]
+    if not missing_now:
+        return
+
+    def _gate(orig: Callable[[Dict[str, Any]], Dict[str, Any]]
+              ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+        def wrapped(a: Dict[str, Any]) -> Dict[str, Any]:
+            still = [s for s in required_skills if not gate.get(s)]
+            if still:
+                return {"ok": False,
+                        "error": ("SKILL POLICY (mandatory): before writing code "
+                                  "you MUST consult "
+                                  + " and ".join(f'mcp_use_skill {{skill:"{s}"}}'
+                                                   for s in still)
+                                  + " — read the guidance, apply it, then retry "
+                                    "this write. This is enforced every run; "
+                                    "the write will succeed after the skill "
+                                    "consultation.")}
+            return orig(a)
+        return wrapped
+
+    for name in ("write_file", "write_files", "edit_file"):
+        if name in tools:
+            tools[name] = _gate(tools[name])
+
+
+def _interaction_toolset(ctx: AgentContext
+                         ) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
+    """v7 (C1/C2): ask_user + request_secret — the agent may STOP and ask
+    instead of guessing. Available to the chief AND the sub-agents (the
+    question carries the asking role)."""
+    def ask_user(a: Dict[str, Any]) -> Dict[str, Any]:
+        question = str(a.get("question") or a.get("q") or "").strip()
+        if not question:
+            return {"ok": False, "error": "question required"}
+        options = [str(o).strip() for o in (a.get("options") or [])
+                   if str(o).strip()][:6]
+        qid = "q-" + uuid.uuid4().hex[:8]
+        ctx.activity("Asking you a question", "active", question[:120])
+        ans = ask_user_wait(qid, ctx.task_id,
+                            {"role": ctx.agent_name, "question": question,
+                             "options": options,
+                             "context": str(a.get("context", ""))[:400]})
+        if ans is None:
+            ctx.activity("Asking you a question", "done",
+                         "no answer in time — proceeding on best judgment")
+            return {"ok": False,
+                    "error": "the user did not answer in time — proceed with "
+                             "your best judgment and say so in your report"}
+        ctx.activity("Asking you a question", "done",
+                     f"answered: {str(ans['answer'])[:100]}")
+        return {"ok": True, "answer": str(ans["answer"])[:2000]}
+
+    def request_secret(a: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(a.get("name") or a.get("key") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", name):
+            return {"ok": False,
+                    "error": "name must be an ENV_VAR-style identifier "
+                             "(e.g. OPENAI_API_KEY)"}
+        purpose = str(a.get("purpose") or "").strip()
+        if not purpose:
+            return {"ok": False, "error": "purpose required (why the app "
+                    "needs it — shown to the user)"}
+        rid = "s-" + uuid.uuid4().hex[:8]
+        ctx.activity("Requesting a secret from you", "active", name)
+        res = secret_request_wait(rid, ctx.task_id,
+                                  {"role": ctx.agent_name, "name": name,
+                                   "purpose": purpose,
+                                   "hint": str(a.get("hint", ""))[:200]})
+        if res is None:
+            ctx.activity("Requesting a secret from you", "done",
+                         "no response in time")
+            return {"ok": False,
+                    "error": f"the user did not provide {name} in time — build "
+                             "without it or ask what to do"}
+        state = str(res.get("state", "failed"))
+        if state == "declined":
+            ctx.activity("Requesting a secret from you", "done",
+                         "declined — building without it")
+            return {"ok": False,
+                    "error": f"the user declined to provide {name} — build "
+                             "without it or ask what to do"}
+        if state in ("stored", "vault_degraded"):
+            ctx.activity("Requesting a secret from you", "done",
+                         f"{name} stored securely")
+            return {"ok": True, "name": name, "state": state,
+                    "usage": (f"reference it in code as process.env.{name} — "
+                              "NEVER hardcode, log, or echo the value; the dev "
+                              "server restarts automatically to pick it up")}
+        return {"ok": False,
+                "error": f"secret storage failed: {res.get('detail', state)}"}
+
+    return {"ask_user": ask_user, "request_secret": request_secret}
 
 
 def _mailbox_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
@@ -2297,7 +2423,13 @@ def build_backend_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, An
 
     tools["api_contract_update"] = api_contract_update
     tools.update(_mailbox_toolset(ctx))
-    tools.update(_skills_toolset("backend"))
+    # v7 (C4): per-run skill gate — Sequential Thinking + FileSystem are
+    # MANDATORY before any write (enforced at the output layer).
+    skill_gate: Dict[str, bool] = {}
+    tools.update(_skills_toolset("backend", gate=skill_gate))
+    _apply_skill_gate(tools, ("Sequential Thinking", "FileSystem"), skill_gate)
+    # v7 (C1/C2): the agent may stop and ask / request secrets.
+    tools.update(_interaction_toolset(ctx))
     return tools
 
 
@@ -2323,7 +2455,13 @@ def build_frontend_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, A
     tools["api_contract_read"] = api_contract_read
     tools.update(_browser_toolset(ctx))
     tools.update(_mailbox_toolset(ctx))
-    tools.update(_skills_toolset("frontend"))
+    # v7 (C4): per-run skill gate — UI/UX Pro Max is MANDATORY before any
+    # UI write (enforced at the output layer, every run).
+    skill_gate: Dict[str, bool] = {}
+    tools.update(_skills_toolset("frontend", gate=skill_gate))
+    _apply_skill_gate(tools, ("UI/UX Pro Max",), skill_gate)
+    # v7 (C1/C2): the agent may stop and ask / request secrets.
+    tools.update(_interaction_toolset(ctx))
 
     # The Integration Link guard: writing fetch/API code before reading the
     # contract earns an explicit warning in the tool result.
@@ -2347,6 +2485,23 @@ def build_frontend_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, A
 def build_debugger_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
     tools: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
     tools.update(_browser_toolset(ctx))
+    # v7 (C4) BUGFIX: the debugger's prompt mentioned mcp_use_skill but its
+    # toolset omitted it (live: "unknown tool 'mcp_use_skill'"). Playwright
+    # is now reachable — and MANDATORY before the first browser audit
+    # (enforced at the output layer, every run).
+    skill_gate: Dict[str, bool] = {}
+    tools.update(_skills_toolset("debugger", gate=skill_gate))
+    _orig_browser = tools.get("browser_tool")
+    if _orig_browser is not None:
+        def gated_browser(a: Dict[str, Any]) -> Dict[str, Any]:
+            if not skill_gate.get("Playwright"):
+                return {"ok": False,
+                        "error": ("SKILL POLICY (mandatory): before your first "
+                                  "browser audit call mcp_use_skill "
+                                  "{skill:\"Playwright\"} for browser-driving "
+                                  "discipline — then retry. Enforced every run.")}
+            return _orig_browser(a)
+        tools["browser_tool"] = gated_browser
 
     def read_file(a: Dict[str, Any]) -> Dict[str, Any]:
         path = str(a.get("path") or "")
@@ -2364,6 +2519,9 @@ def build_debugger_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, A
         return {"ok": False, "error": "read scope: plan.md, frontend/*, backend/*"}
 
     tools["read_file"] = read_file
+    # v7 (C1): the debugger may ask the user a clarifying question when the
+    # plan is ambiguous about a feature it is auditing.
+    tools.update(_interaction_toolset(ctx))
     return tools
 
 
@@ -2381,7 +2539,8 @@ WORKFLOW: read the plan → write the code (batch files in ONE write_files call)
 BACKEND CHOICE: Python Flask (requirements.txt + app.py, port 8000, enable CORS for localhost:3000) unless the plan says otherwise.
 FLASK 3 BANS (recurring live failures — the app crashes at boot): NEVER use @app.before_first_request (removed in Flask 3 — initialise the DB at module scope instead), NEVER use @app.route without explicit methods when you expect JSON bodies, and NEVER call json fields that don't exist.
 ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows an empty backend/, your FIRST action must be ONE write_files call carrying the COMPLETE initial server — app.py + requirements.txt + every module the plan's Backend Requirements list (≤12 files). Never dribble files one at a time from a blank slate; write the whole tree, THEN verify and refine.
-SKILLS (MCP): your skill server hosts domain expertise for you. BEFORE writing backend code, call mcp_use_skill with "Sequential Thinking" for multi-step API design and "FileSystem" for file-layout discipline — one call each, then build. This is policy, not decoration: your build is judged against the skill guidance too.
+SELF-INTERROGATION (before EVERY action): What do I already know? What am I missing? Which of my tools does this step need, and in what order? Must I inspect a result before continuing? If a user decision would unblock me (which provider, which format, which credential), call ask_user NOW instead of guessing. If the app needs an API key or credential, call request_secret — NEVER hardcode a placeholder key or invent one.
+SKILLS (MCP): your skill server hosts domain expertise for you. "Sequential Thinking" (multi-step API design) and "FileSystem" (file-layout discipline) are MANDATORY every run — the write tools BOUNCE until you have consulted them (call mcp_use_skill once each, read the guidance, then build with it applied). Your build is judged against the skill guidance too.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
 FRONTEND_SYSTEM = """You are the Frontend Agent of ArcForge — an autonomous frontend developer working inside a Linux VM.
@@ -2393,7 +2552,8 @@ HARD RULES:
 - After writing code: verify_file on every file, then lsp_diagnostics (tsc) until clean; start the dev server via terminal: nohup npx next dev -p 3000 -H 0.0.0.0 & ; then VERIFY with browser_tool: navigate http://localhost:3000 → console_spy → fix every error (yours) or report it to the backend agent (mailbox_send: what you called, what you expected, what you got). You cannot report done while console errors exist OR while http://localhost:3000 shows a 404.
 UI STANDARDS: inline styles or one <style> tag only (NO .css files); every file using hooks/handlers starts with 'use client'; Next 14 <Link> takes NO nested <a>; no lorem ipsum — realistic copy; responsive; loading + empty states.
 ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows only the bare scaffold, your FIRST action must be ONE write_files call carrying the COMPLETE initial file tree — every page, component and lib module the plan's Frontend Requirements list (≤12 files; extras via write_file after). Never dribble files one at a time from a blank workspace; write the whole tree, THEN verify and refine.
-SKILLS (MCP): your skill server hosts domain expertise for you. BEFORE writing UI code, call mcp_use_skill with "UI/UX Pro Max" — one call, read its guidance, THEN build with it applied. This is policy, not decoration: your build is judged against the skill guidance too.
+SELF-INTERROGATION (before EVERY action): What do I already know? What am I missing? Which of my tools does this step need, and in what order? Must I inspect a result before continuing? If a user decision would unblock me (which design direction, which data shape, which credential), call ask_user NOW instead of guessing. If the app needs an API key or credential, call request_secret — NEVER hardcode a placeholder key or invent one.
+SKILLS (MCP): your skill server hosts domain expertise for you. "UI/UX Pro Max" is MANDATORY every run — the write tools BOUNCE until you have consulted it (call mcp_use_skill once, read the guidance, THEN build with it applied). Your build is judged against the skill guidance too.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
 DEBUGGER_SYSTEM = """You are the Debugger Agent of ArcForge — the QA gate. You NEVER write or edit code. You audit the LIVE app against plan.md and report exactly WHAT IS MISSING.
@@ -2409,7 +2569,8 @@ WORKFLOW:
 4. Screenshot key screens when a visual check matters.
 FINISH with: {"tool":"done","report":"<evidence-based summary>","status":"pass"|"fail","coverage":[{"feature":"<plan feature>","state":"present|partial|missing","evidence":"what you actually saw","suspect":"frontend|backend|unclear"}],"issues":[{"criterion":"...","observation":"what actually happened","suspect":"frontend|backend|unclear"}]}.
 Rules: status is "pass" ONLY when every plan feature is "present". An app that boots but lacks a plan feature is a FAIL — name the feature. Report only real, observed evidence — never speculation. Your missing-features checklist is what the build acts on next: precise feature names, exact gaps.
-SKILLS (MCP): before auditing, you may call mcp_use_skill with "Playwright" for browser-driving discipline — but the audit itself must be evidence from YOUR tools."""
+SELF-INTERROGATION (before EVERY action): What do I already know? What am I missing? Must I inspect a result before continuing? If the plan is ambiguous about a feature you are auditing, call ask_user instead of guessing its intent.
+SKILLS (MCP): "Playwright" is MANDATORY before your first browser audit each run — browser_tool bounces until you have consulted it (call mcp_use_skill {skill:"Playwright"}, read the discipline, then audit). The audit itself must be evidence from YOUR tools."""
 
 
 def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]:
@@ -2676,7 +2837,9 @@ def ensure_servers_up(task_id: str) -> Dict[str, Any]:
         sh("npm install --no-audit --no-fund --loglevel=error", fe, 600)
         sh(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1", fe, 15)
         sh("rm -rf .next node_modules/.cache", fe, 60)
-        sh(f"nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
+        # v7 (C2): source the secrets env (mode 600, outside the workspace)
+        # so the app process inherits process.env.<NAME>.
+        sh(f"{_SECRET_ENV_SOURCE} nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
            f"> /tmp/frontend-dev.log 2>&1 < /dev/null &", fe, 20)
         for _ in range(6):
             sh("sleep 5", fe, 10)
@@ -2700,7 +2863,8 @@ def ensure_servers_up(task_id: str) -> Dict[str, Any]:
         started = False
         for entry in ("app.py", "main.py", "server.py"):
             if os.path.exists(os.path.join(be, entry)):
-                sh(f"nohup python3 {entry} > /tmp/backend-dev.log 2>&1 < /dev/null &",
+                sh(f"{_SECRET_ENV_SOURCE} nohup python3 {entry} "
+                   f"> /tmp/backend-dev.log 2>&1 < /dev/null &",
                    be, 20)
                 started = True
                 break
@@ -2740,9 +2904,12 @@ def ensure_servers_up(task_id: str) -> Dict[str, Any]:
 
 CHIEF_CLASSIFY_SYSTEM = """You are ArcForge — the user's build agent. Your FIRST job is routing their message:
 - "answer": a question / chat / explanation that needs NO code changes (e.g. "What is React?", "Why use TypeScript?"). You answer it directly — the build pipeline does NOT run.
+- "clarify": the request is missing a decision ONLY the user can make (which database, which provider, public or private, which of two directions) — and guessing would build the wrong thing. Ask ONE precise question with concrete options. Do NOT guess.
 - "app": a request to build, modify, extend or fix an application — it goes through the plan + approval + build pipeline.
 Reply with ONLY JSON:
 {"kind":"answer","reply":"<your direct answer to the user>"}
+or
+{"kind":"clarify","question":"<one precise question>","options":["<option1>","<option2>"]}
 or
 {"kind":"app","intent":"<one line: what they want built/changed>"}"""
 
@@ -2762,16 +2929,31 @@ RUNTIME CONSTRAINTS (hard): the app runs inside a single Linux VM — a backend,
 
 CHIEF_REFINE_SYSTEM = """You are ArcForge — the user's build agent. The user read your proposed plan and REJECTED it with change requests. Apply their changes and produce the FULL revised plan (same structure: Overview / Frontend Requirements / Backend Requirements / Acceptance Criteria). Keep everything they did NOT ask to change intact. The revised plan goes back to the user for approval."""
 
-CHIEF_DISPATCH_SYSTEM = """You are ArcForge — the user's build agent. You coordinate specialised sub-agents as YOUR TOOLS. Before every call, INTERROGATE YOURSELF: given the plan's requirement sections and what is already built, WHICH tool does the remaining work belong to, and what EXACTLY should it do next? There is NO fixed order and NO mandatory pipeline — your reasoning decides (a static site never calls backend_agent; a UI tweak after a passing build needs no integration check; not every website needs a backend).
+CHIEF_DISPATCH_SYSTEM = """You are ArcForge — the user's build agent. You coordinate specialised sub-agents and platform tools as YOUR TOOLS. Before EVERY call, INTERROGATE YOURSELF:
+1. Do I need to make a plan here (or does the approved one already cover it)?
+2. What information do I already have?
+3. What information am I missing — and can a tool or the USER supply it?
+4. Which tools do I need for this step?
+5. Which tool/sub-agent should handle each part?
+6. Must they run sequentially, or can parallel work proceed?
+7. Do I need to inspect the result before continuing?
+8. Do I need to ask the user a question (ask_user) or request a secret (request_secret) instead of guessing?
+There is NO fixed order and NO mandatory pipeline — your reasoning decides (a static site never calls backend_agent; a UI tweak after a passing build needs no integration check; not every website needs a backend; an ambiguous requirement deserves a question, not a guess).
 Your tools:
 - backend_agent: builds the API server under backend/ — call it when the plan's Backend Requirements have items not implemented yet.
 - frontend_agent: builds the UI under frontend/ (Next.js 14 App Router) — call it when the plan's Frontend Requirements aren't built or need changes.
 - integration_check: starts both servers and proves the frontend talks to the backend — call it once both agents ran (only when a backend exists).
 - qa_verification: end-to-end verifies the live app against the plan's Acceptance Criteria — call it when the build looks complete.
+- terminal: run a shell command in the workspace yourself (inspect state, check processes, quick diagnostics) — {"tool":"terminal","args":{"command":"<cmd>"}}.
+- vision: screenshot the running app and get a visual description — {"tool":"vision","args":{"question":"<what to check visually>"}}.
+- use_skill: consult your MCP skill server (Superpowers, Memory, Sequential Thinking) — {"tool":"use_skill","args":{"skill":"<name>","input":"<question>"}}.
+- ask_user: pause and ask the user a clarifying question with options — {"tool":"ask_user","args":{"question":"<precise question>","options":["..."],"context":"<why you're asking>"}}.
+- request_secret: securely obtain an API key/credential from the user (never hardcode, never see the value) — {"tool":"request_secret","args":{"name":"ENV_VAR_NAME","purpose":"<why the app needs it>","hint":"<where to find it>"}}.
+- github: GitHub operations via the user's connected account — {"tool":"github","args":{"action":"rest","method":"GET","path":"/user/repos"}} or {"tool":"github","args":{"action":"sync_workspace","repo":"auto-create:<name>","message":"<commit msg>"}}.
 - finish: everything the plan requires is done — no more tool calls.
 BRIEF QUALITY LAW (the platform enforces it): each call's "task" is the sub-agent's ONLY instructions — quote the concrete plan items it must deliver (endpoints with paths and shapes, pages with elements, file names). "Build it" / "do the rest" / "build so-so" briefs get bounced.
 Reply ONLY JSON:
-{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","reason":"<one line, internal>"} (omit "task" for finish)."""
+{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|terminal|vision|use_skill|ask_user|request_secret|github|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","args":{"<tool-specific arguments as shown above>"},"reason":"<one line, internal>"} (omit "task" for tools that take only args; omit both for finish)."""
 
 CHIEF_FOLLOWUP_SYSTEM = """You are ArcForge — the user's build agent. An approved plan.md ALREADY exists and the app is built; the user sent a FOLLOW-UP request. INTERROGATE YOURSELF before answering: does this request need a NEW PLAN, or is it a contained change you can build directly under the existing contract — and WHICH of your tools owns it?
 - "direct": contained work — tweaks, fixes, restyling, copy, adding a small component, adjusting behaviour, small additions. No new plan needed: you already know the codebase and the contract. You will be handed the change verbatim and build it immediately.
@@ -3031,6 +3213,171 @@ def route_prompt_during_approval(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# v7 (GROUP 1 — contracts C1/C2): the USER-INTERACTION state machines.
+# The approval Event pattern generalized: the agent (chief OR a sub-agent)
+# can PAUSE and ask the user a question, or request a secret, instead of
+# guessing. Questions carry options + "Other"; answers return as tool
+# results. Secret VALUES never touch the /ws event bus or agent context —
+# they arrive only via the authenticated /internal/secrets REST route
+# (browser → edge fn → backend → here), land in SECRETS_ENV_PATH (600),
+# and the tool result carries a RECEIPT, never the value.
+# ---------------------------------------------------------------------------
+
+_INTERACT_LOCK = threading.Lock()
+_QUESTION_EVENTS: Dict[str, threading.Event] = {}
+_QUESTION_ANSWERS: Dict[str, Dict[str, Any]] = {}
+_SECRET_EVENTS: Dict[str, threading.Event] = {}
+_SECRET_STATES: Dict[str, Dict[str, Any]] = {}
+# Pending (unresolved) interactions — replayed in the sync payload so a
+# reconnecting studio re-surfaces the cards.
+_PENDING_INTERACTIONS: Dict[str, Dict[str, Any]] = {}
+
+
+def _interaction_pending(interaction: Dict[str, Any]) -> None:
+    with _INTERACT_LOCK:
+        _PENDING_INTERACTIONS[str(interaction.get("question_id")
+                                 or interaction.get("request_id"))] = interaction
+
+
+def _interaction_done(iid: str) -> None:
+    with _INTERACT_LOCK:
+        _PENDING_INTERACTIONS.pop(iid, None)
+
+
+def pending_interactions() -> List[Dict[str, Any]]:
+    with _INTERACT_LOCK:
+        return list(_PENDING_INTERACTIONS.values())
+
+
+def ask_user_wait(question_id: str, task_id: str, payload: Dict[str, Any],
+                  timeout: float = QUESTION_TIMEOUT_S) -> Optional[Dict[str, Any]]:
+    """Emit a user_question event and BLOCK the agent until the user
+    answers (WS user_answer / REST /answer). None on timeout."""
+    ev = threading.Event()
+    with _INTERACT_LOCK:
+        _QUESTION_EVENTS[question_id] = ev
+    event = {"type": "user_question", "task_id": task_id,
+             "question_id": question_id,
+             "role": str(payload.get("role", "chief")),
+             "question": str(payload.get("question", ""))[:1200],
+             "options": [str(o)[:200] for o in (payload.get("options") or [])][:6],
+             "context": str(payload.get("context", ""))[:600]}
+    _interaction_pending(event)
+    emit(event)
+    try:
+        decided = ev.wait(timeout=timeout)
+    finally:
+        with _INTERACT_LOCK:
+            _QUESTION_EVENTS.pop(question_id, None)
+            answer = _QUESTION_ANSWERS.pop(question_id, None)
+        _interaction_done(question_id)
+    if not decided or answer is None:
+        return None
+    return answer
+
+
+def question_submit(question_id: str, answer: str) -> bool:
+    """Called from the WS/REST handlers with the user's answer."""
+    if not question_id or not str(answer).strip():
+        return False
+    with _INTERACT_LOCK:
+        ev = _QUESTION_EVENTS.get(question_id)
+        if ev is None:
+            return False
+        _QUESTION_ANSWERS[question_id] = {"answer": str(answer).strip()[:4000]}
+    ev.set()
+    return True
+
+
+def secret_request_wait(request_id: str, task_id: str, payload: Dict[str, Any],
+                        timeout: float = SECRET_TIMEOUT_S) -> Optional[Dict[str, Any]]:
+    """Emit a secret_request event and BLOCK until /internal/secrets
+    resolves it (stored | declined | vault_degraded | failed)."""
+    ev = threading.Event()
+    with _INTERACT_LOCK:
+        _SECRET_EVENTS[request_id] = ev
+    event = {"type": "secret_request", "task_id": task_id,
+             "request_id": request_id,
+             "role": str(payload.get("role", "chief")),
+             "name": str(payload.get("name", "")),
+             "purpose": str(payload.get("purpose", ""))[:600],
+             "hint": str(payload.get("hint", ""))[:300]}
+    _interaction_pending(event)
+    emit(event)
+    try:
+        decided = ev.wait(timeout=timeout)
+    finally:
+        with _INTERACT_LOCK:
+            _SECRET_EVENTS.pop(request_id, None)
+            state = _SECRET_STATES.pop(request_id, None)
+        _interaction_done(request_id)
+    if not decided or state is None:
+        return None
+    return state
+
+
+def secret_resolve(request_id: str, state: str, detail: str = "") -> bool:
+    """Called by the /internal/secrets route: record the outcome and wake
+    the blocked request_secret tool call."""
+    with _INTERACT_LOCK:
+        ev = _SECRET_EVENTS.get(request_id)
+        if ev is None:
+            return False
+        _SECRET_STATES[request_id] = {"state": state, "detail": detail[:500]}
+    ev.set()
+    return True
+
+
+def _store_secret_env(name: str, value: str) -> bool:
+    """Merge one KEY=VALUE into SECRETS_ENV_PATH (mode 600, outside the
+    workspace). Returns success. NEVER log the value."""
+    try:
+        os.makedirs(os.path.dirname(SECRETS_ENV_PATH), exist_ok=True)
+        lines: List[str] = []
+        if os.path.exists(SECRETS_ENV_PATH):
+            with open(SECRETS_ENV_PATH, "r", encoding="utf-8", errors="replace") as fh:
+                lines = [ln for ln in fh.read().splitlines()
+                         if ln.strip() and not ln.startswith(f"{name}=")]
+        # shell-quote defensively (values are single-line secrets)
+        safe = value.replace("'", "'\\''")
+        lines.append(f"{name}='{safe}'")
+        with open(SECRETS_ENV_PATH, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.chmod(SECRETS_ENV_PATH, 0o600)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        append_log(None, "daemon", "warn",
+                   f"secret store failed for {name}: {type(exc).__name__}")
+        return False
+
+
+def _respawn_dev_with_secrets() -> bool:
+    """After a secret lands: restart the dev servers (only the ones that
+    were running) so the app process inherits the merged secret env."""
+    fe = os.path.join(WORKSPACE, "frontend")
+    respawned = False
+    if os.path.exists(os.path.join(fe, "package.json")):
+        listening = shell_run(f"fuser {NEXT_DEV_PORT}/tcp", fe, 10)["stdout"].strip()
+        if listening:
+            shell_run(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1", fe, 15)
+            shell_run(f"{_SECRET_ENV_SOURCE} nohup npx next dev -p {NEXT_DEV_PORT} "
+                      f"-H 0.0.0.0 > /tmp/frontend-dev.log 2>&1 < /dev/null &", fe, 20)
+            respawned = True
+    be = os.path.join(WORKSPACE, "backend")
+    if os.path.isdir(be):
+        listening = shell_run("fuser 8000/tcp", be, 10)["stdout"].strip()
+        if listening:
+            shell_run("fuser -k 8000/tcp 2>/dev/null; sleep 1", be, 15)
+            for entry in ("app.py", "main.py", "server.py"):
+                if os.path.exists(os.path.join(be, entry)):
+                    shell_run(f"{_SECRET_ENV_SOURCE} nohup python3 {entry} "
+                              f"> /tmp/backend-dev.log 2>&1 < /dev/null &", be, 20)
+                    respawned = True
+                    break
+    return respawned
+
+
+# ---------------------------------------------------------------------------
 # ORCHESTRATION LAYER — LangGraph StateGraph (the brain transplant).
 # The manual while-loop pipeline is GONE. The build is now a state graph:
 #   START → chief → {backend | frontend | fit_check | debugger} → chief → …
@@ -3063,6 +3410,8 @@ class AgentState(TypedDict, total=False):
     # routing (the chief's dispatch decision)
     next_agent: str                   # backend|frontend|fit_check|debugger|end
     dispatch_task: str                # the brief for the dispatched tool
+    dispatch_args: Dict[str, Any]     # v7: structured args for utility tools
+    utility_calls: List[str]          # v7: chief's own tool calls (not build dispatches)
     # progress
     reports: Dict[str, Any]           # per-tool reports
     errors: List[str]
@@ -3220,6 +3569,13 @@ def agent_dispatcher(state: Dict[str, Any]) -> Dict[str, str]:
     for tool in dict.fromkeys(dispatches):  # order-preserving unique
         rep = str((reports.get(tool) or {}).get("report", ""))[:160]
         done_lines.append(f"- {tool}: {rep or 'ran'}")
+    # v7: the chief's own tool results (ask_user answers, vision findings,
+    # terminal output, github results) ride along so the next decision is
+    # informed by them.
+    for util in dict.fromkeys(list(state.get("utility_calls") or [])):
+        rep = str((reports.get(util) or {}).get("report", ""))[:400]
+        if rep:
+            done_lines.append(f"- {util} (your own call): {rep}")
     user = (
         f"APPROVED PLAN:\n{plan_text[:2400]}\n\n"
         f"REPO MAP (current codebase skeleton):\n"
@@ -3241,26 +3597,34 @@ def agent_dispatcher(state: Dict[str, Any]) -> Dict[str, str]:
         # had to save the route). Same family as the agent-loop unwrap.
         raw_tool = data.get("tool")
         raw_task, raw_reason = data.get("task", ""), data.get("reason", "")
+        raw_args = data.get("args")
         if isinstance(raw_tool, dict):
             args = raw_tool.get("arguments") or raw_tool.get("args") or {}
             if isinstance(args, dict):
                 raw_task = raw_task or args.get("task", "")
                 raw_reason = raw_reason or args.get("reason", "")
+                raw_args = raw_args if isinstance(raw_args, dict) else args
             raw_tool = raw_tool.get("name") or raw_tool.get("tool")
         proposal = {"tool": str(raw_tool or "").strip().lower(),
                     "task": str(raw_task or "").strip(),
                     "reason": str(raw_reason or "")[:200]}
+        if isinstance(raw_args, dict):
+            proposal["args"] = {
+                str(k): (v if isinstance(v, (str, int, float, bool)) else str(v))
+                for k, v in raw_args.items()
+                if k not in ("tool", "task", "reason")
+            }
     except Exception as exc:  # noqa: BLE001 — guardrails route alone
         append_log(task_id, "chief", "warn",
                    f"dispatch decision degraded ({exc}) — guardrails routing")
 
-    tool, task = _dispatch_guardrails(state, proposal)
+    tool, task, args = _dispatch_guardrails(state, proposal)
     if tool not in ("end", "debugger", "fit_check") and not task:
         task = _default_brief(tool, plan_text)
     if proposal.get("reason"):
         append_log(task_id, "chief", "info",
                    f"dispatch → {tool} ({proposal['reason']})")
-    return {"tool": tool, "task": task}
+    return {"tool": tool, "task": task, "args": args}
 
 
 _TOOL_ALIASES = {
@@ -3268,78 +3632,107 @@ _TOOL_ALIASES = {
     "frontend_agent": "frontend", "frontend": "frontend",
     "integration_check": "fit_check", "fit_check": "fit_check",
     "qa_verification": "debugger", "debugger": "debugger",
+    # v7: the chief's OWN utility tools (dynamic toolbox — GROUP 1).
+    "terminal": "terminal", "shell": "terminal", "run_command": "terminal",
+    "vision": "vision", "look": "vision", "see": "vision",
+    "screenshot": "vision", "describe_screen": "vision",
+    "use_skill": "use_skill", "skill": "use_skill", "mcp": "use_skill",
+    "ask_user": "ask_user", "question": "ask_user", "clarify": "ask_user",
+    "ask_user_question": "ask_user",
+    "request_secret": "request_secret", "secret": "request_secret",
+    "secret_request": "request_secret",
+    "github": "github", "repo": "github", "git": "github",
     "finish": "end", "end": "end", "": "end",
 }
 
+# v7: the chief's own lightweight tools — they don't consume the BUILD
+# dispatch budget (R1); a separate utility cap (R6) is their loop valve.
+_UTILITY_TOOLS = {"terminal", "vision", "use_skill", "ask_user",
+                  "request_secret", "github"}
+
 
 def _dispatch_guardrails(state: Dict[str, Any],
-                         proposal: Dict[str, str]) -> Tuple[str, str]:
-    """v6 — Replit-style enforcement: the dispatcher LLM's choice is
+                         proposal: Dict[str, Any]
+                         ) -> Tuple[str, str, Dict[str, Any]]:
+    """v7 — Replit-style enforcement: the dispatcher LLM's choice is
     AUTHORITATIVE (any tool, any order — dynamic orchestration; a static
     site opens with frontend_agent, a UI tweak skips the backend). These
     guardrails enforce only the platform INVARIANTS — the rules that must
     hold no matter how the agent reasons:
-      R1 budgets are honoured;
+      R1 build budgets are honoured (the chief's own utility tools do NOT
+         consume the build budget — R6 caps them separately);
       R2 nothing finishes unbuilt — a premature finish is BOUNCED toward
          the missing plan-required work (enforcement at the output layer,
          not a hardcoded phase order);
       R3 the QA gate always runs before the end;
-      R4 integration_check requires a backend.
+      R4 integration_check requires a backend;
+      R5 no-backend plans never dispatch the backend tool;
+      R6 utility calls are capped (loop valve, not a path constraint).
     When the LLM is silent/degraded the same cascade routes — the build
     never stalls."""
     dispatches = list(state.get("dispatches") or [])
+    utility_calls = list(state.get("utility_calls") or [])
     budget = int(state.get("dispatch_budget") or MAX_DISPATCHES)
     plan_text = str(state.get("plan", ""))
     ran = set(dispatches)
     tool = _TOOL_ALIASES.get(str(proposal.get("tool", "")).strip().lower(), "")
     task = str(proposal.get("task", "")).strip()
+    args = proposal.get("args") if isinstance(proposal.get("args"), dict) else {}
     needs_backend = _plan_needs_backend(plan_text)
 
-    # R1 — budget exhausted: the QA gate once, then an honest finish.
-    if len(dispatches) >= budget:
-        return ("debugger" if "debugger" not in ran else "end"), task
+    # R6 — utility loop valve: the chief's own tools are cheap but must
+    # not loop forever. Past the cap the build work proceeds instead.
+    if tool in _UTILITY_TOOLS and len(utility_calls) >= UTILITY_MAX_CALLS:
+        append_log(str(state.get("task_id", "")), "chief", "warn",
+                   f"utility call cap ({UTILITY_MAX_CALLS}) reached — routing "
+                   "back to the build work")
+        tool = ""
+
+    # R1 — build budget exhausted: the QA gate once, then an honest finish.
+    if tool not in _UTILITY_TOOLS and len(dispatches) >= budget:
+        return (("debugger" if "debugger" not in ran else "end"), task, args)
 
     # R4 — integration needs a backend; without one go straight to QA.
     if tool == "fit_check" and not needs_backend:
-        return ("debugger" if "debugger" not in ran else "end"), task
+        return (("debugger" if "debugger" not in ran else "end"), task, args)
 
     # R5 — "Not all websites need a backend": a plan that explicitly
     # declares No-backend never dispatches the backend tool (rule
     # enforcement at the output layer — bounce to the frontend/QA work).
     if not needs_backend and tool == "backend":
         if "frontend" not in ran:
-            return "frontend", task
-        return ("debugger" if "debugger" not in ran else "end"), task
+            return "frontend", task, args
+        return (("debugger" if "debugger" not in ran else "end"), task, args)
 
     # R2/R3 — a proposed finish is bounced until every plan-required tool
     # has run AND the QA gate has run. (Only fires on INVALID finishes;
     # the order here is a tie-break for a decision the chief didn't make.)
     if tool == "end":
         if needs_backend and "backend" not in ran:
-            return "backend", task
+            return "backend", task, args
         if "frontend" not in ran:
-            return "frontend", task
+            return "frontend", task, args
         if needs_backend and "fit_check" not in ran:
-            return "fit_check", task
+            return "fit_check", task, args
         if "debugger" not in ran:
-            return "debugger", task
-        return "end", task
+            return "debugger", task, args
+        return "end", task, args
 
     # The chief's proposal stands — ANY tool, ANY order (dynamic).
     if tool:
-        return tool, task
+        return tool, task, args
 
     # No valid proposal (LLM degraded) — enforce the invariants via the
     # same cascade so the build never stalls.
     if needs_backend and "backend" not in ran:
-        return "backend", task
+        return "backend", task, args
     if "frontend" not in ran:
-        return "frontend", task
+        return "frontend", task, args
     if needs_backend and "fit_check" not in ran:
-        return "fit_check", task
+        return "fit_check", task, args
     if "debugger" not in ran:
-        return "debugger", task
-    return "end", task
+        return "debugger", task, args
+    return "end", task, args
 
 
 def _gap_signature(debug: Dict[str, Any]) -> str:
@@ -3582,10 +3975,28 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # 5) The dispatcher decision (LLM + guardrails).
     decision = agent_dispatcher(state)
     tool, task = decision["tool"], decision["task"]
+    d_args = dict(decision.get("args") or {})
     if tool == "end":
         return {"next_agent": "end", "dispatch_task": ""}
+    if tool in _UTILITY_TOOLS:
+        # v7: the chief's own tools — tracked separately (R6), never
+        # consuming the build dispatch budget (R1).
+        utility_calls = list(state.get("utility_calls") or [])
+        utility_calls.append(tool)
+        label = {"terminal": "Running a command", "vision": "Looking at the app",
+                 "use_skill": "Consulting a skill", "ask_user": "Asking you a question",
+                 "request_secret": "Requesting a secret from you",
+                 "github": "Working with GitHub"}.get(tool, tool)
+        emit({"type": "activity", "task_id": task_id,
+              "label": label, "state": "active",
+              "detail": (str(d_args.get("command") or d_args.get("question")
+                             or d_args.get("skill") or d_args.get("name")
+                             or d_args.get("action") or task) or "")[:120]})
+        return {"next_agent": tool, "dispatch_task": task,
+                "dispatch_args": d_args, "utility_calls": utility_calls}
     dispatches.append(tool)
     return {"next_agent": tool, "dispatch_task": task,
+            "dispatch_args": d_args,
             "dispatches": dispatches,
             "repo_map": generate_repo_map(),
             "file_system_state": file_system_state(task_id)}
@@ -3597,6 +4008,183 @@ def backend_node(state: Dict[str, Any]) -> Dict[str, Any]:
     reports["backend"] = run_backend_agent(
         task_id, str(state.get("dispatch_task", "")), str(state.get("plan", "")))
     return {"reports": reports, "verdict": str(state.get("verdict") or "")}
+
+
+# -- v7: the chief's OWN tool nodes (lightweight, hub-and-spoke) -----------
+
+
+def _parse_dispatch_args(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Utility-node arguments: the dispatcher's structured args, with a
+    lenient fallback to JSON/keywords embedded in the task string."""
+    args = dict(state.get("dispatch_args") or {})
+    if not args:
+        task = str(state.get("dispatch_task", "")).strip()
+        if task.startswith("{"):
+            try:
+                parsed = _extract_json(task)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except Exception:  # noqa: BLE001
+                args = {}
+        if not args and task:
+            args = {"command": task, "question": task, "input": task,
+                    "skill": task, "name": task, "action": task}
+    return args
+
+
+def terminal_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The chief runs a shell command in the workspace itself — inspect
+    state, check processes, quick diagnostics (ACI-paginated)."""
+    task_id = str(state.get("task_id", ""))
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    cmd = str(args.get("command") or args.get("cmd") or "").strip()
+    if not cmd:
+        reports["terminal"] = {"report": "terminal: no command provided"}
+        return {"reports": reports}
+    if any(bad in cmd for bad in ("rm -rf /", "mkfs", "shutdown", "reboot")) \
+            or "secrets.env" in cmd:
+        reports["terminal"] = {"report": "terminal: command rejected (unsafe)"}
+        return {"reports": reports}
+    out = shell_run(cmd, WORKSPACE, timeout=180)
+    text = aci_paginate(f"exit {out['exit_code']}\n{out['stdout'] or out['stderr']}",
+                        4000)
+    emit({"type": "terminal", "task_id": task_id,
+          "command": cmd[:300], "output": text})
+    reports["terminal"] = {"report": f"$ {cmd}\n{text}"[:2000]}
+    return {"reports": reports}
+
+
+def vision_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The chief LOOKS at the running app: screenshot via the browser
+    engine + VLM description (the vision/image-description tool)."""
+    task_id = str(state.get("task_id", ""))
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    question = str(args.get("question") or args.get("ask") or
+                    "Describe this app screen: layout, visible UI elements, "
+                    "any obvious visual defects.").strip()
+    if browser_engine is None:
+        reports["vision"] = {"report": "vision: browser engine unavailable"}
+        return {"reports": reports}
+    nav = browser_engine.navigate(f"http://localhost:{NEXT_DEV_PORT}")
+    shot = browser_engine.screenshot("", question)
+    reports["vision"] = {
+        "report": (f"navigation: {json.dumps(nav)[:300]}\n"
+                   f"vision: {str(shot.get('description') or shot)[:1500]}")}
+    return {"reports": reports}
+
+
+def use_skill_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The chief consults its MCP skill server (Superpowers / Memory /
+    Sequential Thinking) — chief-scoped skills are finally reachable."""
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    skill = str(args.get("skill") or args.get("name") or "").strip()
+    inp = str(args.get("input") or args.get("question") or "").strip()
+    if not skill:
+        reports["use_skill"] = {"report": "use_skill: no skill name provided"}
+        return {"reports": reports}
+    if _skills_server_mod is None:
+        reports["use_skill"] = {"report": "use_skill: skill server unavailable"}
+        return {"reports": reports}
+    result = _skills_server_mod.mcp_call_tool("chief", skill, inp)
+    try:
+        _skills_server_mod.log_usage("chief", skill, bool(result.get("ok")), inp)
+    except Exception:  # noqa: BLE001
+        pass
+    reports["use_skill"] = {"report": json.dumps(result, ensure_ascii=False)[:1800]}
+    return {"reports": reports}
+
+
+def ask_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The chief pauses and asks the user a question (C1) — the answer
+    lands in its reports and informs the next dispatch."""
+    task_id = str(state.get("task_id", ""))
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    question = str(args.get("question") or state.get("dispatch_task", "")).strip()
+    options = [str(o).strip() for o in (args.get("options") or [])
+               if str(o).strip()][:6]
+    if not question:
+        reports["ask_user"] = {"report": "ask_user: no question provided"}
+        return {"reports": reports}
+    qid = "q-" + uuid.uuid4().hex[:8]
+    ans = ask_user_wait(qid, task_id,
+                        {"role": "chief", "question": question,
+                         "options": options,
+                         "context": str(args.get("context", ""))[:400]})
+    if ans is None:
+        reports["ask_user"] = {"report": "the user did not answer in time — "
+                                "proceeding on best judgment"}
+    else:
+        reports["ask_user"] = {"report": f"the user answered: {ans['answer']}",
+                                "answer": str(ans["answer"])[:2000]}
+    return {"reports": reports}
+
+
+def request_secret_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The chief requests a secret from the user (C2). The VALUE never
+    enters the graph — only a receipt."""
+    task_id = str(state.get("task_id", ""))
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    name = str(args.get("name") or args.get("key") or "").strip().upper()
+    purpose = str(args.get("purpose") or "").strip()
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", name) or not purpose:
+        reports["request_secret"] = {
+            "report": "request_secret: needs {name: ENV_VAR, purpose: why}"}
+        return {"reports": reports}
+    rid = "s-" + uuid.uuid4().hex[:8]
+    res = secret_request_wait(rid, task_id,
+                              {"role": "chief", "name": name, "purpose": purpose,
+                               "hint": str(args.get("hint", ""))[:200]})
+    if res is None:
+        reports["request_secret"] = {"report": f"no response for {name} in time"}
+    elif str(res.get("state")) == "declined":
+        reports["request_secret"] = {"report": f"the user declined {name}"}
+    elif str(res.get("state")) in ("stored", "vault_degraded"):
+        reports["request_secret"] = {
+            "report": (f"{name} stored ({res.get('state')}) — the app reads "
+                        f"process.env.{name}; never hardcode it")}
+    else:
+        reports["request_secret"] = {
+            "report": f"storage failed: {res.get('detail', res.get('state'))}"}
+    return {"reports": reports}
+
+
+def github_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """The chief's GitHub tool: REST calls + workspace sync, proxied
+    through the reverse tunnel with the user's PAT (never in the VM).
+    Uses the same in-process rt_mux as the LLM traffic — the backend's
+    reverse-tunnel path knows this connection's sandboxId, so the user's
+    GitHub identity resolves server-side."""
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    action = str(args.get("action") or "rest").strip().lower()
+    payload: Dict[str, Any] = {"action": action}
+    if action == "sync_workspace":
+        payload["repo"] = str(args.get("repo") or "")
+        payload["message"] = str(args.get("message") or "ArcForge workspace sync")
+    else:
+        payload["method"] = str(args.get("method") or "GET").upper()
+        payload["path"] = str(args.get("path") or "")
+        if isinstance(args.get("body"), dict):
+            payload["body"] = args["body"]
+    if not payload.get("path") and action == "rest":
+        reports["github"] = {"report": "github: rest action needs a path "
+                                       "(e.g. /user/repos)"}
+        return {"reports": reports}
+    try:
+        status, body = _tunnel_request("/tunnel/github", payload)
+        reports["github"] = {"report": f"{body[:2500]}"}
+        if status >= 400:
+            reports["github"] = {"report": f"github tool: backend returned "
+                                           f"HTTP {status}: {body[:800]}"}
+    except Exception as exc:  # noqa: BLE001
+        reports["github"] = {"report": f"github tool failed: {type(exc).__name__}: "
+                                        f"{str(exc)[:300]}"}
+    return {"reports": reports}
 
 
 def frontend_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -3694,14 +4282,27 @@ def build_swarm_graph():
     g.add_node("frontend", frontend_node)
     g.add_node("fit_check", fit_check_node)
     g.add_node("debugger", debugger_node)
+    # v7: the chief's own utility tools — hub-and-spoke like the rest.
+    g.add_node("terminal", terminal_node)
+    g.add_node("vision", vision_node)
+    g.add_node("use_skill", use_skill_node)
+    g.add_node("ask_user", ask_user_node)
+    g.add_node("request_secret", request_secret_node)
+    g.add_node("github", github_node)
     g.add_edge(START, "chief")
     g.add_conditional_edges(
         "chief", _route_from_chief,
         {"backend": "backend", "frontend": "frontend",
-         "fit_check": "fit_check", "debugger": "debugger", "end": END})
+         "fit_check": "fit_check", "debugger": "debugger",
+         "terminal": "terminal", "vision": "vision", "use_skill": "use_skill",
+         "ask_user": "ask_user", "request_secret": "request_secret",
+         "github": "github", "end": END})
     g.add_edge("backend", "chief")
     g.add_edge("frontend", "chief")
     g.add_edge("fit_check", "chief")
+    for util in ("terminal", "vision", "use_skill", "ask_user",
+                 "request_secret", "github"):
+        g.add_edge(util, "chief")
     # debugger FAIL → chief (triage/fix loop); PASS → END (the user's spec).
     g.add_conditional_edges("debugger", _route_from_debugger,
                             {"chief": "chief", "end": END})
@@ -3906,6 +4507,38 @@ class TaskWorker(threading.Thread):
                 # ── Step 1: CLASSIFY (the gateway decision) ──────────────
                 activity("Reading your request", "active")
                 route = chief.classify(prompt)
+                # v7 (C1): "clarify" — the request is missing a decision
+                # ONLY the user can make. The agent STOPS AND ASKS instead
+                # of guessing; the answer is folded into the prompt and the
+                # classification re-runs (max 2 rounds — no ping-pong).
+                for _clarify_round in range(2):
+                    if route.get("kind") != "clarify":
+                        break
+                    question = str(route.get("question", "")).strip()
+                    if not question:
+                        break
+                    options = [str(o) for o in (route.get("options") or [])
+                               if str(o).strip()][:6]
+                    activity("Asking you a question before building", "active",
+                             question[:120])
+                    qid = "q-" + uuid.uuid4().hex[:8]
+                    ans = ask_user_wait(qid, task_id,
+                                        {"role": "chief", "question": question,
+                                         "options": options,
+                                         "context": prompt[:400]})
+                    if ans is None:
+                        append_log(task_id, "chief", "warn",
+                                   "clarification timed out — proceeding on "
+                                   "best judgment")
+                        route = {"kind": "app", "intent": prompt[:120]}
+                        break
+                    prompt = (prompt
+                              + f"\n\n[The user answered the clarification "
+                                f"question \"{question}\" with: "
+                                f"\"{str(ans['answer'])[:600]}\"]")
+                    activity("Asking you a question before building", "done",
+                             f"answered: {str(ans['answer'])[:100]}")
+                    route = chief.classify(prompt)
                 if route["kind"] == "answer":
                     activity("Answering your question", "done")
                     reply = route["reply"]
@@ -4151,6 +4784,7 @@ def _sync_payload() -> Dict[str, Any]:
         "tasks": all_tasks(),
         "logs": recent_logs(LOG_TAIL_FOR_SYNC),
         "pending_approval": _pending_approval_payload(),
+        "pending_interactions": pending_interactions(),
         "server": {
             "uptime_s": int(time.time() - STARTED_AT),
             "model": LLM_MODEL,
@@ -4305,6 +4939,79 @@ async def approval_route(request: Request):
     return {"accepted": ok}
 
 
+@app.post("/answer")
+async def answer_route(request: Request):
+    """v7 (C1): REST fallback for user answers to agent questions
+    (WS user_answer is the primary path)."""
+    _guard(request)
+    body = await request.json()
+    question_id = str(body.get("question_id") or "").strip()
+    answer = str(body.get("answer") or "").strip()
+    if not question_id or not answer:
+        return JSONResponse({"error": "question_id and answer required"},
+                            status_code=400)
+    ok = question_submit(question_id, answer)
+    if ok:
+        emit({"type": "user_question_resolved", "question_id": question_id,
+              "via": "rest", "answer": answer[:200]})
+    return {"accepted": ok}
+
+
+@app.post("/internal/secrets")
+async def internal_secrets_route(request: Request):
+    """v7 (C2): the backend delivers a user-provided secret HERE (the
+    authenticated control path). The value lands in SECRETS_ENV_PATH
+    (mode 600, outside the workspace + git), the dev server respawns with
+    it sourced, and the blocked request_secret tool call resolves with a
+    RECEIPT — the value never enters agent context, the /ws event bus, or
+    any log. Guard: ORCH_TOKEN via Authorization header OR X-VM-Token."""
+    if TOKEN:
+        header = request.headers.get("authorization", "")
+        vm_tok = request.headers.get("x-vm-token", "")
+        if not (secrets.compare_digest(header, f"Bearer {TOKEN}")
+                or secrets.compare_digest(vm_tok, TOKEN)):
+            raise HTTPException(status_code=401, detail="unauthorized")
+    body = await request.json()
+    request_id = str(body.get("request_id") or "").strip()
+    name = str(body.get("name") or "").strip().upper()
+    value = body.get("value")
+    declined = body.get("declined") is True
+    vault = str(body.get("vault") or "")
+    if not request_id or not name:
+        return JSONResponse({"error": "request_id and name required"},
+                            status_code=400)
+    if not declined and not isinstance(value, str):
+        return JSONResponse({"error": "value or declined:true required"},
+                            status_code=400)
+    if declined:
+        secret_resolve(request_id, "declined", "user declined")
+        emit({"type": "secret_request_resolved", "task_id": None,
+              "request_id": request_id, "state": "declined",
+              "detail": "the user declined to provide it"})
+        return {"ok": True, "state": "declined"}
+    stored = _store_secret_env(name, str(value))
+    if not stored:
+        secret_resolve(request_id, "failed", "sidecar env write failed")
+        emit({"type": "secret_request_resolved", "task_id": None,
+              "request_id": request_id, "state": "failed",
+              "detail": "storing the secret in the VM failed"})
+        return JSONResponse({"error": "secret storage failed"}, status_code=500)
+    _respawn_dev_with_secrets()
+    # vault: "stored" (Daytona Secrets Manager of record) | "unavailable…"
+    # (delivery succeeded with reduced protection — surfaced honestly).
+    state = "stored" if vault in ("", "stored") else "vault_degraded"
+    detail = ("stored securely" if state == "stored"
+              else f"delivered to the app; vault protection unavailable "
+                   f"({vault[:200]})")
+    secret_resolve(request_id, state, detail)
+    emit({"type": "secret_request_resolved", "task_id": None,
+          "request_id": request_id, "state": state, "detail": detail})
+    append_log(None, "daemon", "info",
+               f"secret {name} delivered and respawned dev servers "
+               f"(vault={vault or 'unknown'})")
+    return {"ok": True, "state": state}
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     """The dumb-terminal channel + the approval interaction surface."""
@@ -4336,6 +5043,14 @@ async def ws_endpoint(ws: WebSocket):
                 task_id = enqueue_task(text)
                 await ws.send_text(json.dumps(
                     {"type": "task_queued", "task_id": task_id, "prompt": text}))
+            elif mtype == "user_answer":
+                # v7 (C1): an answer to an agent question (question card).
+                question_id = str(msg.get("question_id") or "").strip()
+                answer = str(msg.get("answer") or "").strip()
+                ok = question_submit(question_id, answer) if (question_id and answer) else False
+                await ws.send_text(json.dumps(
+                    {"type": "user_question_resolved", "question_id": question_id,
+                     "via": "ws" if ok else "unknown", "accepted": ok}))
             elif mtype == "approval_response":
                 task_id = str(msg.get("task_id") or "").strip()
                 action = str(msg.get("action") or "").strip()

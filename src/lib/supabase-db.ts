@@ -39,6 +39,8 @@ export type DbUser = {
   weekly_digest: boolean | null;
   nvidia_api_key: string | null;
   daytona_api_key: string | null;
+  /** Write-only GitHub PAT (contract C6) — never returned by /settings. */
+  github_pat: string | null;
 };
 
 export type DbAgentMessage = {

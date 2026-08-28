@@ -473,3 +473,81 @@ class BrowserInstallResult(BaseModel):
     browser_path: str | None = None
     install_log: str = ""
     duration_ms: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Daytona Secrets Manager (org vault + sandbox mounts)
+# ---------------------------------------------------------------------------
+
+
+class SecretStoreRequest(BaseModel):
+    """Store a user-provided secret in the Daytona org vault and mount it.
+
+    The caller (Node backend, behind JWT + project ownership) sends the
+    plaintext value exactly once; it is written to the Daytona Secrets
+    Manager and NEVER logged, echoed, or persisted anywhere else.
+    """
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Secret name / env var name, e.g. OPENAI_API_KEY",
+    )
+    value: str = Field(
+        min_length=1,
+        max_length=131_072,
+        description="Secret value (plaintext — never logged, never echoed)",
+    )
+    project_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Owning project UUID (scopes the vault secret name)",
+    )
+    mount_env: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Env var name the vault secret is mounted as inside the sandbox "
+            "(defaults to `name`)"
+        ),
+    )
+
+
+class SecretStoreResponse(BaseModel):
+    """Result of a vault store + mount attempt.
+
+    ``vault="unavailable"`` is NOT an error: the current API key may lack
+    the ``manage:secrets`` permission — the caller still delivers the value
+    to the VM sidecar directly and continues with reduced protection
+    (surfaced honestly downstream via ``detail``).
+    """
+    ok: bool = True
+    vault: str = Field(description='"stored" or "unavailable"')
+    detail: str | None = Field(
+        default=None,
+        description="Actionable reason when the vault write was degraded",
+    )
+    secret_name: str | None = Field(
+        default=None,
+        description="Vault secret name (arcforge-<project>-<NAME>)",
+    )
+    mounted: bool = Field(
+        default=False,
+        description="True when the sandbox mount (update_secrets) succeeded",
+    )
+
+
+class SecretClearResponse(BaseModel):
+    """Result of a best-effort secret cleanup (never throws)."""
+    ok: bool = True
+    unmounted: bool = Field(
+        default=False,
+        description="True when the sandbox secret mounts were detached",
+    )
+    deleted: int = Field(
+        default=0,
+        description="Number of arcforge-* vault secrets deleted for the project",
+    )
+    detail: str | None = Field(
+        default=None,
+        description="Non-fatal failures encountered during cleanup",
+    )

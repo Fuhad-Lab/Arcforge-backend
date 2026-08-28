@@ -70,6 +70,9 @@ function toSettings(row: DbUser) {
     weeklyDigest: row.weekly_digest ?? false,
     hasNvidiaKey: Boolean(row.nvidia_api_key),
     hasDaytonaKey: Boolean(row.daytona_api_key),
+    // GitHub PAT is write-only (contract C6): the settings response carries
+    // ONLY the connected boolean — the PAT value never leaves the DB.
+    githubConnected: Boolean(row.github_pat),
   };
 }
 
@@ -331,6 +334,11 @@ router.put("/settings", async (req: Request, res: Response, next: NextFunction) 
     }
     if (typeof body.daytonaApiKey === "string") {
       patch.daytona_api_key = body.daytonaApiKey.trim() ? body.daytonaApiKey.trim() : null;
+    }
+    // GitHub PAT (contract C6): write-only — trimmed, empty string clears
+    // (null). NEVER echoed back; toSettings exposes githubConnected only.
+    if (typeof body.githubPat === "string") {
+      patch.github_pat = body.githubPat.trim() ? body.githubPat.trim() : null;
     }
 
     const { data: row, error } = await supabase

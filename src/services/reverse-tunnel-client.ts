@@ -36,6 +36,13 @@
  *                {t:"error", id, message}
  *                {t:"ping"} / {t:"pong"}
  *
+ * PATH ROUTING (2026-08-28): req frames whose `path` starts with
+ * /tunnel/github are routed to services/github-proxy.ts (this connection
+ * is per-sandbox, so the proxy resolves sandboxId→project→user→PAT and
+ * calls api.github.com with the PAT injected server-side — the PAT never
+ * enters the VM). Other /tunnel/* paths get a 404 JSON; everything else
+ * goes to the NVIDIA forwarder unchanged. Mirrors routes/tunnel.ts.
+ *
  * AUTH
  * ────
  * The shared secret `process.env.AGENT_PROXY_SECRET` is presented as
@@ -59,6 +66,7 @@
  */
 import WebSocket from "ws";
 import { forwardToNvidia, type ForwardParams } from "./nvidia-forwarder";
+import { handleGithubTunnel } from "./github-proxy";
 import { logger } from "../lib/logger";
 
 // ─── Configuration ──────────────────────────────────────────────────────
@@ -184,13 +192,21 @@ function clearTimers(conn: ReverseTunnelConnection): void {
 
 // ─── Per-req frame handler ──────────────────────────────────────────────
 /**
- * Handle a single `req` frame end-to-end: forward to NVIDIA, send `res`
- * + `chunk`(s) + `done` to the VM, or `error` on failure. Never throws
- * to the caller — all errors are converted to `error` frames.
+ * Handle a single `req` frame end-to-end, ROUTED BY PATH:
+ *   /tunnel/github → GitHub proxy (sandboxId→project→user→PAT; the PAT
+ *                   is injected here, server-side — it never enters the VM)
+ *   /tunnel/*      → 404 JSON (unknown tunnel path)
+ *   else           → NVIDIA forwarder (unchanged — /v1/*, /vlm/* and
+ *                   legacy bare paths)
+ *
+ * Sends `res` + `chunk`(s) + `done` to the VM, or `error` on failure.
+ * Never throws to the caller — all errors are converted to `error`
+ * frames.
  *
  * This is the SAME logic as `handleReqFrame` in `src/routes/tunnel.ts`
  * — the only difference is that we hold the WS to the VM (vs. the VM
- * holding the WS to us).
+ * holding the WS to us) AND this connection is per-sandbox, so the
+ * GitHub proxy gets its identity from `conn.sandboxId` directly.
  */
 async function handleReqFrame(
   conn: ReverseTunnelConnection,
@@ -201,6 +217,66 @@ async function handleReqFrame(
     send(conn, { t: "error", id: "", message: "req frame missing id" });
     return;
   }
+
+  // PATH ROUTING — strip the query string before prefix matching (the
+  // VM-side client appends ?query to the path).
+  const path = (frame.path || "").split("?")[0];
+
+  if (path.startsWith("/tunnel/github")) {
+    // GitHub REST + workspace sync on the user's PAT — identity comes
+    // from this per-sandbox connection.
+    try {
+      let sentHead = false;
+      for await (const event of handleGithubTunnel(conn, frame)) {
+        if (event.kind === "head") {
+          sentHead = true;
+          send(conn, {
+            t: "res",
+            id,
+            status: event.status,
+            headers: event.headers,
+          });
+        } else {
+          if (!sentHead) {
+            // Defensive — proxy should always yield head first.
+            send(conn, { t: "res", id, status: 200, headers: {} });
+            sentHead = true;
+          }
+          send(conn, { t: "chunk", id, body: event.body });
+        }
+      }
+      send(conn, { t: "done", id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "github tunnel forward failed";
+      logger.warn(
+        { sandboxId: conn.sandboxId, id, err: message },
+        "reverse-tunnel: github request failed",
+      );
+      send(conn, { t: "error", id, message });
+    }
+    return;
+  }
+
+  if (path.startsWith("/tunnel/")) {
+    // Unknown tunnel path — honest 404 JSON (res + chunk + done).
+    send(conn, {
+      t: "res",
+      id,
+      status: 404,
+      headers: { "content-type": "application/json" },
+    });
+    send(conn, {
+      t: "chunk",
+      id,
+      body: JSON.stringify({
+        ok: false,
+        error: `unknown tunnel path "${path}" — supported: /tunnel/github`,
+      }),
+    });
+    send(conn, { t: "done", id });
+    return;
+  }
+
   const params: ForwardParams = {
     method: frame.method || "POST",
     path: frame.path || "/v1/chat/completions",

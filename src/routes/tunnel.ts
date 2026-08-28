@@ -18,6 +18,18 @@
  * any NVIDIA traffic. The backend injects the NVIDIA API key
  * server-side; the key never enters the VM.
  *
+ * PATH ROUTING (2026-08-28): every `req` frame used to go to
+ * forwardToNvidia. Now the frame `path` selects a handler:
+ *   /tunnel/github → services/github-proxy.ts (sandboxId→user→PAT;
+ *                   api.github.com REST + workspace sync — the PAT
+ *                   never enters the VM)
+ *   /tunnel/*      → 404 JSON (unknown tunnel path)
+ *   anything else  → forwardToNvidia (unchanged — /v1/*, /vlm/* and
+ *                   legacy bare paths)
+ * The routing mirrors services/reverse-tunnel-client.ts exactly (the
+ * two handlers are intentionally duplicated — one for the VM→backend
+ * dial, one for the backend→VM reverse dial).
+ *
  * PROTOCOL (shared with the VM-side tunnel client — match EXACTLY)
  * ─────────────────────────────────────────────────────────────────
  * Connection: WS upgrade to `/api/tunnel` with header
@@ -30,7 +42,8 @@
  *
  *   Client→Server:
  *     { "t":"req", "id":"<uuid>", "method":"POST",
- *       "path":"/v1/chat/completions", "headers":{...}, "body":"<str>" }
+ *       "path":"/v1/chat/completions", "headers":{...}, "body":"<str>",
+ *       "sandboxId":"<optional — caller identity for /tunnel/github>" }
  *     { "t":"ping" }
  *
  *   Server→Client:
@@ -60,6 +73,7 @@ import type { Server, IncomingMessage } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../lib/logger";
 import { forwardToNvidia } from "../services/nvidia-forwarder";
+import { handleGithubTunnel } from "../services/github-proxy";
 
 // ─── Tunnel path ────────────────────────────────────────────────────────
 const TUNNEL_PATH = "/api/tunnel";
@@ -80,6 +94,9 @@ interface ReqFrame {
   path: string;
   headers: Record<string, string>;
   body: string;
+  /** Optional caller identity for /tunnel/github (the direct VM→backend
+   *  dial carries no per-sandbox binding — the frame may supply one). */
+  sandboxId?: string;
 }
 
 // ─── Auth ────────────────────────────────────────────────────────────────
@@ -122,14 +139,97 @@ function send(ws: WebSocket, frame: AnyFrame): void {
 
 // ─── Per-request handler ───────────────────────────────────────────────
 /**
- * Handle a single `req` frame end-to-end: forward to NVIDIA, send `res`
- * + `chunk`(s) + `done` to the VM, or `error` on failure. Never throws
- * to the caller — all errors are converted to `error` frames.
+ * Handle a single `req` frame end-to-end, ROUTED BY PATH:
+ *   /tunnel/github → GitHub proxy (user PAT injected server-side)
+ *   /tunnel/*      → 404 JSON
+ *   else           → NVIDIA forwarder (unchanged legacy behavior)
+ *
+ * Sends `res` + `chunk`(s) + `done` to the VM, or `error` on failure.
+ * Never throws to the caller — all errors are converted to `error`
+ * frames. Mirrors handleReqFrame in services/reverse-tunnel-client.ts
+ * (intentional duplication — keep in sync).
  */
-async function handleReqFrame(ws: WebSocket, frame: ReqFrame): Promise<void> {
+async function handleReqFrame(
+  ws: WebSocket,
+  frame: ReqFrame,
+  connSandbox: { sandboxId: string },
+): Promise<void> {
   const id = frame.id || "";
   if (!id) {
     send(ws, { t: "error", id: "", message: "req frame missing id" });
+    return;
+  }
+
+  // PATH ROUTING — strip the query string before prefix matching (the
+  // VM-side client appends ?query to the path).
+  const path = (frame.path || "").split("?")[0];
+
+  if (path.startsWith("/tunnel/github")) {
+    // This connection is the shared direct dial (no per-sandbox
+    // binding of its own) — the sandbox identity comes from the frame
+    // (or is remembered from a previous frame on this connection).
+    const sandboxId =
+      (typeof frame.sandboxId === "string" && frame.sandboxId) || connSandbox.sandboxId;
+    if (!sandboxId) {
+      send(ws, {
+        t: "res",
+        id,
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+      send(ws, {
+        t: "chunk",
+        id,
+        body: JSON.stringify({
+          ok: false,
+          error:
+            "sandbox identity missing on this tunnel connection — include a sandboxId field in the req frame",
+        }),
+      });
+      send(ws, { t: "done", id });
+      return;
+    }
+    try {
+      let sentHead = false;
+      for await (const event of handleGithubTunnel({ sandboxId }, frame)) {
+        if (event.kind === "head") {
+          sentHead = true;
+          send(ws, { t: "res", id, status: event.status, headers: event.headers });
+        } else {
+          if (!sentHead) {
+            // Defensive: proxy should always yield head first.
+            send(ws, { t: "res", id, status: 200, headers: {} });
+            sentHead = true;
+          }
+          send(ws, { t: "chunk", id, body: event.body });
+        }
+      }
+      send(ws, { t: "done", id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "github tunnel forward failed";
+      logger.warn({ id, sandboxId, err: message }, "tunnel: github request failed");
+      send(ws, { t: "error", id, message });
+    }
+    return;
+  }
+
+  if (path.startsWith("/tunnel/")) {
+    // Unknown tunnel path — honest 404 JSON (res + chunk + done).
+    send(ws, {
+      t: "res",
+      id,
+      status: 404,
+      headers: { "content-type": "application/json" },
+    });
+    send(ws, {
+      t: "chunk",
+      id,
+      body: JSON.stringify({
+        ok: false,
+        error: `unknown tunnel path "${path}" — supported: /tunnel/github`,
+      }),
+    });
+    send(ws, { t: "done", id });
     return;
   }
 
@@ -289,6 +389,10 @@ export function attachTunnelServer(httpServer: Server): void {
       awaitingPong: false,
       closed: false,
     };
+    // Caller identity for /tunnel/github — this shared dial has no
+    // per-sandbox binding of its own, so the sandboxId is learned from
+    // req frames that carry one (and remembered for the connection).
+    const connSandbox: { sandboxId: string } = { sandboxId: "" };
 
     logger.info(
       { ip: req.socket.remoteAddress },
@@ -324,7 +428,12 @@ export function attachTunnelServer(httpServer: Server): void {
             send(ws, { t: "error", id: "", message: "req frame missing id" });
             return;
           }
-          handleReqFrame(ws, frame as unknown as ReqFrame).catch((err) => {
+          // Remember an explicitly-supplied sandbox identity for later
+          // /tunnel/github frames on this connection.
+          const frameSandboxId =
+            typeof frame.sandboxId === "string" ? frame.sandboxId : "";
+          if (frameSandboxId) connSandbox.sandboxId = frameSandboxId;
+          handleReqFrame(ws, frame as unknown as ReqFrame, connSandbox).catch((err) => {
             const message =
               err instanceof Error ? err.message : "req handler crashed";
             send(ws, { t: "error", id, message });

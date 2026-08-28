@@ -17,6 +17,12 @@ import { logger } from "../lib/logger";
 import { requireAuth } from "../middleware/auth";
 import { getServiceSupabase, isSupabaseConfigured } from "../lib/supabase-db";
 import {
+  getProjectRow,
+  getProjectRowBySandbox,
+  type ProjectRow,
+} from "../lib/project-lookup";
+import {
+  daytonaBaseUrl,
   destroyWorkspace,
   ensureProjectSandbox,
   getAgentInfo,
@@ -45,31 +51,10 @@ const router: IRouter = Router();
 router.use(requireAuth);
 
 // ─── OWNERSHIP RESOLUTION ─────────────────────────────────────────────────
-
-type ProjectRow = {
-  id: string;
-  user_id: string;
-  name: string;
-  logo_url: string | null;
-  session_id: string | null;
-  sandbox_id: string | null;
-};
-
-/**
- * Fetch a project row by id. Returns null when not found (or DB down).
- * Callers MUST compare `row.user_id === req.userId` before acting.
- */
-async function getProjectRow(projectId: string): Promise<ProjectRow | null> {
-  if (!isSupabaseConfigured()) return null;
-  const supabase = getServiceSupabase();
-  const { data, error } = await supabase
-    .from("projects")
-    .select("id,user_id,name,logo_url,session_id,sandbox_id")
-    .eq("id", projectId)
-    .maybeSingle();
-  if (error) throw new Error(`project lookup: ${error.message}`);
-  return (data as ProjectRow) ?? null;
-}
+// getProjectRow / getProjectRowBySandbox / ProjectRow live in
+// src/lib/project-lookup.ts (shared with services/github-proxy.ts, which
+// must not import route modules — the reverse-tunnel client imports it and
+// is itself imported by this router).
 
 /**
  * Ownership guard: responds 404 (missing) or 403 (foreign project) and
@@ -99,25 +84,6 @@ async function saveSandboxId(projectId: string, sandboxId: string): Promise<void
     .update({ sandbox_id: sandboxId, updated_at: new Date().toISOString() })
     .eq("id", projectId);
   if (error) throw new Error(`sandbox_id save: ${error.message}`);
-}
-
-/**
- * Look up a project row by its sandbox_id. Used by the preview proxy
- * routes to verify the caller owns the sandbox before proxying through
- * to the VM. Returns null when no project owns this sandbox (or DB down).
- */
-async function getProjectRowBySandbox(
-  sandboxId: string,
-): Promise<ProjectRow | null> {
-  if (!isSupabaseConfigured()) return null;
-  const supabase = getServiceSupabase();
-  const { data, error } = await supabase
-    .from("projects")
-    .select("id,user_id,name,logo_url,session_id,sandbox_id")
-    .eq("sandbox_id", sandboxId)
-    .maybeSingle();
-  if (error) throw new Error(`project lookup by sandbox: ${error.message}`);
-  return (data as ProjectRow) ?? null;
 }
 
 /**
@@ -223,6 +189,188 @@ router.get("/agent-info/:projectId", async (req: Request, res: Response, next: N
       "agent-info probe failed — frontend will use host-side SSE",
     );
     res.json({ installed: false, port: 9000, url: null, token: null, launcher: null, alive: false, app_url: null, app_port: null });
+  }
+});
+
+// ─── POST /api/workspace/secrets/:projectId — secure secret delivery ──────
+// Contract C2/C6 submission path: browser → edge fn vm-ops {action:
+// "secret-provide"} → this route. The VALUE never travels over the /ws
+// event bus and never enters agent context — it goes exactly two places:
+//   (a) the Daytona org vault via the Python daytona-service
+//       (POST /api/sandbox/{sandbox_id}/secrets — creates
+//       arcforge-<project8>-<NAME> with a provider host allowlist and
+//       mounts it into the sandbox; degrades honestly to
+//       vault:"unavailable" when the key lacks manage:secrets), and
+//   (b) the VM sidecar's authenticated /internal/secrets route (X-VM-Token
+//       — same url+token brokering as getAgentInfo), which merges it into
+//       /home/daytona/.system/secrets.env (mode 600) and respawns the dev
+//       server so the app process inherits it.
+// On decline, the vault is skipped and the sidecar is notified with
+// declined:true so the pending request_secret tool call resolves.
+//
+// LOGGING: the request body carries the secret value — this handler logs
+// ONLY {projectId, sandboxId, requestId, name, declined, vault}. The
+// pino-http request serializer (app.ts) logs id/method/url only, so the
+// value cannot leak through request logs either.
+
+const SECRETS_TIMEOUTS = {
+  /** Vault write + mount through the (possibly cold-starting) daytona-service. */
+  daytonaVault: 30_000,
+  /** In-VM sidecar delivery (local HTTP inside the VM via the preview URL). */
+  sidecar: 20_000,
+} as const;
+
+/** POST {request_id, name, value|declined, vault} to the sidecar /internal/secrets. */
+async function postSecretToSidecar(
+  vmUrl: string,
+  vmToken: string,
+  payload: { request_id: string; name: string; value?: string; declined?: boolean; vault?: string },
+): Promise<void> {
+  const res = await fetch(`${vmUrl.replace(/\/+$/, "")}/internal/secrets`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-VM-Token": vmToken,
+    },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(SECRETS_TIMEOUTS.sidecar),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`sidecar /internal/secrets responded ${res.status}: ${text.slice(0, 300)}`);
+  }
+}
+
+router.post("/secrets/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const projectId = String(req.params.projectId || "");
+    const body = req.body ?? {};
+    const requestId: string = typeof body.requestId === "string" ? body.requestId.trim() : "";
+    const name: string = typeof body.name === "string" ? body.name.trim() : "";
+    const value: string | undefined =
+      typeof body.value === "string" && body.value.length > 0 ? body.value : undefined;
+    const declined: boolean = body.declined === true;
+
+    if (!requestId || !name) {
+      res.status(400).json({ error: "requestId and name are required" });
+      return;
+    }
+    if (!declined && !value) {
+      res.status(400).json({ error: "either value or declined:true is required" });
+      return;
+    }
+
+    // 1. Ownership check (same guard as agent-info).
+    const row = await getProjectRow(projectId);
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      res.status(404).json({ error: "No sandbox for this project yet" });
+      return;
+    }
+
+    // 2. Broker the VM sidecar url+token (same path as agent-info).
+    let info: Awaited<ReturnType<typeof getAgentInfo>> | null = null;
+    try {
+      info = await getAgentInfo(row.sandbox_id);
+    } catch (err: unknown) {
+      logger.warn(
+        { projectId, sandboxId: row.sandbox_id, err: err instanceof Error ? err.message : err },
+        "secrets: agent-info probe failed — cannot reach the VM sidecar",
+      );
+    }
+    if (!info?.url || !info.token) {
+      res.status(502).json({
+        error: "Workspace VM sidecar unreachable — retry when the workspace is running",
+      });
+      return;
+    }
+
+    // 3. Decline path: skip the vault, notify the sidecar, resolve skipped.
+    if (declined) {
+      try {
+        await postSecretToSidecar(info.url, info.token, { request_id: requestId, name, declined: true, vault: "skipped" });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "sidecar unreachable";
+        logger.warn(
+          { projectId, sandboxId: row.sandbox_id, requestId, name, err: message },
+          "secrets: declined-notify to sidecar failed",
+        );
+        res.status(502).json({ error: "Sidecar unreachable", detail: message });
+        return;
+      }
+      logger.info(
+        { projectId, sandboxId: row.sandbox_id, requestId, name, declined: true },
+        "secrets: user declined — sidecar notified (vault skipped)",
+      );
+      res.json({ ok: true, vault: "skipped" });
+      return;
+    }
+
+    // 4. Value path: (a) Daytona vault via the Python daytona-service,
+    //    (b) sidecar delivery. Vault failures degrade to
+    //    vault:"unavailable:<reason>" — delivery still proceeds.
+    let vault = "stored";
+    let vaultDetail: string | undefined;
+    try {
+      const vaultRes = await fetch(
+        `${daytonaBaseUrl()}/api/sandbox/${encodeURIComponent(row.sandbox_id)}/secrets`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name,
+            value,
+            project_id: projectId,
+            mount_env: name,
+          }),
+          signal: AbortSignal.timeout(SECRETS_TIMEOUTS.daytonaVault),
+        },
+      );
+      if (vaultRes.ok) {
+        const payload = (await vaultRes.json().catch(() => null)) as
+          | { vault?: unknown; detail?: unknown }
+          | null;
+        const vaultState = typeof payload?.vault === "string" ? payload.vault : "";
+        if (vaultState === "stored" || vaultState === "unavailable") {
+          vault = vaultState;
+        } else {
+          vault = "stored";
+        }
+        vaultDetail =
+          typeof payload?.detail === "string" && payload.detail ? payload.detail : undefined;
+      } else {
+        const text = await vaultRes.text().catch(() => "");
+        vault = `unavailable: daytona-service HTTP ${vaultRes.status}`;
+        vaultDetail = text.slice(0, 300) || undefined;
+      }
+    } catch (err: unknown) {
+      // Network error/timeout reaching the daytona-service — degrade, don't fail.
+      vault = `unavailable: ${err instanceof Error ? err.message : "daytona-service unreachable"}`;
+    }
+
+    // (b) Deliver to the sidecar — THE critical path (the app reads
+    //     process.env inside the VM; the vault is defense-in-depth).
+    try {
+      await postSecretToSidecar(info.url, info.token, { request_id: requestId, name, value, vault });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "sidecar unreachable";
+      logger.warn(
+        { projectId, sandboxId: row.sandbox_id, requestId, name, vault, err: message },
+        "secrets: sidecar delivery failed — value NOT delivered",
+      );
+      res.status(502).json({ error: "Sidecar unreachable", detail: message, vault });
+      return;
+    }
+
+    // Name + sandbox only — the value is NEVER logged.
+    logger.info(
+      { projectId, sandboxId: row.sandbox_id, requestId, name, vault },
+      "secrets: delivered to sidecar (vault state recorded)",
+    );
+    res.json({ ok: true, vault, ...(vaultDetail ? { detail: vaultDetail } : {}) });
+  } catch (error) {
+    next(error);
   }
 });
 

@@ -231,18 +231,18 @@ state = {"task_id": "t2", "plan": plan,
          "dispatches": ["backend", "frontend", "fit_check"],
          "reports": {"backend": {"report": "b"}, "frontend": {"report": "f"}},
          "dispatch_budget": 3, "verdict": ""}
-tool, task = orch._dispatch_guardrails(state, {"tool": "finish", "task": ""})
+tool, task, _args = orch._dispatch_guardrails(state, {"tool": "finish", "task": ""})
 check("budget exhausted → QA gate forced", tool == "debugger", tool)
 state2 = dict(state, dispatches=["backend", "frontend", "fit_check", "debugger"],
               verdict="pass")
-tool2, _ = orch._dispatch_guardrails(state2, {"tool": "finish", "task": ""})
+tool2, _, _a2 = orch._dispatch_guardrails(state2, {"tool": "finish", "task": ""})
 check("QA passed → end allowed", tool2 == "end", tool2)
 
 # frontend-only plan: no backend dispatch
 state3 = {"task_id": "t3",
           "plan": "# X\n## Data & API\nNo backend needed (static/frontend-only).\n",
           "dispatches": [], "reports": {}, "dispatch_budget": 8, "verdict": ""}
-tool3, _ = orch._dispatch_guardrails(state3, {"tool": "backend_agent", "task": "x"})
+tool3, _, _a3 = orch._dispatch_guardrails(state3, {"tool": "backend_agent", "task": "x"})
 check("frontend-only plan: backend dispatch rejected", tool3 == "frontend", tool3)
 
 # ═══ TEST 5b: the plan-gap loop — debugger reports WHAT'S MISSING, the ═══

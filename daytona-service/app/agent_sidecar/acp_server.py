@@ -30,6 +30,11 @@ MAPPING onto the daemon's native event bus (emit()):
     task_queued  → session/updated          activity(active) → agent/tool_call
     activity(done) → agent/tool_call/update log             → agent/thought
     terminal     → terminal/output          task_done/_failed → agent/turn-end
+    approval_request → agent/approval_request      (v7)
+    user_question → agent/ask_user                (v7 — C1)
+    user_question_resolved → agent/ask_user/resolved (v7)
+    secret_request → agent/secret_request          (v7 — C2)
+    secret_request_resolved → agent/secret_request/resolved (v7)
 
 Session model: the daemon is task-oriented; ACP is session-oriented. An
 ACP-created session maps its prompts to task ids; events for tasks with no
@@ -186,6 +191,54 @@ def relay(event: Dict[str, Any]) -> None:
             _notify("terminal/output", {
                 "sessionId": _session_for(task_id),
                 "data": f"$ {cmd}\n{out}"[:6000]})
+            return
+
+        # v7 (C1): the agent paused to ask the user a question — surface it
+        # so ACP clients can render the question card.
+        if etype == "user_question":
+            _notify("agent/ask_user", {
+                "sessionId": _session_for(task_id),
+                "questionId": str(event.get("question_id", "")),
+                "role": str(event.get("role", "chief")),
+                "question": str(event.get("question", ""))[:1200],
+                "options": [str(o) for o in (event.get("options") or [])],
+                "context": str(event.get("context", ""))[:600]})
+            return
+
+        if etype == "user_question_resolved":
+            _notify("agent/ask_user/resolved", {
+                "sessionId": _session_for(task_id),
+                "questionId": str(event.get("question_id", "")),
+                "answer": str(event.get("answer", ""))[:600]})
+            return
+
+        # v7 (C2): the agent requested a secret — the request metadata only
+        # (the VALUE never rides the event bus by design).
+        if etype == "secret_request":
+            _notify("agent/secret_request", {
+                "sessionId": _session_for(task_id),
+                "requestId": str(event.get("request_id", "")),
+                "role": str(event.get("role", "chief")),
+                "name": str(event.get("name", "")),
+                "purpose": str(event.get("purpose", ""))[:600],
+                "hint": str(event.get("hint", ""))[:300]})
+            return
+
+        if etype == "secret_request_resolved":
+            _notify("agent/secret_request/resolved", {
+                "sessionId": _session_for(task_id),
+                "requestId": str(event.get("request_id", "")),
+                "state": str(event.get("state", "")),
+                "detail": str(event.get("detail", ""))[:500]})
+            return
+
+        # v7: plan approvals were never relayed to ACP clients — now they
+        # are (the ACP studio can approve a plan without the /ws socket).
+        if etype == "approval_request":
+            _notify("agent/approval_request", {
+                "sessionId": _session_for(task_id),
+                "taskId": task_id,
+                "plan": str(event.get("plan", ""))[:6000]})
             return
 
         if etype == "task_done":

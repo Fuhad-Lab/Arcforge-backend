@@ -22,6 +22,7 @@ from app.routers import (
     health,
     orchestrator,
     sandboxes,
+    secrets,
     workspace,
 )
 from app.services.quota_reaper import reap_forever
@@ -100,6 +101,10 @@ def create_app() -> FastAPI:
     application.include_router(files.router, prefix=api_prefix)
     application.include_router(workspace.router, prefix=api_prefix)
     application.include_router(orchestrator.router, prefix=api_prefix)
+    # Secrets Manager: mounted at /api (NOT /api/v1) so the Node backend
+    # calls POST /api/sandbox/{sandbox_id}/secrets — the exact path pinned
+    # by the C6 backend contract.
+    application.include_router(secrets.router, prefix="/api")
 
     return application
 
