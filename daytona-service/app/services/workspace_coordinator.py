@@ -39,6 +39,7 @@ from app.daytona_client import (
     get_daytona,
 )
 from app.models import CodeRunResult
+from app.services.degit import fetch_template_safe
 from app.services.quota_reaper import is_quota_error, reap_idle_workspaces, force_free_quota
 
 logger = logging.getLogger(__name__)
@@ -318,6 +319,10 @@ class DaytonaWorkspaceManager:
         This is non-fatal -- if the mount fails (no privileges, /workspace
         already mounted), we proceed with disk-backed /workspace. Returns
         ``{"vfs_backend": "tmpfs" | "disk"}``.
+
+        Greenfield degit: after the mandatory dirs exist, the pinned Next.js
+        starter is fetched from the templates repo (codeload tarball) and
+        planted into /workspace/frontend — best-effort, never fatal.
         """
         daytona = self._get_client()
         sandbox = await asyncio.to_thread(daytona.get, sandbox_id)
@@ -377,6 +382,41 @@ class DaytonaWorkspaceManager:
             )
             raise RuntimeError(
                 f"Workspace scaffold failed: {getattr(result, 'result', '')}"
+            )
+
+        # --- Greenfield template planting (degit, best-effort) ---
+        # Architecture mandate: instantly pull an un-versioned frontend
+        # framework template (pinned Next.js 14 + Tailwind starter) into the
+        # fresh MicroVM so a new workspace boots with a compilable app
+        # instead of an empty dir. Strictly best-effort: ANY failure here
+        # only logs a warning — the in-VM orchestrator's minimal scaffold
+        # remains the fallback, and workspace creation always succeeds.
+        try:
+            template_files = await asyncio.to_thread(fetch_template_safe)
+            if template_files:
+                for rel, content in template_files.items():
+                    # upload_file creates parent dirs inside the VM.
+                    await asyncio.to_thread(
+                        sandbox.fs.upload_file,
+                        content.encode("utf-8"),
+                        f"{WORKSPACE_ROOT}/frontend/{rel}",
+                    )
+                logger.info(
+                    "Greenfield template planted: %d files into %s/frontend "
+                    "in sandbox %s",
+                    len(template_files), WORKSPACE_ROOT, sandbox_id,
+                )
+            else:
+                logger.warning(
+                    "Greenfield template empty for sandbox %s — keeping bare "
+                    "dirs (in-VM scaffold remains the fallback)",
+                    sandbox_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — planting must never fail provisioning
+            logger.warning(
+                "Greenfield template planting failed in sandbox %s: %s — "
+                "in-VM scaffold remains the fallback",
+                sandbox_id, exc,
             )
 
         logger.info(
