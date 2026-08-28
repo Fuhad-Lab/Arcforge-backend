@@ -1443,8 +1443,29 @@ def _extract_json(text: str) -> Dict[str, Any]:
         candidate = candidate[start:end + 1]
     try:
         return json.loads(candidate)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"LLM reply was not valid JSON: {text[:300]}") from exc
+    except json.JSONDecodeError:
+        pass
+    # v7.7: models occasionally NEST a JSON object inside a JSON string
+    # value without escaping (live on the debug follow-up:
+    # {"plan":"{"plan":"direct","agent":"frontend",…}"} — the outer object
+    # is unparseable, the inner one is exactly what we want). Try brace
+    # start × brace-end combinations (later starts, earlier ends first).
+    if end > 0:
+        starts = [m.start() for m in re.finditer(r"\{", candidate)][:8]
+        ends = [m.start() for m in re.finditer(r"\}", candidate)][-8:]
+        for s2 in reversed(starts):
+            if s2 <= start:
+                continue
+            for e2 in reversed(ends):
+                if e2 <= s2:
+                    break
+                try:
+                    parsed = json.loads(candidate[s2:e2 + 1])
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+    raise RuntimeError(f"LLM reply was not valid JSON: {text[:300]}")
 
 
 # ---------------------------------------------------------------------------
