@@ -311,15 +311,22 @@ class AgentInstaller:
                 # auth — the shared AGENT_PROXY_SECRET between VM and backend) ---
                 f"TUNNEL_TOKEN={proxy_secret}",
                 # --- Backend wake (Render-sleep recovery, 2026-08-28) ---------
-                # The sidecar POSTs /api/tunnel/wake on this URL when its
-                # reverse tunnel is dead (backend suspended/redeployed) and
-                # every ~4 min while a task is active. Inbound HTTP is the
-                # ONLY thing that revives a suspended Render free-tier
-                # service — WS traffic does not count. ORCH_SANDBOX_ID is
-                # the sidecar's self-identity for that call (the tunnel
-                # connection carries no identity until it exists).
+                # The sidecar POSTs /api/tunnel/wake when its reverse tunnel
+                # is dead (backend suspended/redeployed) and every ~4 min
+                # while a task is active. Inbound HTTP is the ONLY thing that
+                # revives a suspended Render free-tier service — WS traffic
+                # does not count. ORCH_SANDBOX_ID is the sidecar's
+                # self-identity for that call (the tunnel connection carries
+                # no identity until it exists).
+                # ORCH_WAKE_EDGE_URL is the vm-wake SUPABASE EDGE FUNCTION:
+                # the EU-region sandbox egress filter resets TLS to
+                # *.onrender.com (verified live), so the wake RELAYS through
+                # Supabase (reachable) which fetches the backend server-side.
+                # Host env ARCFORGE_WAKE_EDGE_URL supplies it; unset → the
+                # sidecar falls back to the direct POST (non-EU regions).
                 f"ORCH_BACKEND_URL={backend_url}",
                 f"ORCH_SANDBOX_ID={sandbox.id}",
+                f"ORCH_WAKE_EDGE_URL={os.environ.get('ARCFORGE_WAKE_EDGE_URL', '')}",
                 # Vision model for the Browser Vision Engine — routed through
                 # the reverse tunnel (/vlm path) to NVIDIA on the backend side;
                 # the VM never holds a provider key.

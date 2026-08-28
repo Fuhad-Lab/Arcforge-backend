@@ -162,6 +162,13 @@ RT_TOKEN = os.environ.get("TUNNEL_TOKEN", "")
 # (proactively — inbound HTTP is the only thing that keeps a suspended
 # Render free-tier service awake; WS traffic does not count).
 BACKEND_URL = os.environ.get("ORCH_BACKEND_URL", "").rstrip("/")
+# EDGE RELAY (EU-region reality, verified live 2026-08-28): the Daytona
+# EU sandbox egress firewall RESETS outbound TLS to *.onrender.com — the
+# direct wake can never get through. *.supabase.co IS reachable, so the
+# wake goes through the vm-wake Supabase edge function, which fetches the
+# backend server-side (and waits out its cold boot). Direct POST remains
+# the fallback for regions without the filter.
+WAKE_EDGE_URL = os.environ.get("ORCH_WAKE_EDGE_URL", "").rstrip("/")
 # The sidecar's self-identity for that wake call: the reverse-tunnel
 # connection carries no identity until it EXISTS, so the VM must name
 # itself to request its own dial. (Distinct from the github proxy, which
@@ -1078,14 +1085,21 @@ _last_wake_ok: Optional[bool] = None
 
 
 def wake_backend(reason: str, timeout_s: float = 90.0) -> bool:
-    """POST /api/tunnel/wake on the backend: wake a suspended (or redeployed)
-    Render service AND force it to (re)dial our reverse tunnel. Blocking —
-    a cold boot can take ~30-60s for the HTTP response alone, which IS the
-    retry backoff. Rate-limited to one real attempt per 20s; concurrent
-    callers within the window share the last outcome (no dial storms).
-    Returns True only when the backend confirmed a connected tunnel."""
+    """Ask the backend to (re)dial our reverse tunnel — the Render-sleep
+    recovery path. Two transports, in order:
+      1. EDGE RELAY (ORCH_WAKE_EDGE_URL — the vm-wake Supabase edge
+         function) when configured: the EU egress filter resets TLS to
+         *.onrender.com, but *.supabase.co is reachable; the edge
+         function fetches the backend server-side and waits out its
+         ~30-60s cold boot.
+      2. DIRECT POST to BACKEND_URL for regions without the filter.
+    Blocking — a cold boot can take ~30-60s for the HTTP response alone,
+    which IS the retry backoff. Rate-limited to one real attempt per 20s;
+    concurrent callers within the window share the last outcome (no dial
+    storms). Returns True only when the backend confirmed a connected
+    tunnel."""
     global _last_wake_ts, _last_wake_ok
-    if not BACKEND_URL:
+    if not BACKEND_URL and not WAKE_EDGE_URL:
         return False
     with _wake_lock:
         now = time.time()
@@ -1093,26 +1107,44 @@ def wake_backend(reason: str, timeout_s: float = 90.0) -> bool:
             return bool(_last_wake_ok)
         _last_wake_ts = now
         _last_wake_ok = False
-    try:
-        payload = json.dumps({"sandboxId": SANDBOX_ID,
-                              "reason": str(reason)[:200]}).encode("utf-8")
-        req = urllib_request.Request(
-            f"{BACKEND_URL}/api/tunnel/wake", data=payload,
-            headers={"Content-Type": "application/json",
-                     "X-Agent-Token": RT_TOKEN},
-            method="POST")
-        with urllib_request.urlopen(req, timeout=timeout_s) as resp:
-            body = json.loads(resp.read() or b"{}")
-        _last_wake_ok = bool(body.get("ok")) and bool(body.get("connected"))
-        append_log(None, "daemon", "info",
-                   f"backend wake ok ({str(reason)[:80]}): "
-                   f"connected={body.get('connected')}")
-        return bool(_last_wake_ok)
-    except Exception as exc:  # noqa: BLE001 — wake is best-effort
-        append_log(None, "daemon", "warning",
-                   f"backend wake failed ({str(reason)[:80]}): "
-                   f"{str(exc)[:160]}")
-        return False
+    payload = json.dumps({"sandboxId": SANDBOX_ID,
+                          "reason": str(reason)[:200]}).encode("utf-8")
+    targets: List[Tuple[str, str]] = []
+    if WAKE_EDGE_URL:
+        targets.append((WAKE_EDGE_URL, "edge"))
+    if BACKEND_URL:
+        targets.append((f"{BACKEND_URL}/api/tunnel/wake", "direct"))
+    for url, transport in targets:
+        try:
+            req = urllib_request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json",
+                         "X-Agent-Token": RT_TOKEN},
+                method="POST")
+            with urllib_request.urlopen(req, timeout=timeout_s) as resp:
+                body = json.loads(resp.read() or b"{}")
+            ok = bool(body.get("ok")) and bool(body.get("connected"))
+            if ok:
+                _last_wake_ok = True
+                append_log(None, "daemon", "info",
+                           f"backend wake ok via {transport} "
+                           f"({str(reason)[:80]}): "
+                           f"connected={body.get('connected')}")
+                return True
+            # Honest error envelope from a reachable backend — do not
+            # retry the other transport for the same failure (it would
+            # produce the same verdict); log and stop.
+            append_log(None, "daemon", "warning",
+                       f"backend wake via {transport} refused "
+                       f"({str(reason)[:80]}): "
+                       f"{str(body.get('error'))[:160]}")
+            return False
+        except Exception as exc:  # noqa: BLE001 — wake is best-effort
+            append_log(None, "daemon", "warning",
+                       f"backend wake via {transport} failed "
+                       f"({str(reason)[:80]}): {str(exc)[:160]}")
+            continue
+    return False
 
 
 def _backend_keepalive_loop() -> None:
@@ -1128,7 +1160,7 @@ def _backend_keepalive_loop() -> None:
     while True:
         time.sleep(45)
         try:
-            if not BACKEND_URL or not SANDBOX_ID:
+            if not (BACKEND_URL or WAKE_EDGE_URL) or not SANDBOX_ID:
                 continue
             st = get_status("active") or {}
             if str(st.get("state") or "idle") == "idle":
