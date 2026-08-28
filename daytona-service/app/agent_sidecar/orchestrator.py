@@ -251,7 +251,15 @@ LOG_FILE = os.environ.get("ORCH_LOG_FILE", os.path.join(SYSTEM_DIR, "orchestrato
 APPROVAL_TIMEOUT_S = float(os.environ.get("ORCH_APPROVAL_TIMEOUT_S", str(6 * 3600)))
 # Agent-loop step budget: the agent model is thorough but ~60-100s/call —
 # this keeps a single agent run inside ~15-20 min worst case.
-AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "14"))
+AGENT_MAX_STEPS = int(os.environ.get("ORCH_AGENT_MAX_STEPS", "18"))
+# v6.1: build agents drifted to their step cap mid-build with 14 (the
+# dispatcher re-dispatched — correct but slow). 18 fits a one-shot write +
+# verify + boot + browser-check arc inside one dispatch.
+DEBUGGER_MAX_STEPS = int(os.environ.get("ORCH_DEBUGGER_MAX_STEPS", "28"))
+# v6.1: the debugger's audit is step-hungry (navigate + interact +
+# console_spy PER plan feature). 18 starved thorough audits ("step limit
+# reached" → an 'overall' gap instead of a real checklist — live-observed).
+# 28 covers ~10 features with evidence.
 # v5 CONVERGENCE (user-mandated 2026-08-27): the QA loop has NO fixed
 # round cap. It runs until the debugger's OBSERVATION of the live app
 # MATCHES plan.md. Early exit only when progress PROVABLY stops:
@@ -2373,6 +2381,7 @@ WORKFLOW: read the plan → write the code (batch files in ONE write_files call)
 BACKEND CHOICE: Python Flask (requirements.txt + app.py, port 8000, enable CORS for localhost:3000) unless the plan says otherwise.
 FLASK 3 BANS (recurring live failures — the app crashes at boot): NEVER use @app.before_first_request (removed in Flask 3 — initialise the DB at module scope instead), NEVER use @app.route without explicit methods when you expect JSON bodies, and NEVER call json fields that don't exist.
 ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows an empty backend/, your FIRST action must be ONE write_files call carrying the COMPLETE initial server — app.py + requirements.txt + every module the plan's Backend Requirements list (≤12 files). Never dribble files one at a time from a blank slate; write the whole tree, THEN verify and refine.
+SKILLS (MCP): your skill server hosts domain expertise for you. BEFORE writing backend code, call mcp_use_skill with "Sequential Thinking" for multi-step API design and "FileSystem" for file-layout discipline — one call each, then build. This is policy, not decoration: your build is judged against the skill guidance too.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
 FRONTEND_SYSTEM = """You are the Frontend Agent of ArcForge — an autonomous frontend developer working inside a Linux VM.
@@ -2384,6 +2393,7 @@ HARD RULES:
 - After writing code: verify_file on every file, then lsp_diagnostics (tsc) until clean; start the dev server via terminal: nohup npx next dev -p 3000 -H 0.0.0.0 & ; then VERIFY with browser_tool: navigate http://localhost:3000 → console_spy → fix every error (yours) or report it to the backend agent (mailbox_send: what you called, what you expected, what you got). You cannot report done while console errors exist OR while http://localhost:3000 shows a 404.
 UI STANDARDS: inline styles or one <style> tag only (NO .css files); every file using hooks/handlers starts with 'use client'; Next 14 <Link> takes NO nested <a>; no lorem ipsum — realistic copy; responsive; loading + empty states.
 ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows only the bare scaffold, your FIRST action must be ONE write_files call carrying the COMPLETE initial file tree — every page, component and lib module the plan's Frontend Requirements list (≤12 files; extras via write_file after). Never dribble files one at a time from a blank workspace; write the whole tree, THEN verify and refine.
+SKILLS (MCP): your skill server hosts domain expertise for you. BEFORE writing UI code, call mcp_use_skill with "UI/UX Pro Max" — one call, read its guidance, THEN build with it applied. This is policy, not decoration: your build is judged against the skill guidance too.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
 DEBUGGER_SYSTEM = """You are the Debugger Agent of ArcForge — the QA gate. You NEVER write or edit code. You audit the LIVE app against plan.md and report exactly WHAT IS MISSING.
@@ -2398,7 +2408,8 @@ WORKFLOW:
    - "missing": the app has none of it.
 4. Screenshot key screens when a visual check matters.
 FINISH with: {"tool":"done","report":"<evidence-based summary>","status":"pass"|"fail","coverage":[{"feature":"<plan feature>","state":"present|partial|missing","evidence":"what you actually saw","suspect":"frontend|backend|unclear"}],"issues":[{"criterion":"...","observation":"what actually happened","suspect":"frontend|backend|unclear"}]}.
-Rules: status is "pass" ONLY when every plan feature is "present". An app that boots but lacks a plan feature is a FAIL — name the feature. Report only real, observed evidence — never speculation. Your missing-features checklist is what the build acts on next: precise feature names, exact gaps."""
+Rules: status is "pass" ONLY when every plan feature is "present". An app that boots but lacks a plan feature is a FAIL — name the feature. Report only real, observed evidence — never speculation. Your missing-features checklist is what the build acts on next: precise feature names, exact gaps.
+SKILLS (MCP): before auditing, you may call mcp_use_skill with "Playwright" for browser-driving discipline — but the audit itself must be evidence from YOUR tools."""
 
 
 def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]:
@@ -2588,7 +2599,8 @@ def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
             f"{plan_text[:3200]}\n")
     pace_for_tpm()
     result = run_agent_loop(ctx, DEBUGGER_SYSTEM, user,
-                            build_debugger_toolset(ctx), max_steps=18,
+                            build_debugger_toolset(ctx),
+                            max_steps=DEBUGGER_MAX_STEPS,
                             max_tokens=4000, model=DEBUGGER_MODELS)
     report = str(result.get("report", ""))
     status = "pass" if (result.get("status") == "pass" or
@@ -2761,6 +2773,15 @@ BRIEF QUALITY LAW (the platform enforces it): each call's "task" is the sub-agen
 Reply ONLY JSON:
 {"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","reason":"<one line, internal>"} (omit "task" for finish)."""
 
+CHIEF_FOLLOWUP_SYSTEM = """You are ArcForge — the user's build agent. An approved plan.md ALREADY exists and the app is built; the user sent a FOLLOW-UP request. INTERROGATE YOURSELF before answering: does this request need a NEW PLAN, or is it a contained change you can build directly under the existing contract — and WHICH of your tools owns it?
+- "direct": contained work — tweaks, fixes, restyling, copy, adding a small component, adjusting behaviour, small additions. No new plan needed: you already know the codebase and the contract. You will be handed the change verbatim and build it immediately.
+- "replan": structural work — new pages/sections beyond the plan's shape, new data models, new integrations, anything that changes the CONTRACT or needs the user's sign-off on scope.
+When unsure, prefer "replan" (the user approves scope; direct builds are for work you are CONFIDENT is contained).
+Reply ONLY JSON:
+{"plan":"direct","agent":"frontend"|"backend","instruction":"<restate the change precisely enough to build: what, where, which files/components>"}
+or
+{"plan":"replan","intent":"<one line: what they want changed/built>"}"""
+
 CHIEF_TRIAGE_SYSTEM = """You are ArcForge — the user's build agent. Verification audited the live app against the approved plan and reported WHAT IS MISSING. You decide which of your tools builds what.
 RULES:
 - The MISSING FEATURES list is your work queue: every missing or partial plan feature MUST become a delegation that BUILDS it. Quote the plan requirement, state exactly what is absent, and instruct to build ONLY the missing pieces — never rebuild what already works.
@@ -2828,6 +2849,42 @@ class ChiefAgent:
             [{"role": "system", "content": CHIEF_REFINE_SYSTEM},
              {"role": "user", "content": user}],
             json_mode=False, max_tokens=3600, model=CHIEF_MODELS).strip()
+
+    # -- step 2b: the FOLLOW-UP GATE (v6.1 — the planning-necessity rule).
+    # plan.md exists ⟹ planning is OPTIONAL: the chief REASONS about whether
+    # this request needs a new plan or is a contained change it can build
+    # directly. No plan.md ⟹ planning is NECESSARY (the step-2 flow above).
+    def assess_followup(self, prompt: str, plan_md: str) -> Dict[str, Any]:
+        """The self-questioning gate: 'Is planning necessary for THIS request,
+        given the contract already exists?' — the Replit follow-up feel."""
+        repo_map = generate_repo_map()
+        user = (
+            f"EXISTING CONTRACT (plan.md — the app is BUILT and verified "
+            f"against it):\n{plan_md[:2200]}\n\n"
+            f"CURRENT CODEBASE SKELETON:\n{(repo_map or workspace_tree_text())[:1800]}\n\n"
+            f"FOLLOW-UP REQUEST:\n{prompt[:1200]}\n\n"
+            "Decide: direct build or new plan."
+        )
+        try:
+            pace_for_tpm()
+            data = _extract_json(llm_chat(
+                [{"role": "system", "content": CHIEF_FOLLOWUP_SYSTEM},
+                 {"role": "user", "content": user}],
+                json_mode=True, max_tokens=900, model=CHIEF_MODELS))
+            plan_kind = str(data.get("plan", "")).strip().lower()
+            agent = str(data.get("agent", "frontend")).strip().lower()
+            if agent not in ("frontend", "backend"):
+                agent = "frontend"
+            if plan_kind == "direct" and str(data.get("instruction", "")).strip():
+                return {"plan": "direct", "agent": agent,
+                        "instruction": str(data["instruction"]).strip()}
+            if plan_kind == "replan":
+                return {"plan": "replan",
+                        "intent": str(data.get("intent", prompt[:120])).strip()}
+        except Exception as exc:  # noqa: BLE001
+            append_log(self.ctx.task_id, "chief", "warn",
+                       f"follow-up assessment degraded ({exc}) — replanning")
+        return {"plan": "replan", "intent": prompt[:120]}
 
     # -- step 3: the dispatch decision lives in agent_dispatcher (the graph's
     #    chief_node) — sub-agents are the chief's TOOLS; one LLM call picks the
@@ -3651,9 +3708,16 @@ def build_swarm_graph():
     return g.compile()
 
 
-def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
+def run_swarm(task_id: str, prompt: str, plan_text: str,
+              initial_delegation: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Run the build as a LangGraph state machine. plan.md is the contract;
-    the chief dispatches its tools; the QA gate guards the exit."""
+    the chief dispatches its tools; the QA gate guards the exit.
+
+    initial_delegation (v6.1): an optional preloaded change order from the
+    follow-up gate — a contained change the chief decided to build WITHOUT
+    a new plan. It rides the existing fix-queue mechanics: dispatched
+    first, then the debugger re-verifies the live app against the amended
+    plan.md (contract + change order) — the same convergence loop."""
     set_status("active", {"state": "building", "detail": "starting the build",
                           "task_id": task_id})
     emit({"type": "status", "status": get_status("active")})
@@ -3670,8 +3734,8 @@ def run_swarm(task_id: str, prompt: str, plan_text: str) -> Dict[str, Any]:
         "reports": {},
         "errors": [],
         "dispatches": [],
-        "fix_queue": [],
-        "debug_pending": False,
+        "fix_queue": ([dict(initial_delegation)] if initial_delegation else []),
+        "debug_pending": bool(initial_delegation),
         "debug_rounds": 0,
         "repairs": 0,
         "last_gap_sig": "",
@@ -3863,10 +3927,63 @@ class TaskWorker(threading.Thread):
                     return
 
                 # ── Step 2: DRAFT PLAN ────────────────────────────────────
-                set_active("thinking", "drafting the plan")
-                activity("Drafting the build plan", "active")
-                plan_text = chief.draft_plan(prompt)
-                activity("Drafting the build plan", "done")
+                # ── Step 1.5: THE FOLLOW-UP GATE (v6.1 planning-necessity
+                # rule — a PROMPTED principle, not control flow): when an
+                # approved plan.md already exists, the chief ASKS ITSELF
+                # whether planning is necessary. Contained change → build
+                # it directly under the amended contract (no approval
+                # round-trip — the Replit follow-up feel); structural →
+                # replan through the normal approval loop below.
+                direct_delegation: Optional[Dict[str, str]] = None
+                plan_md = ""
+                if os.path.exists(PLAN_PATH):
+                    try:
+                        with open(PLAN_PATH, "r", encoding="utf-8",
+                                  errors="replace") as fh:
+                            plan_md = fh.read()
+                    except OSError:
+                        plan_md = ""
+                if follow_up and plan_md.strip():
+                    set_active("thinking",
+                               "deciding whether a new plan is needed")
+                    gate = chief.assess_followup(prompt, plan_md)
+                    if gate["plan"] == "direct":
+                        instruction = gate["instruction"]
+                        # Amend the contract transparently — the change
+                        # order becomes part of plan.md so the debugger's
+                        # audit (and the UI) sees exactly what to verify.
+                        plan_text = (plan_md.rstrip()
+                                     + f"\n\n## Change Order — {instruction}\n")
+                        with open(PLAN_PATH, "w", encoding="utf-8") as fh:
+                            fh.write(plan_text)
+                        upsert_file(PLAN_PATH, task_id, "edit")
+                        emit({"type": "plan_locked", "task_id": task_id,
+                              "path": PLAN_PATH, "plan": plan_text})
+                        emit({"type": "files", "task_id": task_id,
+                              "files": [{"path": PLAN_PATH, "action": "edit"}]})
+                        activity("Change understood — building it directly",
+                                 "done", instruction[:120])
+                        append_chat("assistant",
+                                    "Got it — building that change now: "
+                                    + instruction,
+                                    {"task_id": task_id, "kind": "note"})
+                        emit({"type": "chat", "message": recent_chat(1)[0]})
+                        direct_delegation = {
+                            "agent": gate["agent"],
+                            "task": ("CHANGE ORDER (user-requested follow-up "
+                                     "— build it while preserving everything "
+                                     "that already works): " + instruction),
+                        }
+                    else:
+                        activity("This change reshapes the plan", "done",
+                                 "drafting a revised plan for approval")
+
+                # ── Step 2: DRAFT PLAN (only when planning is necessary)
+                if direct_delegation is None:
+                    set_active("thinking", "drafting the plan")
+                    activity("Drafting the build plan", "active")
+                    plan_text = chief.draft_plan(prompt)
+                    activity("Drafting the build plan", "done")
 
                 # ── Step 3: THE APPROVAL LOOP (state machine) ─────────────
                 while True:
@@ -3901,15 +4018,17 @@ class TaskWorker(threading.Thread):
                     activity("Revising the plan", "done")
             else:
                 plan_text = recovered_plan
+                direct_delegation = None
 
             # ── Step 4: LOCK plan.md (verbatim — no additions, no removals)
-            with open(PLAN_PATH, "w", encoding="utf-8") as fh:
-                fh.write(plan_text)
-            upsert_file(PLAN_PATH, task_id, "create")
-            emit({"type": "plan_locked", "task_id": task_id, "path": PLAN_PATH,
-                  "plan": plan_text})
-            emit({"type": "files", "task_id": task_id,
-                  "files": [{"path": PLAN_PATH, "action": "create"}]})
+            if direct_delegation is None:
+                with open(PLAN_PATH, "w", encoding="utf-8") as fh:
+                    fh.write(plan_text)
+                upsert_file(PLAN_PATH, task_id, "create")
+                emit({"type": "plan_locked", "task_id": task_id, "path": PLAN_PATH,
+                      "plan": plan_text})
+                emit({"type": "files", "task_id": task_id,
+                      "files": [{"path": PLAN_PATH, "action": "create"}]})
             activity("Plan approved — starting the build", "done",
                      "plan.md is now the contract")
 
@@ -3917,7 +4036,8 @@ class TaskWorker(threading.Thread):
             self._mark(task_id, "running")
             if not follow_up:
                 seed_scaffold(task_id)
-            swarm = run_swarm(task_id, prompt, plan_text)
+            swarm = run_swarm(task_id, prompt, plan_text,
+                              initial_delegation=direct_delegation)
 
             # ── Complete ──────────────────────────────────────────────────
             app_port = (get_status("app") or {}).get("port")
