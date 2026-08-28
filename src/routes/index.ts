@@ -6,6 +6,7 @@ import mcpRouter from "./mcp";
 import workspaceRouter from "./workspace";
 import dbRouter from "./db";
 import llmRouter from "./llm";
+import tunnelWakeRouter from "./tunnel-wake";
 
 const router: IRouter = Router();
 
@@ -14,6 +15,10 @@ router.use(healthRouter);
 
 // /api/llm/* — LLM proxy for the In-VM agent sidecar (X-Agent-Token auth).
 router.use("/llm", llmRouter);
+
+// /api/tunnel/wake — VM-side reverse-tunnel force-dial (X-Agent-Token auth;
+// Render-sleep recovery — the sidecar calls this when its tunnel is down).
+router.use(tunnelWakeRouter);
 
 // /api/db/* — frontend data routes (JWT required; applied inside db.ts).
 router.use("/db", dbRouter);

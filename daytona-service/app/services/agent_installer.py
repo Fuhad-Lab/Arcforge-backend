@@ -310,6 +310,16 @@ class AgentInstaller:
                 # --- Tunnel config (read by orchestrator.py for /reverse-tunnel
                 # auth — the shared AGENT_PROXY_SECRET between VM and backend) ---
                 f"TUNNEL_TOKEN={proxy_secret}",
+                # --- Backend wake (Render-sleep recovery, 2026-08-28) ---------
+                # The sidecar POSTs /api/tunnel/wake on this URL when its
+                # reverse tunnel is dead (backend suspended/redeployed) and
+                # every ~4 min while a task is active. Inbound HTTP is the
+                # ONLY thing that revives a suspended Render free-tier
+                # service — WS traffic does not count. ORCH_SANDBOX_ID is
+                # the sidecar's self-identity for that call (the tunnel
+                # connection carries no identity until it exists).
+                f"ORCH_BACKEND_URL={backend_url}",
+                f"ORCH_SANDBOX_ID={sandbox.id}",
                 # Vision model for the Browser Vision Engine — routed through
                 # the reverse tunnel (/vlm path) to NVIDIA on the backend side;
                 # the VM never holds a provider key.

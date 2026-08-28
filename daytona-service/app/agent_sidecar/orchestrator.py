@@ -156,6 +156,17 @@ PORT = int(os.environ.get("ORCH_PORT", "9000"))
 TOKEN = os.environ.get("ORCH_TOKEN", "")
 WORKSPACE = os.environ.get("ORCH_WORKSPACE", "/workspace")
 RT_TOKEN = os.environ.get("TUNNEL_TOKEN", "")
+# Backend wake (Render-sleep recovery): the PUBLIC backend URL the sidecar
+# POSTs /api/tunnel/wake to when its reverse tunnel is dead (reactively,
+# from the LLM retry path) and every ~4 min while a task is active
+# (proactively — inbound HTTP is the only thing that keeps a suspended
+# Render free-tier service awake; WS traffic does not count).
+BACKEND_URL = os.environ.get("ORCH_BACKEND_URL", "").rstrip("/")
+# The sidecar's self-identity for that wake call: the reverse-tunnel
+# connection carries no identity until it EXISTS, so the VM must name
+# itself to request its own dial. (Distinct from the github proxy, which
+# derives identity from the live tunnel connection — no env needed there.)
+SANDBOX_ID = os.environ.get("ORCH_SANDBOX_ID", "")
 SYSTEM_DIR = os.environ.get("ORCH_SYSTEM_DIR", "/home/daytona/.system")
 DB_PATH = os.environ.get("ORCH_DB", os.path.join(SYSTEM_DIR, "state.db"))
 
@@ -1047,6 +1058,89 @@ def emit_tunnel_down(reason: str) -> None:
     emit({"type": "tunnel_down", "reason": reason[:200]})
 
 
+# --- Backend wake (Render-sleep recovery) ---------------------------------
+#
+# INCIDENT (2026-08-28, live): a headless build ran with no browser open;
+# the Render backend got zero inbound HTTP for >15 min and SUSPENDED. The
+# suspension killed the reverse-tunnel WS and nothing re-dialed — the
+# sweeper lives inside the sleeping process, and headless runs have no
+# frontend to relay tunnel_down. Every sub-agent call died "backend hasn't
+# dialed in" for ~20 min and the task reported honestly-failed.
+#
+# The fix: the sidecar wakes the backend itself over plain HTTP (inbound
+# HTTP is what revives a suspended Render service) and asks it to force-
+# dial this sandbox's tunnel. Reactive (LLM retry path) + proactive
+# (keepalive thread while a task is active).
+
+_wake_lock = threading.Lock()
+_last_wake_ts = 0.0
+_last_wake_ok: Optional[bool] = None
+
+
+def wake_backend(reason: str, timeout_s: float = 90.0) -> bool:
+    """POST /api/tunnel/wake on the backend: wake a suspended (or redeployed)
+    Render service AND force it to (re)dial our reverse tunnel. Blocking —
+    a cold boot can take ~30-60s for the HTTP response alone, which IS the
+    retry backoff. Rate-limited to one real attempt per 20s; concurrent
+    callers within the window share the last outcome (no dial storms).
+    Returns True only when the backend confirmed a connected tunnel."""
+    global _last_wake_ts, _last_wake_ok
+    if not BACKEND_URL:
+        return False
+    with _wake_lock:
+        now = time.time()
+        if now - _last_wake_ts < 20:
+            return bool(_last_wake_ok)
+        _last_wake_ts = now
+        _last_wake_ok = False
+    try:
+        payload = json.dumps({"sandboxId": SANDBOX_ID,
+                              "reason": str(reason)[:200]}).encode("utf-8")
+        req = urllib_request.Request(
+            f"{BACKEND_URL}/api/tunnel/wake", data=payload,
+            headers={"Content-Type": "application/json",
+                     "X-Agent-Token": RT_TOKEN},
+            method="POST")
+        with urllib_request.urlopen(req, timeout=timeout_s) as resp:
+            body = json.loads(resp.read() or b"{}")
+        _last_wake_ok = bool(body.get("ok")) and bool(body.get("connected"))
+        append_log(None, "daemon", "info",
+                   f"backend wake ok ({str(reason)[:80]}): "
+                   f"connected={body.get('connected')}")
+        return bool(_last_wake_ok)
+    except Exception as exc:  # noqa: BLE001 — wake is best-effort
+        append_log(None, "daemon", "warning",
+                   f"backend wake failed ({str(reason)[:80]}): "
+                   f"{str(exc)[:160]}")
+        return False
+
+
+def _backend_keepalive_loop() -> None:
+    """While a task is active (state != idle), ping the backend's wake
+    endpoint every ~4 min. Two effects in one idempotent call:
+      1. Inbound HTTP keeps the Render free-tier backend from suspending
+         mid-build (WS traffic does NOT count as Render activity).
+      2. If the tunnel died anyway (backend redeploy, proxy idle-drop),
+         the wake re-dials it within one interval.
+    Idle daemons ping nothing — the backend may sleep (quota-friendly:
+    the studio's own traffic wakes it for interactive use)."""
+    last_ping = 0.0
+    while True:
+        time.sleep(45)
+        try:
+            if not BACKEND_URL or not SANDBOX_ID:
+                continue
+            st = get_status("active") or {}
+            if str(st.get("state") or "idle") == "idle":
+                continue
+            if time.time() - last_ping < 240:
+                continue
+            last_ping = time.time()
+            wake_backend("keepalive")
+        except Exception:  # noqa: BLE001 — keepalive must never kill the daemon
+            pass
+
+
 def _estimate_cost_tokens(messages: List[Dict[str, Any]], max_tokens: int) -> float:
     prompt_chars = 0
     for m in messages:
@@ -1111,12 +1205,22 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
     TUNNEL-DROP TOLERANCE: backend redeploys restart the reverse-tunnel
     client, leaving a ~30-60s window where the WS is down before the
     backend re-dials. ConnectionError retries use PROGRESSIVE backoff
-    (5/15/30/60s ≈ 110s total) so in-flight build tasks survive deploys
-    instead of dying mid-agent (observed live: a refine_plan call failed
-    'backend hasn't dialed in' during a deploy restart)."""
-    _CONNECT_BACKOFF_S = (5, 15, 30, 60)
+    so in-flight build tasks survive deploys instead of dying mid-agent
+    (observed live: a refine_plan call failed 'backend hasn't dialed in'
+    during a deploy restart).
+
+    RENDER-SLEEP RECOVERY (2026-08-28): a SUSPENDED backend redeploys
+    nothing — the sweeper is asleep with it, so no re-dial ever happens
+    on its own. On a reverse-tunnel transport failure we now WAKE the
+    backend over HTTP (wake_backend — blocking through the ~30-60s cold
+    boot) and ask it to force-dial our tunnel; the extended 5-attempt
+    backoff (10/20/30/45/60s + wake time ≈ up to ~4 min) covers cold
+    boot + first sweep + dial. Direct (non-tunnel) transports keep the
+    classic 4-attempt schedule."""
+    _CONNECT_BACKOFF_S = (10, 20, 30, 45, 60)
+    attempts = 5 if LLM_USE_REVERSE_TUNNEL else 4
     last_err: Optional[Exception] = None
-    for attempt in range(4):
+    for attempt in range(attempts):
         try:
             if LLM_USE_REVERSE_TUNNEL:
                 status, raw = _tunnel_request(path, body)
@@ -1158,7 +1262,11 @@ def _llm_call_impl(body: Dict[str, Any], path: str = "/v1/chat/completions",
             wait = _CONNECT_BACKOFF_S[min(attempt, len(_CONNECT_BACKOFF_S) - 1)]
             if "reverse-tunnel" in str(exc):
                 emit_tunnel_down(str(exc))
-            if attempt < 3:
+                # RENDER-SLEEP RECOVERY: nothing inside a suspended backend
+                # can re-dial — wake it (blocking; the cold boot IS most of
+                # the backoff) and force our tunnel back before the retry.
+                wake_backend("llm transport failure")
+            if attempt < attempts - 1:
                 last_err = exc
                 log.warning("llm transport failure (attempt %d): %s — retrying in %ss",
                             attempt + 1, str(exc)[:120], wait)
@@ -4853,6 +4961,10 @@ async def lifespan(app: FastAPI):
     recover_pending_tasks()
     worker = TaskWorker()
     worker.start()
+    # Backend keepalive (Render-sleep recovery): pings /api/tunnel/wake
+    # every ~4 min while a task is active — see _backend_keepalive_loop.
+    threading.Thread(target=_backend_keepalive_loop, name="backend-keepalive",
+                     daemon=True).start()
     log.info(boot_note)
     yield
     if browser_engine is not None:
