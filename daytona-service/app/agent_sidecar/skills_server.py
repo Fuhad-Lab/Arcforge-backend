@@ -39,6 +39,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
+import threading
+import time
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("skills-server")
@@ -159,3 +162,76 @@ def prompt_block(role: str) -> str:
     return (f"SKILL SERVER (mcp): {len(mine)} skill(s) are hosted for you ({names}). "
             "Call tool mcp_list_skills to see them and mcp_use_skill to consult one "
             "BEFORE writing code in its domain.")
+
+
+# ── Usage telemetry (v6) ───────────────────────────────────────────────────
+# Every mcp_use_skill call is journalled into the daemon's SQLite
+# (state.db, table skill_logs) — /status surfaces the aggregate, which is
+# the empirical answer to "are the 17 skills actually used by the agents
+# that are supposed to use them?"
+
+_SKILL_DB_PATH: Optional[str] = None
+_skill_db_lock = threading.Lock()
+
+_SKILL_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS skill_logs (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    role    TEXT NOT NULL,
+    skill   TEXT NOT NULL,
+    ok      INTEGER NOT NULL,
+    input   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_skill_logs_ts ON skill_logs(ts);
+"""
+
+
+def set_db_path(path: str) -> None:
+    """Point the telemetry sink at the daemon's state.db (idempotent)."""
+    global _SKILL_DB_PATH
+    _SKILL_DB_PATH = str(path)
+
+
+def log_usage(role: str, skill_name: str, ok: bool, user_input: str = "") -> None:
+    """Record one mcp_use_skill call. Never raises."""
+    if not _SKILL_DB_PATH:
+        return
+    try:
+        with _skill_db_lock, sqlite3.connect(_SKILL_DB_PATH, timeout=15) as conn:
+            conn.executescript(_SKILL_LOG_SCHEMA)
+            conn.execute(
+                "INSERT INTO skill_logs (ts, role, skill, ok, input) "
+                "VALUES (?,?,?,?,?)",
+                (time.time(), str(role)[:40], str(skill_name)[:120],
+                 1 if ok else 0, str(user_input)[:500]),
+            )
+    except sqlite3.Error as exc:
+        log.debug("skill telemetry write failed: %s", exc)
+
+
+def usage_summary() -> Dict[str, Any]:
+    """Aggregate skill usage (per-skill counts + last-used + per-role
+    breakdown) for /status."""
+    if not _SKILL_DB_PATH or not os.path.exists(_SKILL_DB_PATH):
+        return {"calls": 0, "skills": {}}
+    try:
+        with _skill_db_lock, sqlite3.connect(_SKILL_DB_PATH, timeout=15) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT skill, role, ok, COUNT(*) AS n, MAX(ts) AS last_ts "
+                "FROM skill_logs GROUP BY skill, role, ok").fetchall()
+            total = conn.execute("SELECT COUNT(*) AS n FROM skill_logs").fetchone()
+    except sqlite3.Error:
+        return {"calls": 0, "skills": {}}
+    skills: Dict[str, Any] = {}
+    for r in rows:
+        name = r["skill"]
+        entry = skills.setdefault(
+            name, {"calls": 0, "ok": 0, "failed": 0, "last_ts": None,
+                   "by_role": {}})
+        entry["calls"] += r["n"]
+        entry["ok" if r["ok"] else "failed"] += r["n"]
+        entry["last_ts"] = max(entry["last_ts"] or 0, r["last_ts"] or 0) or None
+        entry["by_role"][r["role"]] = (entry["by_role"].get(r["role"], 0)
+                                       + r["n"])
+    return {"calls": int(total["n"]) if total else 0, "skills": skills}

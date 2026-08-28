@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ArcForge Orchestrator v4 — the LangGraph-orchestrated build daemon.
+ArcForge Orchestrator v6 — the LangGraph-orchestrated build daemon.
 
 Runs inside every Daytona MicroVM (PM2 "agent-brain").
 
@@ -38,6 +38,33 @@ ORCHESTRATION (LangGraph StateGraph — the 2026-09-28 brain transplant):
          debugger→chief on FAIL, debugger→END on PASS (conditional).
   Uses the real `langgraph` package when installed; otherwise a built-in
   _MiniStateGraph with identical semantics runs the same graph.
+
+v6 (2026-10-30 — the Replit-parity architecture pass):
+  • PLAN CONTRACT: plan.md now carries explicit `## Frontend Requirements`
+    and `## Backend Requirements` NUMBERED work queues — the delegation
+    briefs quote them, so sub-agents get detailed instructions instead of
+    "build so-so".
+  • DYNAMIC DISPATCH: the chief's tool choice is AUTHORITATIVE (any tool,
+    any order — a static site never calls backend_agent). Guardrails
+    enforce only platform INVARIANTS (budgets, nothing finishes unbuilt,
+    the QA gate always runs, integration needs a backend) — rules live in
+    prompts + the output layer, never as a hardcoded phase order.
+  • ACI (SWE-agent pattern): terminal output is paginated head+tail with
+    a unique-error digest — 10k-line webpack noise can no longer blow the
+    model's context window.
+  • ONE-SHOT GREENFIELD (gpt-engineer pattern): on a blank workspace the
+    build agents' FIRST action is a single write_files batch carrying the
+    complete initial file tree.
+  • YJS BRIDGE (yjs_bridge.py): CRDT multiplayer sync — the shared YDoc
+    mirrors every agent write; connected editors merge live user edits
+    with agent writes without locking or overwriting (the Replit
+    multiplayer experience).
+  • ACP SERVER (acp_server.py): the Agent Client Protocol surface —
+    JSON-RPC 2.0 (initialize / session/new / session/prompt) with
+    agent/turn-start|thought|tool_call and terminal/output notifications,
+    so standard editor clients can drive the agent.
+  • SKILLS TELEMETRY: every mcp_use_skill call is logged (role, skill,
+    ok) — /status answers "are the 17 skills actually used?" with data.
 
 CONTEXT LAYER (Tree-sitter RepoMapper — "infinite context" cheaply):
   generate_repo_map() extracts the SKELETON of every source file
@@ -886,8 +913,18 @@ manager = ConnectionManager()
 _LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 
+_EVENT_RELAYS: List[Callable[[Dict[str, Any]], None]] = []
+
+
 def emit(event: Dict[str, Any]) -> None:
     manager.broadcast_from_worker(event)
+    # v6: side-channel relays (ACP server notifications, …). A relay must
+    # never break the primary broadcast.
+    for _relay in _EVENT_RELAYS:
+        try:
+            _relay(event)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1280,8 +1317,51 @@ else:  # pragma: no cover
 
 if _skills_server_mod is not None:
     _skills_server_mod.load_catalog()
+    try:
+        _skills_server_mod.set_db_path(DB_PATH)   # v6: usage telemetry sink
+    except Exception as exc:  # noqa: BLE001
+        log.warning("skills telemetry unavailable: %s", exc)
 else:  # pragma: no cover
     log.error("skills_server.py failed to load — skills MCP unavailable")
+
+# v6 sidecar modules — Yjs CRDT bridge (multiplayer file sync) and the
+# ACP server (Agent Client Protocol surface). Both degrade to no-ops when
+# their optional deps are missing; the daemon itself never depends on them.
+_yjs_mod = _load_module("yjs_bridge")
+_acp_mod = _load_module("acp_server")
+if _yjs_mod is not None:
+    try:
+        _yjs_mod.init(emit_fn=emit, workspace=WORKSPACE,
+                      allowed_prefixes=("frontend", "backend"))
+        _yjs_mod.boot_load()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("yjs bridge init failed (CRDT sync disabled): %s", exc)
+        _yjs_mod = None
+if _acp_mod is not None:
+    _EVENT_RELAYS.append(_acp_mod.relay)
+else:  # pragma: no cover
+    log.error("acp_server.py failed to load — ACP endpoint unavailable")
+
+
+def _yjs_note_file(rel: str, old_content: Optional[str],
+                   new_content: str) -> None:
+    """Mirror one agent file-write into the shared Yjs doc (no-op when the
+    bridge is unavailable)."""
+    if _yjs_mod is None:
+        return
+    try:
+        _yjs_mod.note_file(rel, old_content, new_content)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("yjs note_file failed for %s: %s", rel, exc)
+
+
+def _yjs_note_delete(rel: str) -> None:
+    if _yjs_mod is None:
+        return
+    try:
+        _yjs_mod.note_delete(rel)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("yjs note_delete failed for %s: %s", rel, exc)
 
 
 def skills_catalog_summary() -> Dict[str, int]:
@@ -1645,12 +1725,64 @@ def safe_join(base: str, rel: str) -> Optional[str]:
     return dest
 
 
+# ── ACI: Agent-Computer Interface (the SWE-agent pattern) ─────────────────
+# Terminal output is adversarial: a failed `npm run build` can emit ten
+# thousand lines of webpack noise and blow the model's context window.
+# Every terminal observation the agents see is paginated (head + tail)
+# with a unique-error digest — the MODEL sees the signal, the noise is
+# truncated behind an explicit marker.
+
+ACI_MAX_CHARS = int(os.environ.get("ORCH_ACI_MAX_CHARS", "6000"))
+_ACI_ERR_RE = re.compile(r"error\b|Error:|error:|traceback|Traceback|failed|FAILED|✗|ELIFECYCLE")
+
+
+def _aci_digest(error_lines: List[str]) -> str:
+    """First ~12 UNIQUE error lines, deduped and length-capped."""
+    seen: set = set()
+    picked: List[str] = []
+    for ln in error_lines:
+        key = ln.strip()[:120]
+        if key and key not in seen:
+            seen.add(key)
+            picked.append(ln.rstrip()[:240])
+        if len(picked) >= 12:
+            break
+    return "\n".join(picked)
+
+
+def aci_paginate(text: str, max_chars: int = ACI_MAX_CHARS) -> str:
+    """Head + tail pagination with a unique-error digest. Deterministic,
+    cheap, and bounded — the ACI contract for everything terminal-shaped
+    the LLMs observe."""
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    lines = text.splitlines()
+    error_lines = [ln for ln in lines if _ACI_ERR_RE.search(ln)]
+    digest = _aci_digest(error_lines)
+    budget = max(2000, max_chars - len(digest) - 400)
+    head = text[: int(budget * 0.5)]
+    tail = text[-int(budget * 0.5):]
+    if "\n" in head:                      # snap to line boundaries
+        head = head.rsplit("\n", 1)[0]
+    if "\n" in tail:
+        tail = tail.split("\n", 1)[1]
+    marker = (f"\n… [ACI: output was {len(text)} chars / {len(lines)} lines — "
+              f"head+tail shown; {len(error_lines)} error lines digested] …\n")
+    out = head + marker
+    if digest:
+        out += f"[ACI error digest — first unique error lines]\n{digest}\n"
+    out += tail
+    return out
+
+
 def shell_run(cmd: str, cwd: str, timeout: int = 180) -> Dict[str, Any]:
     try:
         proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
                               text=True, timeout=timeout)
         return {"exit_code": proc.returncode,
-                "stdout": (proc.stdout or "")[-2500:], "stderr": (proc.stderr or "")[-2000:]}
+                "stdout": aci_paginate(proc.stdout or "", 4000),
+                "stderr": aci_paginate(proc.stderr or "", 3000)}
     except subprocess.TimeoutExpired:
         return {"exit_code": -1, "stdout": "", "stderr": f"timed out after {timeout}s"}
     except Exception as exc:  # noqa: BLE001
@@ -1672,10 +1804,23 @@ def write_workspace_file(rel: str, content: str, task_id: Optional[str],
         return {"ok": False, "error": f"invalid path '{rel}'"}
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     existed = os.path.exists(dest)
+    old_content: Optional[str] = None
+    if existed:
+        try:
+            with open(dest, "r", encoding="utf-8", errors="replace") as fh:
+                old_content = fh.read()
+        except OSError:
+            old_content = None            # unreadable → the CRDT seeds fresh
     with open(dest, "w", encoding="utf-8") as fh:
         fh.write(_repair_double_escaped(content))
     action = "edit" if existed else "create"
     upsert_file(dest, task_id, action)
+    # v6: mirror the write into the shared Yjs doc as a MINIMAL DIFF
+    # (old → new) so concurrent user edits in connected editors MERGE
+    # with this change instead of being overwritten (CRDT semantics).
+    # The doc is the source of truth: the debounced disk-flush heals any
+    # interleaving (user edit mid-write) back to the merged doc content.
+    _yjs_note_file(rel, old_content, _repair_double_escaped(content))
     if task_id:
         emit({"type": "files", "task_id": task_id,
               "files": [{"path": dest, "action": action}]})
@@ -1972,6 +2117,7 @@ def _fs_toolset(ctx: AgentContext, scope_dir: str,
             return {"ok": False, "error": f"cannot delete {path}"}
         os.remove(dest)
         upsert_file(dest, ctx.task_id, "delete")
+        _yjs_note_delete(path)
         emit({"type": "files", "task_id": ctx.task_id,
               "files": [{"path": dest, "action": "delete"}]})
         return {"ok": True, "deleted": path}
@@ -1990,7 +2136,13 @@ def _terminal_tool(ctx: AgentContext, cwd: str) -> Callable[[Dict[str, Any]], Di
             return {"ok": False, "error": "command rejected (unsafe)"}
         out = shell_run(cmd, cwd, timeout=240)
         ok = out["exit_code"] == 0
-        text = f"exit {out['exit_code']}\n{out['stdout'] or out['stderr']}"[:2800]
+        text = aci_paginate(
+            f"exit {out['exit_code']}\n{out['stdout'] or out['stderr']}", 4000)
+        # v6: surface real terminal output on the event bus — the ACP
+        # relay turns this into terminal/output notifications (live
+        # terminal feed in the studio).
+        emit({"type": "terminal", "task_id": ctx.task_id,
+              "command": cmd[:300], "output": text})
         return {"ok": ok, "output": text}
     return terminal
 
@@ -2059,9 +2211,18 @@ def _skills_toolset(role: str) -> Dict[str, Callable[[Dict[str, Any]], Dict[str,
     def mcp_list_skills(_: Dict[str, Any]) -> Dict[str, Any]:
         return _skills_server_mod.mcp_list_tools(role)
     def mcp_use_skill(a: Dict[str, Any]) -> Dict[str, Any]:
-        return _skills_server_mod.mcp_call_tool(
-            role, str(a.get("skill") or a.get("name") or ""),
-            str(a.get("input") or a.get("question") or ""))
+        skill = str(a.get("skill") or a.get("name") or "")
+        result = _skills_server_mod.mcp_call_tool(
+            role, skill, str(a.get("input") or a.get("question") or ""))
+        # v6: per-call telemetry — answers "are the 17 skills actually
+        # used?" with per-role, per-skill evidence (see /status).
+        try:
+            _skills_server_mod.log_usage(
+                role, skill, bool(result.get("ok")),
+                str(a.get("input") or a.get("question") or ""))
+        except Exception:  # noqa: BLE001
+            pass
+        return result
     return {"mcp_list_skills": mcp_list_skills, "mcp_use_skill": mcp_use_skill}
 
 
@@ -2211,6 +2372,7 @@ HARD RULES:
 WORKFLOW: read the plan → write the code (batch files in ONE write_files call) → verify_file on every file you wrote → fix any reported errors → install deps + start the server via terminal (nohup, background) → smoke-test endpoints with curl → api_contract_update {contract:{base_url,port,endpoints:[{method,path,description,response}]}} → mailbox_send to frontend (contract ready) → done.
 BACKEND CHOICE: Python Flask (requirements.txt + app.py, port 8000, enable CORS for localhost:3000) unless the plan says otherwise.
 FLASK 3 BANS (recurring live failures — the app crashes at boot): NEVER use @app.before_first_request (removed in Flask 3 — initialise the DB at module scope instead), NEVER use @app.route without explicit methods when you expect JSON bodies, and NEVER call json fields that don't exist.
+ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows an empty backend/, your FIRST action must be ONE write_files call carrying the COMPLETE initial server — app.py + requirements.txt + every module the plan's Backend Requirements list (≤12 files). Never dribble files one at a time from a blank slate; write the whole tree, THEN verify and refine.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
 FRONTEND_SYSTEM = """You are the Frontend Agent of ArcForge — an autonomous frontend developer working inside a Linux VM.
@@ -2221,6 +2383,7 @@ HARD RULES:
 - CODE VERIFICATION IS MANDATORY: after writing any code you MUST call verify_file {path:"frontend/<file>"} for EVERY file you wrote. If errors are returned, fix them immediately before marking the task complete.
 - After writing code: verify_file on every file, then lsp_diagnostics (tsc) until clean; start the dev server via terminal: nohup npx next dev -p 3000 -H 0.0.0.0 & ; then VERIFY with browser_tool: navigate http://localhost:3000 → console_spy → fix every error (yours) or report it to the backend agent (mailbox_send: what you called, what you expected, what you got). You cannot report done while console errors exist OR while http://localhost:3000 shows a 404.
 UI STANDARDS: inline styles or one <style> tag only (NO .css files); every file using hooks/handlers starts with 'use client'; Next 14 <Link> takes NO nested <a>; no lorem ipsum — realistic copy; responsive; loading + empty states.
+ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows only the bare scaffold, your FIRST action must be ONE write_files call carrying the COMPLETE initial file tree — every page, component and lib module the plan's Frontend Requirements list (≤12 files; extras via write_file after). Never dribble files one at a time from a blank workspace; write the whole tree, THEN verify and refine.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
 DEBUGGER_SYSTEM = """You are the Debugger Agent of ArcForge — the QA gate. You NEVER write or edit code. You audit the LIVE app against plan.md and report exactly WHAT IS MISSING.
@@ -2576,26 +2739,25 @@ Required structure (Markdown):
 # <App Name>
 ## Overview
 2-3 sentences: what the app is and does.
-## Pages & UI
-Each page/screen with its key UI elements and the styling direction.
-## Data & API
-The data model and EVERY API endpoint the backend will expose (method, path, purpose, response shape) — or "No backend needed (static/frontend-only)" if the app needs no server.
-## Components
-File layout: frontend/ (Next.js 14 App Router + TypeScript — mandated) and backend/ (your chosen language/framework, only if needed).
+## Frontend Requirements
+A NUMBERED list of EVERY UI feature the frontend must have — each item concrete and independently checkable (pages with their elements, components, interactions, states, empty/loading handling, styling direction). This list is the Frontend Agent's work queue: every delegation quotes these items, so vague groupings ("a nice UI") are FORBIDDEN — enumerate ("1. Header with app title and theme toggle. 2. Add-task input with Enter-to-submit. …").
+## Backend Requirements
+A NUMBERED list of EVERY API endpoint the backend must expose (method, path, purpose, request/response shape) plus the data model and storage — or the single line "No backend needed (static/frontend-only)" if the app needs no server. This list is the Backend Agent's work queue.
 ## Acceptance Criteria
 Numbered, concrete, testable statements the Debugger will click through on the live app (e.g. "1. Typing text and pressing Add creates a new item in the list").
-Rules: specific enough to build from; no code; keep it under ~90 lines.
+Rules: specific enough to build from; no code; keep it under ~90 lines; every Frontend/Backend Requirements item must map to at least one Acceptance Criterion; if there is no backend, the Backend Requirements section must say so in exactly that one line.
 RUNTIME CONSTRAINTS (hard): the app runs inside a single Linux VM — a backend, if needed, must be Python Flask or Node Express with in-memory storage or SQLite ONLY (no MongoDB/Postgres/Redis or any external service — none exist in the VM). The frontend is Next.js 14 App Router + TypeScript, always."""
 
-CHIEF_REFINE_SYSTEM = """You are ArcForge — the user's build agent. The user read your proposed plan and REJECTED it with change requests. Apply their changes and produce the FULL revised plan (same structure: Overview / Pages & UI / Data & API / Components / Acceptance Criteria). Keep everything they did NOT ask to change intact. The revised plan goes back to the user for approval."""
+CHIEF_REFINE_SYSTEM = """You are ArcForge — the user's build agent. The user read your proposed plan and REJECTED it with change requests. Apply their changes and produce the FULL revised plan (same structure: Overview / Frontend Requirements / Backend Requirements / Acceptance Criteria). Keep everything they did NOT ask to change intact. The revised plan goes back to the user for approval."""
 
-CHIEF_DISPATCH_SYSTEM = """You are ArcForge — the user's build agent. You coordinate specialised sub-agents as YOUR TOOLS: you decide which to call, and each call carries a precise brief. Given the approved plan, the repo map, and what has already been done, decide the NEXT tool call.
+CHIEF_DISPATCH_SYSTEM = """You are ArcForge — the user's build agent. You coordinate specialised sub-agents as YOUR TOOLS. Before every call, INTERROGATE YOURSELF: given the plan's requirement sections and what is already built, WHICH tool does the remaining work belong to, and what EXACTLY should it do next? There is NO fixed order and NO mandatory pipeline — your reasoning decides (a static site never calls backend_agent; a UI tweak after a passing build needs no integration check; not every website needs a backend).
 Your tools:
-- backend_agent: builds the API server under backend/ — call it when the plan defines endpoints that aren't implemented yet.
-- frontend_agent: builds the UI under frontend/ (Next.js 14 App Router) — call it when the UI isn't built or needs changes.
-- integration_check: starts both servers and proves the frontend talks to the backend — call it ONCE after both agents ran (only when a backend exists).
+- backend_agent: builds the API server under backend/ — call it when the plan's Backend Requirements have items not implemented yet.
+- frontend_agent: builds the UI under frontend/ (Next.js 14 App Router) — call it when the plan's Frontend Requirements aren't built or need changes.
+- integration_check: starts both servers and proves the frontend talks to the backend — call it once both agents ran (only when a backend exists).
 - qa_verification: end-to-end verifies the live app against the plan's Acceptance Criteria — call it when the build looks complete.
 - finish: everything the plan requires is done — no more tool calls.
+BRIEF QUALITY LAW (the platform enforces it): each call's "task" is the sub-agent's ONLY instructions — quote the concrete plan items it must deliver (endpoints with paths and shapes, pages with elements, file names). "Build it" / "do the rest" / "build so-so" briefs get bounced.
 Reply ONLY JSON:
 {"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","reason":"<one line, internal>"} (omit "task" for finish)."""
 
@@ -2927,33 +3089,62 @@ class _MiniCompiled:
         return st
 
 
+def _plan_requirements_section(plan_text: str, title: str) -> str:
+    """Extract a `## <title>` section body (title matched loosely,
+    case-insensitive). Empty string when the section is absent."""
+    pat = rf"##\s*{re.escape(title)}\s*\n(.*?)(?=\n##\s|\Z)"
+    m = re.search(pat, plan_text, re.S | re.I)
+    return (m.group(1) if m else "").strip()
+
+
 def _plan_needs_backend(plan_text: str) -> bool:
-    """Deterministic read of the plan: does it define API endpoints?"""
-    m = re.search(r"##\s*Data & API(.*?)(?=\n## |\Z)", plan_text, re.S)
-    section = (m.group(1) if m else plan_text).lower()
-    if "no backend needed" in section or "frontend-only" in section \
-            or "static/frontend-only" in section:
+    """Deterministic read of the plan: does it define API endpoints?
+    v6: reads the explicit `## Backend Requirements` contract section,
+    falling back to the legacy `## Data & API` shape."""
+    section = _plan_requirements_section(plan_text, "Backend Requirements")
+    if not section:
+        section = _plan_requirements_section(plan_text, "Data & API")
+    if not section:
+        section = plan_text
+    low = section.lower()
+    if ("no backend needed" in low or "frontend-only" in low
+            or "static/frontend-only" in low):
         return False
-    if re.search(r"\b(get|post|put|patch|delete)\b[^\n]{0,40}/[a-z]", section):
+    if re.search(r"\b(get|post|put|patch|delete)\b[^\n]{0,40}/[a-z]", low):
         return True
-    if re.search(r"/api/[a-z]", section):
+    if re.search(r"/api/[a-z]", low):
         return True
-    return "flask" in section or "express" in section or "endpoint" in section
+    return bool(re.search(r"\bflask\b|\bexpress\b|\bendpoint", low))
 
 
 def _default_brief(tool: str, plan_text: str) -> str:
     """Fallback briefs when the dispatcher omits one (its decision still
-    routes; the brief just gets blunter)."""
+    routes; the brief just gets blunter). v6: quote the plan's explicit
+    requirement sections — the brief carries the WORK QUEUE, not vibes."""
     if tool == "backend":
-        return ("Build the backend exactly as the plan's Data & API section "
-                "specifies: every endpoint (method, path, response), the data "
-                "model, and the port. Publish the API contract when done.")
+        reqs = (_plan_requirements_section(plan_text, "Backend Requirements")
+                or _plan_requirements_section(plan_text, "Data & API"))
+        if reqs:
+            return ("Build the backend exactly as the plan's Backend "
+                    "Requirements specify — EVERY numbered item is yours to "
+                    "deliver:\n" + reqs[:1800]
+                    + "\nPublish the API contract when done.")
+        return ("Build the backend exactly as the plan specifies: every "
+                "endpoint (method, path, response), the data model, and "
+                "the port. Publish the API contract when done.")
     if tool == "frontend":
-        return ("Build the frontend exactly as the plan's Pages & UI section "
-                "specifies (Next.js 14 App Router — the page MUST be "
-                "frontend/app/page.tsx). If a backend exists, read the API "
-                "contract first and route every call through "
-                "frontend/lib/api_client.ts.")
+        reqs = (_plan_requirements_section(plan_text, "Frontend Requirements")
+                or _plan_requirements_section(plan_text, "Pages & UI"))
+        base = ("Build the frontend exactly as the plan's Frontend "
+                "Requirements specify — EVERY numbered item is yours to "
+                "deliver (Next.js 14 App Router — the page MUST be "
+                "frontend/app/page.tsx):\n")
+        if reqs:
+            return base + reqs[:1800]
+        return ("Build the frontend exactly as the plan specifies (Next.js 14 "
+                "App Router — the page MUST be frontend/app/page.tsx). If a "
+                "backend exists, read the API contract first and route every "
+                "call through frontend/lib/api_client.ts.")
     return ""
 
 
@@ -3026,12 +3217,20 @@ _TOOL_ALIASES = {
 
 def _dispatch_guardrails(state: Dict[str, Any],
                          proposal: Dict[str, str]) -> Tuple[str, str]:
-    """Deterministic validation of the chief's dispatch choice. The chief
-    has real agency, but the graph GUARANTEES: nothing finishes unbuilt,
-    the integration and QA gates always run, budgets are honoured, and
-    no phase loops forever."""
+    """v6 — Replit-style enforcement: the dispatcher LLM's choice is
+    AUTHORITATIVE (any tool, any order — dynamic orchestration; a static
+    site opens with frontend_agent, a UI tweak skips the backend). These
+    guardrails enforce only the platform INVARIANTS — the rules that must
+    hold no matter how the agent reasons:
+      R1 budgets are honoured;
+      R2 nothing finishes unbuilt — a premature finish is BOUNCED toward
+         the missing plan-required work (enforcement at the output layer,
+         not a hardcoded phase order);
+      R3 the QA gate always runs before the end;
+      R4 integration_check requires a backend.
+    When the LLM is silent/degraded the same cascade routes — the build
+    never stalls."""
     dispatches = list(state.get("dispatches") or [])
-    reports = state.get("reports") or {}
     budget = int(state.get("dispatch_budget") or MAX_DISPATCHES)
     plan_text = str(state.get("plan", ""))
     ran = set(dispatches)
@@ -3039,15 +3238,25 @@ def _dispatch_guardrails(state: Dict[str, Any],
     task = str(proposal.get("task", "")).strip()
     needs_backend = _plan_needs_backend(plan_text)
 
-    # Budget exhausted: force the QA gate once, then finish honestly.
+    # R1 — budget exhausted: the QA gate once, then an honest finish.
     if len(dispatches) >= budget:
         return ("debugger" if "debugger" not in ran else "end"), task
 
-    # Nothing dispatched yet → sane opening move.
-    if not dispatches:
-        return ("backend" if needs_backend else "frontend"), task
+    # R4 — integration needs a backend; without one go straight to QA.
+    if tool == "fit_check" and not needs_backend:
+        return ("debugger" if "debugger" not in ran else "end"), task
 
-    # Premature finish → force the missing build/gate.
+    # R5 — "Not all websites need a backend": a plan that explicitly
+    # declares No-backend never dispatches the backend tool (rule
+    # enforcement at the output layer — bounce to the frontend/QA work).
+    if not needs_backend and tool == "backend":
+        if "frontend" not in ran:
+            return "frontend", task
+        return ("debugger" if "debugger" not in ran else "end"), task
+
+    # R2/R3 — a proposed finish is bounced until every plan-required tool
+    # has run AND the QA gate has run. (Only fires on INVALID finishes;
+    # the order here is a tie-break for a decision the chief didn't make.)
     if tool == "end":
         if needs_backend and "backend" not in ran:
             return "backend", task
@@ -3059,24 +3268,21 @@ def _dispatch_guardrails(state: Dict[str, Any],
             return "debugger", task
         return "end", task
 
-    # Unknown tool name → default route.
-    if not tool:
-        if needs_backend and "backend" not in ran:
-            return "backend", task
-        if "frontend" not in ran:
-            return "frontend", task
-        if needs_backend and "fit_check" not in ran:
-            return "fit_check", task
-        if "debugger" not in ran:
-            return "debugger", task
-        return "end", task
+    # The chief's proposal stands — ANY tool, ANY order (dynamic).
+    if tool:
+        return tool, task
 
-    # Integration check only makes sense with a backend; without one go
-    # straight to QA.
-    if tool == "fit_check" and not needs_backend:
-        return ("debugger" if "debugger" not in ran else "end"), task
-
-    return tool, task
+    # No valid proposal (LLM degraded) — enforce the invariants via the
+    # same cascade so the build never stalls.
+    if needs_backend and "backend" not in ran:
+        return "backend", task
+    if "frontend" not in ran:
+        return "frontend", task
+    if needs_backend and "fit_check" not in ran:
+        return "fit_check", task
+    if "debugger" not in ran:
+        return "debugger", task
+    return "end", task
 
 
 def _gap_signature(debug: Dict[str, Any]) -> str:
@@ -3863,6 +4069,42 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ArcForge Orchestrator", version="3.0.0", lifespan=lifespan)
 
 
+# ---------------------------------------------------------------------------
+# v6 mounts — the Yjs CRDT bridge (/yjs) and the ACP server (/acp).
+# Both live on this same daemon (same port 9000 / same signed preview URL
+# the studio already brokers via agent-info). Optional modules: absent
+# y-py or a failed import simply leaves the endpoint unregistered.
+# ---------------------------------------------------------------------------
+if _yjs_mod is not None:
+    app.websocket("/yjs")(_yjs_mod.yjs_endpoint)
+    # The stock y-websocket client appends its room name to the server
+    # URL (…/yjs/<room>) — serve both shapes; the room is cosmetic.
+    app.websocket("/yjs/{room}")(_yjs_mod.yjs_endpoint)
+    log.info("yjs bridge mounted at /yjs (+/yjs/{room}) — CRDT multiplayer file sync")
+if _acp_mod is not None:
+    _acp_mod.bind(
+        enqueue_task=lambda text: enqueue_task(text),
+        route_approval_feedback=lambda text: route_prompt_during_approval(text),
+        cancel_queued=lambda task_id: _cancel_queued_task(task_id),
+    )
+    app.websocket("/acp")(_acp_mod.acp_endpoint)
+    log.info("ACP server mounted at /acp (Agent Client Protocol)")
+
+
+def _cancel_queued_task(task_id: str) -> bool:
+    """Best-effort cancellation of a QUEUED (not yet started) task —
+    used by ACP session/cancel. In-flight tasks run to completion."""
+    try:
+        with _db_lock, db() as conn:
+            cur = conn.execute(
+                "UPDATE task_queue SET status='cancelled', error='cancelled via ACP' "
+                "WHERE id=? AND status='queued'", (task_id,))
+            return cur.rowcount > 0
+    except sqlite3.Error:
+        return False
+
+
+
 @app.get("/health")
 async def health():
     return {"ok": True, "uptime_s": int(time.time() - STARTED_AT)}
@@ -3894,6 +4136,12 @@ async def status_route(request: Request):
         "browser": (browser_engine.health() if browser_engine is not None
                     else {"playwright_installed": False}),
         "lsp": LSP_CLIENT.health(),
+        "yjs": (getattr(_yjs_mod, "health", lambda: {"available": False})()
+                if _yjs_mod is not None else {"available": False}),
+        "acp": {"available": _acp_mod is not None},
+        "skills_usage": (getattr(_skills_server_mod, "usage_summary",
+                                  lambda: {})()
+                         if _skills_server_mod is not None else {}),
     }
 
 

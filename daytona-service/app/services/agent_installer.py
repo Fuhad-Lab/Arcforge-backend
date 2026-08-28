@@ -47,13 +47,15 @@ _SIDECAR_SRC_DIR = Path(__file__).resolve().parent.parent / "agent_sidecar"
 # uses fastapi+uvicorn (its HTTP+WS server). curl_cffi is kept so the
 # tunnel_client.py (still deployed for backward compat in non-REVERSE
 # mode — see ORCH_LLM_URL) has its WS transport available. aiohttp is
-# likewise kept for the same reason.
+# likewise kept for the same reason. y-py powers the v6 Yjs CRDT bridge
+# (yjs_bridge.py — multiplayer file sync); the bridge degrades to a
+# no-op without it, but shipping it blocking keeps /yjs live from boot.
 #
 # In REVERSE mode (the new default — ORCH_LLM_URL=reverse-tunnel://),
 # the orchestrator handles the LLM bridge ITSELF over its own
 # /reverse-tunnel WS endpoint, so the tunnel_client daemon is no longer
 # started (see ecosystem.config.js — only agent-brain is launched).
-_PIP_DEPS = ("fastapi", "uvicorn[standard]", "aiohttp", "curl_cffi")
+_PIP_DEPS = ("fastapi", "uvicorn[standard]", "aiohttp", "curl_cffi", "y-py")
 
 # Ports the generated app's dev server may listen on, in probe-priority
 # order. 3000 = the mandated Next.js frontend (`next dev -p 3000`);
@@ -130,7 +132,12 @@ class AgentInstaller:
             #   vm_browser.py     — Browser Vision Engine (Playwright bridge)
             #   skills_server.py  — MCP-style skills host (per-agent scopes)
             vm_browser_src = (_SIDECAR_SRC_DIR / "vm_browser.py").read_text("utf-8")
-            skills_server_src = (_SIDECAR_SRC_DIR / "skills_server.py").read_text("utf-8")
+            skills_src = (_SIDECAR_SRC_DIR / "skills_server.py").read_text("utf-8")
+            # v6 multiplayer/protocol modules:
+            #   yjs_bridge.py  — Yjs CRDT file sync (mounted at /yjs)
+            #   acp_server.py  — Agent Client Protocol (mounted at /acp)
+            yjs_src = (_SIDECAR_SRC_DIR / "yjs_bridge.py").read_text("utf-8")
+            acp_src = (_SIDECAR_SRC_DIR / "acp_server.py").read_text("utf-8")
 
             # --- Derive the WS tunnel config from the host env ------------
             # The VM's AI client points at localhost:7777; the tunnel_client
@@ -184,8 +191,21 @@ class AgentInstaller:
             )
             await asyncio.to_thread(
                 sandbox.fs.upload_file,
-                skills_server_src.encode("utf-8"),
+                skills_src.encode("utf-8"),
                 f"{SIDE_CAR_HOME}/skills_server.py",
+            )
+            # v6 — the CRDT bridge + the ACP server ride along with the
+            # daemon (mounted by orchestrator.py at /yjs and /acp on the
+            # same port-9000 preview URL the studio already brokers).
+            await asyncio.to_thread(
+                sandbox.fs.upload_file,
+                yjs_src.encode("utf-8"),
+                f"{SIDE_CAR_HOME}/yjs_bridge.py",
+            )
+            await asyncio.to_thread(
+                sandbox.fs.upload_file,
+                acp_src.encode("utf-8"),
+                f"{SIDE_CAR_HOME}/acp_server.py",
             )
             # Token file (mode 600) — the host re-reads this to broker
             # credentials to the VM's owner; it is never stored elsewhere.
