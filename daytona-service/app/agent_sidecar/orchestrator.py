@@ -3756,9 +3756,15 @@ def agent_dispatcher(state: Dict[str, Any]) -> Dict[str, str]:
     # terminal output, github results) ride along so the next decision is
     # informed by them.
     for util in dict.fromkeys(list(state.get("utility_calls") or [])):
-        rep = str((reports.get(util) or {}).get("report", ""))[:400]
-        if rep:
-            done_lines.append(f"- {util} (your own call): {rep}")
+        # v7.6: receipts are keyed "<util>:<id>" (e.g. request_secret:SUPABASE_URL)
+        # so MULTIPLE calls to the same tool each stay visible — the plain
+        # "<util>" key collapsed them to the last one, and the chief ping-
+        # ponged between two secrets it had already received (live).
+        keys = [util] + [k for k in reports if k.startswith(util + ":")]
+        for k in keys:
+            rep = str((reports.get(k) or {}).get("report", ""))[:400]
+            if rep:
+                done_lines.append(f"- {k} (your own call): {rep}")
     user = (
         f"APPROVED PLAN:\n{plan_text[:2400]}\n\n"
         f"REPO MAP (current codebase skeleton):\n"
@@ -4338,8 +4344,12 @@ def ask_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
         reports["ask_user"] = {"report": "the user did not answer in time — "
                                 "proceeding on best judgment"}
     else:
-        reports["ask_user"] = {"report": f"the user answered: {ans['answer']}",
-                                "answer": str(ans["answer"])[:2000]}
+        # v7.6: key by question id — multiple questions each keep their
+        # answer (the plain "ask_user" key overwrote earlier answers).
+        reports[f"ask_user:{qid}"] = {
+            "report": f"you asked: {question[:200]} — "
+                      f"the user answered: {ans['answer']}",
+            "answer": str(ans["answer"])[:2000]}
     return {"reports": reports}
 
 
@@ -4360,15 +4370,19 @@ def request_secret_node(state: Dict[str, Any]) -> Dict[str, Any]:
                               {"role": "chief", "name": name, "purpose": purpose,
                                "hint": str(args.get("hint", ""))[:200]})
     if res is None:
-        reports["request_secret"] = {"report": f"no response for {name} in time"}
+        reports[f"request_secret:{name}"] = {"report": f"no response for {name} in time"}
     elif str(res.get("state")) == "declined":
-        reports["request_secret"] = {"report": f"the user declined {name}"}
+        reports[f"request_secret:{name}"] = {"report": f"the user declined {name}"}
     elif str(res.get("state")) in ("stored", "vault_degraded"):
-        reports["request_secret"] = {
+        # v7.6: key by SECRET NAME — every delivered secret keeps its own
+        # receipt (the plain "request_secret" key overwrote earlier ones,
+        # making the chief re-request secrets it already had — live ping-pong
+        # between SUPABASE_URL and SUPABASE_ANON_KEY).
+        reports[f"request_secret:{name}"] = {
             "report": (f"{name} stored ({res.get('state')}) — the app reads "
                         f"process.env.{name}; never hardcode it")}
     else:
-        reports["request_secret"] = {
+        reports[f"request_secret:{name}"] = {
             "report": f"storage failed: {res.get('detail', res.get('state'))}"}
     return {"reports": reports}
 
