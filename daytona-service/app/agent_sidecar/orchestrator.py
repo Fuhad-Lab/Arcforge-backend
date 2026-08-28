@@ -129,6 +129,7 @@ task_failed, pong.
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
 import json
 import logging
@@ -2431,6 +2432,39 @@ def _apply_skill_gate(tools: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]
             tools[name] = _gate(tools[name])
 
 
+def _coerce_options(raw: Any) -> List[str]:
+    """Options arrive in many shapes: a proper JSON list, a STRINGIFIED
+    list ("['Supabase', 'PostgreSQL']" — the dispatcher's structured-arg
+    extraction frequently stringifies), or a comma-separated line. Never
+    iterate a string char-by-char (live: options rendered as "[", "'",
+    "S", "u", "p"… on the question card)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        # Try JSON first, then a python-ish literal, then comma split.
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                parsed = parser(text)
+                if isinstance(parsed, (list, tuple)):
+                    return _coerce_options(list(parsed))
+            except Exception:  # noqa: BLE001 — try the next parser
+                pass
+        return [p.strip(" \"'[]") for p in text.split(",") if p.strip(" \"'[]")][:6]
+    if isinstance(raw, (list, tuple)):
+        out: List[str] = []
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+            elif isinstance(item, (list, tuple)):
+                # a stringified item inside a list — flatten one level
+                out.extend(_coerce_options(list(item)))
+        return out[:6]
+    return []
+
+
 def _interaction_toolset(ctx: AgentContext
                          ) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
     """v7 (C1/C2): ask_user + request_secret — the agent may STOP and ask
@@ -2440,8 +2474,7 @@ def _interaction_toolset(ctx: AgentContext
         question = str(a.get("question") or a.get("q") or "").strip()
         if not question:
             return {"ok": False, "error": "question required"}
-        options = [str(o).strip() for o in (a.get("options") or [])
-                   if str(o).strip()][:6]
+        options = _coerce_options(a.get("options"))
         qid = "q-" + uuid.uuid4().hex[:8]
         ctx.activity("Asking you a question", "active", question[:120])
         ans = ask_user_wait(qid, ctx.task_id,
@@ -3145,8 +3178,7 @@ class ChiefAgent:
             if data.get("kind") == "clarify" and str(data.get("question", "")).strip():
                 return {"kind": "clarify",
                         "question": str(data["question"]),
-                        "options": [str(o) for o in (data.get("options") or [])
-                                     if str(o).strip()][:6]}
+                        "options": _coerce_options(data.get("options"))}
             if data.get("kind") == "app":
                 return {"kind": "app", "intent": str(data.get("intent", prompt[:120]))}
         except Exception as exc:  # noqa: BLE001
@@ -4293,8 +4325,7 @@ def ask_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
     reports = dict(state.get("reports") or {})
     args = _parse_dispatch_args(state)
     question = str(args.get("question") or state.get("dispatch_task", "")).strip()
-    options = [str(o).strip() for o in (args.get("options") or [])
-               if str(o).strip()][:6]
+    options = _coerce_options(args.get("options"))
     if not question:
         reports["ask_user"] = {"report": "ask_user: no question provided"}
         return {"reports": reports}
@@ -4706,8 +4737,7 @@ class TaskWorker(threading.Thread):
                     question = str(route.get("question", "")).strip()
                     if not question:
                         break
-                    options = [str(o) for o in (route.get("options") or [])
-                               if str(o).strip()][:6]
+                    options = _coerce_options(route.get("options"))
                     activity("Asking you a question before building", "active",
                              question[:120])
                     qid = "q-" + uuid.uuid4().hex[:8]
