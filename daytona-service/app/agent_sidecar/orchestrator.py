@@ -3412,6 +3412,7 @@ class AgentState(TypedDict, total=False):
     dispatch_task: str                # the brief for the dispatched tool
     dispatch_args: Dict[str, Any]     # v7: structured args for utility tools
     utility_calls: List[str]          # v7: chief's own tool calls (not build dispatches)
+    utility_stalls: int               # v7.1: consecutive arg-less utility dispatches
     # progress
     reports: Dict[str, Any]           # per-tool reports
     errors: List[str]
@@ -3621,6 +3622,13 @@ def agent_dispatcher(state: Dict[str, Any]) -> Dict[str, str]:
     tool, task, args = _dispatch_guardrails(state, proposal)
     if tool not in ("end", "debugger", "fit_check") and not task:
         task = _default_brief(tool, plan_text)
+    # v7.1: utility tools the model proposes WITHOUT args/task still carry
+    # their stated intent in "reason" — pass it through so the node's
+    # fallback has something to work with (and its error message can teach
+    # the correct arg shape).
+    if tool in _UTILITY_TOOLS and not args and not task \
+            and proposal.get("reason"):
+        task = str(proposal["reason"])[:400]
     if proposal.get("reason"):
         append_log(task_id, "chief", "info",
                    f"dispatch → {tool} ({proposal['reason']})")
@@ -3682,10 +3690,15 @@ def _dispatch_guardrails(state: Dict[str, Any],
 
     # R6 — utility loop valve: the chief's own tools are cheap but must
     # not loop forever. Past the cap the build work proceeds instead.
-    if tool in _UTILITY_TOOLS and len(utility_calls) >= UTILITY_MAX_CALLS:
+    # v7.1: arg-less STALLS bounce even earlier (3 consecutive utility
+    # proposals with no usable args = the model is looping on the same
+    # shape — the build cascade takes over; live-observed 12-in-a-row).
+    stall_count = int(state.get("utility_stalls") or 0)
+    if tool in _UTILITY_TOOLS and (
+            len(utility_calls) >= UTILITY_MAX_CALLS or stall_count >= 3):
         append_log(str(state.get("task_id", "")), "chief", "warn",
-                   f"utility call cap ({UTILITY_MAX_CALLS}) reached — routing "
-                   "back to the build work")
+                   f"utility {'cap' if stall_count < 3 else 'stall'} reached — "
+                   "routing back to the build work")
         tool = ""
 
     # R1 — build budget exhausted: the QA gate once, then an honest finish.
@@ -3983,6 +3996,10 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # consuming the build dispatch budget (R1).
         utility_calls = list(state.get("utility_calls") or [])
         utility_calls.append(tool)
+        # v7.1: stall tracking — an arg-less utility dispatch is a stall;
+        # a fully-formed one resets the counter.
+        stalls = int(state.get("utility_stalls") or 0)
+        stalls = 0 if (d_args or task) else (stalls + 1)
         label = {"terminal": "Running a command", "vision": "Looking at the app",
                  "use_skill": "Consulting a skill", "ask_user": "Asking you a question",
                  "request_secret": "Requesting a secret from you",
@@ -3993,7 +4010,8 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
                              or d_args.get("skill") or d_args.get("name")
                              or d_args.get("action") or task) or "")[:120]})
         return {"next_agent": tool, "dispatch_task": task,
-                "dispatch_args": d_args, "utility_calls": utility_calls}
+                "dispatch_args": d_args, "utility_calls": utility_calls,
+                "utility_stalls": stalls}
     dispatches.append(tool)
     return {"next_agent": tool, "dispatch_task": task,
             "dispatch_args": d_args,
@@ -4034,13 +4052,34 @@ def _parse_dispatch_args(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def terminal_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """The chief runs a shell command in the workspace itself — inspect
-    state, check processes, quick diagnostics (ACI-paginated)."""
+    state, check processes, quick diagnostics (ACI-paginated).
+    Live-hardened (v7.1): the chief model intermittently proposes terminal
+    with NO args.command (observed live: 12 identical "need to view code"
+    dispatches in a row). The no-command result now TEACHES the correct
+    arg shape AND carries the workspace tree — the thing the model was
+    reaching for — so the loop breaks in one round instead of burning
+    the utility cap."""
     task_id = str(state.get("task_id", ""))
     reports = dict(state.get("reports") or {})
     args = _parse_dispatch_args(state)
     cmd = str(args.get("command") or args.get("cmd") or "").strip()
-    if not cmd:
-        reports["terminal"] = {"report": "terminal: no command provided"}
+    # The fallback dict maps task→command; an intent SENTENCE is not a
+    # command — detect that and teach instead of executing garbage.
+    first_word = cmd.split()[0] if cmd else ""
+    looks_like_intent = bool(cmd) and " " in cmd and not any(
+        c in cmd for c in "./|;&><=`$") and first_word not in (
+        "ls", "cat", "head", "tail", "grep", "find", "pwd", "ps", "curl",
+        "node", "python3", "npm", "npx", "git", "echo", "wc", "which", "du",
+        "df", "top", "fuser", "sleep", "mkdir", "cp", "mv", "touch", "sed",
+        "awk", "sort", "uniq", "diff", "stat", "file", "tree", "export",
+        "source", "pip", "kill", "true", "false", "date", "whoami", "env")
+    if not cmd or looks_like_intent:
+        tree = (workspace_tree_text() or "(empty workspace)")[:1500]
+        reports["terminal"] = {"report": (
+            "terminal: no usable command was provided — to run a shell "
+            "command include args like {\"command\":\"cat frontend/app/"
+            "page.tsx\"}. HERE IS THE CURRENT WORKSPACE TREE so you can "
+            "decide the next step without another terminal call:\n" + tree)}
         return {"reports": reports}
     if any(bad in cmd for bad in ("rm -rf /", "mkfs", "shutdown", "reboot")) \
             or "secrets.env" in cmd:
