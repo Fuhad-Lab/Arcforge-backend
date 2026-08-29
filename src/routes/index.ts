@@ -7,6 +7,8 @@ import workspaceRouter from "./workspace";
 import dbRouter from "./db";
 import llmRouter from "./llm";
 import tunnelWakeRouter from "./tunnel-wake";
+import authOauthRouter from "./auth-oauth";
+import connectorsRouter from "./connectors";
 
 const router: IRouter = Router();
 
@@ -19,6 +21,15 @@ router.use("/llm", llmRouter);
 // /api/tunnel/wake — VM-side reverse-tunnel force-dial (X-Agent-Token auth;
 // Render-sleep recovery — the sidecar calls this when its tunnel is down).
 router.use(tunnelWakeRouter);
+
+// /api/auth/github/* — GitHub Sign-In (edge-relayed; anonymous-safe routes:
+// signed OAuth state + single-use one-time codes provide the security).
+router.use(authOauthRouter);
+
+// /api/connectors/* — generic connector system (GROUP 2). The OAuth
+// callback inside is public-by-design (signed state); everything else
+// requires a JWT via requireAuth inside the router.
+router.use(connectorsRouter);
 
 // /api/db/* — frontend data routes (JWT required; applied inside db.ts).
 router.use("/db", dbRouter);
