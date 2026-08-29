@@ -9,6 +9,7 @@ import llmRouter from "./llm";
 import tunnelWakeRouter from "./tunnel-wake";
 import authOauthRouter from "./auth-oauth";
 import connectorsRouter from "./connectors";
+import githubImportRouter from "./github-import";
 
 const router: IRouter = Router();
 
@@ -30,6 +31,12 @@ router.use(authOauthRouter);
 // callback inside is public-by-design (signed state); everything else
 // requires a JWT via requireAuth inside the router.
 router.use(connectorsRouter);
+
+// /api/github/* — GitHub App repository importing (GROUP 3): repo listing
+// + tarball import on the caller's own GitHub App authorization (JWT
+// required; applied inside github-import.ts). Frontend reaches these via
+// the connector-ops edge function ONLY.
+router.use(githubImportRouter);
 
 // /api/db/* — frontend data routes (JWT required; applied inside db.ts).
 router.use("/db", dbRouter);

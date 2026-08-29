@@ -78,6 +78,11 @@ export interface OAuthState {
   projectId?: string;
   sandboxId?: string;
   origin?: string;
+  /** Post-connect relative landing path on the frontend (GROUP 3): lets
+   *  flows like the GitHub import modal resume where they started instead
+   * of always landing on /connectors. Server-validated to be a safe
+   * same-origin path — never a full URL (no open-redirect). */
+  returnPath?: string;
   nonce: string;
   exp: number;
 }

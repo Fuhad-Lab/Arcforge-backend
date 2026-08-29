@@ -38,6 +38,7 @@
  * `{kind:"head", status, headers}` first, then `{kind:"chunk", body}`.
  */
 import { logger } from "../lib/logger";
+import { SKIP_DIRS, TEXT_EXTENSIONS, TEXT_FILENAMES } from "./github-filters";
 import { getProjectRowBySandbox } from "../lib/project-lookup";
 import { getServiceSupabase, isSupabaseConfigured } from "../lib/supabase-db";
 import { getWorkspaceFileTree, proxyToDaytona } from "./daytona-workspace";
@@ -95,19 +96,8 @@ const VM_READ_TIMEOUT_MS = 30_000;
 /** File-tree depth when scanning the VM for sync_workspace. */
 const SYNC_TREE_DEPTH = 10;
 
-/** Directory segments never synced to GitHub. */
-const SKIP_DIRS = new Set(["node_modules", ".next", ".git"]);
-/** Extensions considered text (binary files are never synced). */
-const TEXT_EXTENSIONS = new Set([
-  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".css", ".scss", ".sass",
-  ".less", ".html", ".htm", ".md", ".mdx", ".txt", ".py", ".yml", ".yaml", ".toml",
-  ".sql", ".sh", ".svg", ".xml", ".cfg", ".ini", ".conf", ".env", ".example", ".lock",
-]);
-/** Extension-less / dot files that are still text. */
-const TEXT_FILENAMES = new Set([
-  "dockerfile", "makefile", "procfile", ".gitignore", ".dockerignore",
-  ".npmrc", ".editorconfig", ".env", ".env.example", ".env.local",
-]);
+// Text-file / skip-dir filters live in ./github-filters (shared with the
+// GROUP 3 repository-import route — one definition of "importable text").
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 

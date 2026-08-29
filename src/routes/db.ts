@@ -131,6 +131,9 @@ router.post("/projects", async (req: Request, res: Response, next: NextFunction)
     const logoUrl = typeof body.logoUrl === "string" ? body.logoUrl : null;
     const sessionId = typeof body.sessionId === "string" && body.sessionId ? body.sessionId : null;
     const description = typeof body.description === "string" ? body.description : null;
+    // GROUP 3: imported repositories create the project with mode "import"
+    // (GitHub App flow); everything else stays "single".
+    const mode = body.mode === "import" ? "import" : "single";
 
     // FK SAFETY NET — fixes "projects_user_id_fkey" violation for brand-new
     // auth users who have never visited /settings (no public.users row yet).
@@ -148,7 +151,7 @@ router.post("/projects", async (req: Request, res: Response, next: NextFunction)
         platforms: toPlatformsColumn(body.platforms),
         session_id: sessionId,
         status: "draft",
-        mode: "single",
+        mode,
         skills_used: [],
         phases_completed: [],
         negotiation_rounds: 0,

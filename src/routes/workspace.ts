@@ -813,7 +813,11 @@ function toHeaderCase(key: string): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// LEGACY SANDBOX-ID PROXIES (authenticated) — kept for AI agent tooling
+// LEGACY SANDBOX-ID PROXIES (authenticated) — kept for AI agent tooling.
+// SECURITY (GROUP 3 audit): every legacy route now enforces OWNERSHIP via
+// authorizeSandboxAccess — the sandbox must belong to a project owned by the
+// caller (previously any authenticated user with a sandboxId could
+// read/write/exec/destroy another user's VM).
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ─── GET /api/workspace/:sandboxId/file-tree ────────────────────────
@@ -821,6 +825,7 @@ function toHeaderCase(key: string): string {
 router.get("/:sandboxId/file-tree", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
+    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
     const maxDepth = parseInt(String(req.query.max_depth ?? "4"), 10) || 4;
     const tree = await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/file-tree?max_depth=${maxDepth}`);
     res.json(tree);
@@ -834,6 +839,7 @@ router.get("/:sandboxId/file-tree", async (req: Request, res: Response, next: Ne
 router.post("/:sandboxId/write", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
+    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
     await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/write`, {
       method: "POST",
       body: req.body,
@@ -849,6 +855,7 @@ router.post("/:sandboxId/write", async (req: Request, res: Response, next: NextF
 router.post("/:sandboxId/write-bulk", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
+    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
     await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/write-bulk`, {
       method: "POST",
       body: req.body,
@@ -864,6 +871,7 @@ router.post("/:sandboxId/write-bulk", async (req: Request, res: Response, next: 
 router.get("/:sandboxId/read", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
+    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
     const path = req.query.path as string;
     if (!path) {
       res.status(400).json({ error: "path query param is required" });
@@ -884,6 +892,7 @@ router.get("/:sandboxId/read", async (req: Request, res: Response, next: NextFun
 router.post("/:sandboxId/logo", logoRawBody, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
+    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
 
     // Accept either a raw binary body or { dataUrl: "data:image/png;base64,..." }.
     let bytes: Buffer | null = null;
@@ -917,6 +926,7 @@ router.post("/:sandboxId/logo", logoRawBody, async (req: Request, res: Response,
 router.post("/:sandboxId/terminal", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
+    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
     const result = await proxyToDaytona(`/${encodeURIComponent(sandboxId)}/terminal`, {
       method: "POST",
       body: req.body,
@@ -932,6 +942,7 @@ router.post("/:sandboxId/terminal", async (req: Request, res: Response, next: Ne
 router.delete("/:sandboxId", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
+    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
     await proxyToDaytona(`/${encodeURIComponent(sandboxId)}`, { method: "DELETE" });
     res.status(204).send();
   } catch (error) {

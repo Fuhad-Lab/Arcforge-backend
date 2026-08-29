@@ -173,6 +173,32 @@ function sanitizedStatus(
   };
 }
 
+/** Safe post-connect landing path (GROUP 3 import flow): a RELATIVE path
+ *  on the frontend origin only — starts with "/", not "//" (protocol
+ *  relative), no scheme/host, bounded length. Returns null otherwise. */
+function safeReturnPath(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128) return undefined;
+  if (!trimmed.startsWith("/") || trimmed.startsWith("//") || trimmed.includes(":\\")) {
+    return undefined;
+  }
+  try {
+    const url = new URL(trimmed, "https://arcforge.invalid");
+    // Only same-origin paths survive (URL() resolves ?query/#hash fine).
+    if (url.origin !== "https://arcforge.invalid") return undefined;
+    return trimmed;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Post-connect landing base: the state's validated returnPath (e.g. the
+ *  import modal origin) or the Connectors page. Always same-origin. */
+function landing(state: { returnPath?: string }): string {
+  return `${FRONTEND_URL}${safeReturnPath(state.returnPath) || "/connectors"}`;
+}
+
 /** ── OAUTH CALLBACK (provider → edge → here) ────────────────────────
  * PUBLIC BY DESIGN and registered BEFORE requireAuth: the browser lands
  * here via a top-level redirect from the OAuth provider with no Supabase
@@ -188,12 +214,12 @@ router.get("/connectors/callback", async (req: Request, res: Response) => {
   }
   const connector = getConnector(state.connector);
   if (!connector) {
-    res.redirect(302, `${FRONTEND_URL}/connectors?connected=${state.connector}&status=error`);
+    res.redirect(302, `${landing(state)}?connected=${state.connector}&status=error`);
     return;
   }
   const creds = connectorCredentials(connector);
   if (!creds) {
-    res.redirect(302, `${FRONTEND_URL}/connectors?connected=${connector.id}&status=error&message=not_configured`);
+    res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=not_configured`);
     return;
   }
   const userId = state.userId;
@@ -228,7 +254,7 @@ router.get("/connectors/callback", async (req: Request, res: Response) => {
           "connector-oauth: token exchange failed",
         );
         await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-        res.redirect(302, `${FRONTEND_URL}/connectors?connected=${connector.id}&status=error&message=exchange_failed`);
+        res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=exchange_failed`);
         return;
       }
       const tokenJson = (await tokenRes.json()) as {
@@ -285,7 +311,7 @@ router.get("/connectors/callback", async (req: Request, res: Response) => {
       if (!accessToken) {
         logger.warn({ err: tokenJson.error }, "connector-oauth: github exchange failed");
         await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-        res.redirect(302, `${FRONTEND_URL}/connectors?connected=${connector.id}&status=error&message=exchange_failed`);
+        res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=exchange_failed`);
         return;
       }
       // Label with the resolved GitHub login.
@@ -305,7 +331,7 @@ router.get("/connectors/callback", async (req: Request, res: Response) => {
 
     if (!accessToken) {
       await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-      res.redirect(302, `${FRONTEND_URL}/connectors?connected=${connector.id}&status=error&message=no_token`);
+      res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=no_token`);
       return;
     }
 
@@ -341,11 +367,11 @@ router.get("/connectors/callback", async (req: Request, res: Response) => {
       });
     }
 
-    res.redirect(302, `${FRONTEND_URL}/connectors?connected=${connector.id}&status=ok`);
+    res.redirect(302, `${landing(state)}?connected=${connector.id}&status=ok`);
   } catch (err) {
     logger.error({ err: err instanceof Error ? err.message : "unknown" }, "connector-oauth: callback error");
     await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-    res.redirect(302, `${FRONTEND_URL}/connectors?connected=${connector.id}&status=error&message=internal`);
+    res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=internal`);
   }
 });
 
@@ -395,6 +421,7 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
     request_id?: string;
     task_id?: string;
     project_id?: string;
+    return_path?: string;
   };
   // Validate the requested capability belongs to this connector.
   let capability: string | undefined;
@@ -416,6 +443,7 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
     requestId: body.request_id,
     taskId: body.task_id,
     projectId: body.project_id,
+    returnPath: safeReturnPath(body.return_path),
   });
 
   await markConnectionStatus(userId, connector.id, "connecting").catch(() => undefined);
