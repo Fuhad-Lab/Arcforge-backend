@@ -30,6 +30,8 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
 import { requireAuth } from "../middleware/auth";
+import { getProjectRow } from "../lib/project-lookup";
+import { getAgentInfo } from "../services/daytona-workspace";
 import {
   CONNECTORS,
   connectorCredentials,
@@ -60,6 +62,92 @@ function connectorCallbackUrl(): string {
 }
 
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://arcforge-web.onrender.com";
+
+/** In-VM sidecar delivery timeout (local HTTP inside the VM via the
+ *  preview URL — same budget as workspace.ts's secrets route). */
+const SIDECAR_NOTIFY_TIMEOUT_MS = 20_000;
+
+/** ── VM NOTIFICATION (GROUP 2 session 2) ─────────────────────────────
+ *  Resolve the project's sandbox → VM sidecar url+token (same brokering
+ *  as workspace.ts postSecretToSidecar) and POST /internal/connectors so
+ *  the blocked request_connector tool call wakes and the paused task
+ *  resumes. Ownership is enforced: the project row's user_id MUST match
+ *  `userId` (the HMAC-signed state identity on the public callback path;
+ *  req.userId on the authenticated decline path). Failures are logged
+ *  honestly and NEVER fail the caller — the connection itself already
+ *  succeeded; only the task resume degrades. */
+async function notifySidecarConnector(
+  userId: string,
+  projectId: string | undefined,
+  payload: { request_id?: string; granted?: boolean; declined?: boolean; capability?: string; detail?: string },
+): Promise<void> {
+  if (!projectId) {
+    logger.warn(
+      { userId, requestId: payload.request_id ?? null },
+      "connector-resume: no projectId in the request context — the sidecar was not notified",
+    );
+    return;
+  }
+  try {
+    const row = await getProjectRow(projectId);
+    if (!row) {
+      logger.warn(
+        { userId, projectId, requestId: payload.request_id ?? null },
+        "connector-resume: project row not found — the sidecar was not notified",
+      );
+      return;
+    }
+    if (row.user_id !== userId) {
+      // User isolation: the state's user must own the project row.
+      logger.warn(
+        { userId, projectId, requestId: payload.request_id ?? null },
+        "connector-resume: project belongs to a different user — refusing to notify the sidecar",
+      );
+      return;
+    }
+    if (!row.sandbox_id) {
+      logger.warn(
+        { userId, projectId, requestId: payload.request_id ?? null },
+        "connector-resume: project has no sandbox — the sidecar was not notified",
+      );
+      return;
+    }
+    const info = await getAgentInfo(row.sandbox_id);
+    if (!info?.url || !info.token) {
+      logger.warn(
+        { userId, projectId, sandboxId: row.sandbox_id, requestId: payload.request_id ?? null },
+        "connector-resume: VM sidecar unreachable — the task resume degrades",
+      );
+      return;
+    }
+    const res = await fetch(`${info.url.replace(/\/+$/, "")}/internal/connectors`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-VM-Token": info.token,
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(SIDECAR_NOTIFY_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      logger.warn(
+        { userId, projectId, sandboxId: row.sandbox_id, requestId: payload.request_id ?? null, status: res.status, detail: text.slice(0, 200) },
+        "connector-resume: sidecar /internal/connectors responded non-2xx",
+      );
+      return;
+    }
+    logger.info(
+      { userId, projectId, sandboxId: row.sandbox_id, requestId: payload.request_id ?? null, granted: payload.granted === true, declined: payload.declined === true },
+      "connector-resume: sidecar notified (token value never logged)",
+    );
+  } catch (err) {
+    logger.warn(
+      { userId, projectId, requestId: payload.request_id ?? null, err: err instanceof Error ? err.message : "unknown" },
+      "connector-resume: sidecar notification failed — the task resume degrades",
+    );
+  }
+}
 
 /** Status derivation: DB row + token freshness. Sanitized — no token
  *  material, no env names. */
@@ -221,21 +309,37 @@ router.get("/connectors/callback", async (req: Request, res: Response) => {
       return;
     }
 
+    // Capability grant bookkeeping (GROUP 2 session 2): an authorize call
+    // WITH a specific capability grants exactly that one; the Connectors
+    // page (no capability) grants ALL connector capabilities — the user
+    // explicitly connected the whole connector.
+    const grantedCapabilities = state.capability
+      ? [state.capability]
+      : connector.capabilities.map((c) => c.id);
+
     await upsertConnection(userId, connector.id, {
       accessToken,
       refreshToken,
       expiresAt: expiryDate(expiresIn),
-    }, { scopes, accountLabel, githubLogin });
+    }, { scopes, accountLabel, githubLogin, grantedCapabilities });
 
     logger.info(
-      { userId, connector: connector.id, capability: state.capability ?? null, hasTask: Boolean(state.taskId) },
+      { userId, connector: connector.id, capability: state.capability ?? null, hasTask: Boolean(state.taskId), granted: grantedCapabilities },
       "connector-oauth: connected (token stored encrypted; value never logged)",
     );
 
-    // TODO(GROUP 2 session 2): when state.taskId/sandboxId are present,
-    // POST <vm-url>/internal/connectors (X-VM-Token) so the sidecar wakes
-    // the blocked request_connector tool call and resumes the paused task.
-    // The state context is preserved above (requestId/taskId/projectId).
+    // Task resume: when the OAuth round-trip originated from an
+    // agent-initiated request_connector call, wake the blocked sidecar
+    // tool so the paused task continues with the grant. Ownership is
+    // verified inside (state.userId is the HMAC-signed identity this
+    // backend minted at authorize time; the project row must match it).
+    if (state.taskId || state.requestId || state.projectId) {
+      await notifySidecarConnector(userId, state.projectId, {
+        request_id: state.requestId,
+        granted: true,
+        capability: state.capability,
+      });
+    }
 
     res.redirect(302, `${FRONTEND_URL}/connectors?connected=${connector.id}&status=ok`);
   } catch (err) {
@@ -361,8 +465,14 @@ router.post("/connectors/:id/decline", async (req: Request, res: Response) => {
     { userId, connector: connector.id, requestId: body.request_id ?? null, taskId: body.task_id ?? null },
     "connectors: agent-initiated request declined",
   );
-  // TODO(GROUP 2 session 2): notify the sidecar /internal/connectors with
-  // {declined: true} so the blocked agent resumes with an honest refusal.
+  // Wake the blocked sidecar request_connector call with an honest
+  // refusal (same brokering + ownership guard as the resume path).
+  if (body.request_id || body.task_id || body.project_id) {
+    await notifySidecarConnector(userId, body.project_id, {
+      request_id: body.request_id,
+      declined: true,
+    });
+  }
   res.json({ ok: true });
 });
 

@@ -36,12 +36,16 @@
  *                {t:"error", id, message}
  *                {t:"ping"} / {t:"pong"}
  *
- * PATH ROUTING (2026-08-28): req frames whose `path` starts with
- * /tunnel/github are routed to services/github-proxy.ts (this connection
- * is per-sandbox, so the proxy resolves sandboxId→project→user→PAT and
- * calls api.github.com with the PAT injected server-side — the PAT never
- * enters the VM). Other /tunnel/* paths get a 404 JSON; everything else
- * goes to the NVIDIA forwarder unchanged. Mirrors routes/tunnel.ts.
+ * PATH ROUTING (2026-08-28 + GROUP 2 session 2): req frames whose `path`
+ *   starts with /tunnel/github are routed to services/github-proxy.ts
+ *   (this connection is per-sandbox, so the proxy resolves
+ *   sandboxId→project→user→PAT and calls api.github.com with the PAT
+ *   injected server-side — the PAT never enters the VM). /mcp/supabase
+ *   frames route to services/supabase-mcp.ts (sandboxId→project→user →
+ *   vault OAuth token → the official Supabase MCP server — the token
+ *   never enters the VM). Other /tunnel/* paths get a 404 JSON;
+ *   everything else goes to the NVIDIA forwarder unchanged. Mirrors
+ *   routes/tunnel.ts.
  *
  * AUTH
  * ────
@@ -67,6 +71,7 @@
 import WebSocket from "ws";
 import { forwardToNvidia, type ForwardParams } from "./nvidia-forwarder";
 import { handleGithubTunnel } from "./github-proxy";
+import { handleMcpTunnel } from "./supabase-mcp";
 import { logger } from "../lib/logger";
 
 // ─── Configuration ──────────────────────────────────────────────────────
@@ -195,6 +200,8 @@ function clearTimers(conn: ReverseTunnelConnection): void {
  * Handle a single `req` frame end-to-end, ROUTED BY PATH:
  *   /tunnel/github → GitHub proxy (sandboxId→project→user→PAT; the PAT
  *                   is injected here, server-side — it never enters the VM)
+ *   /mcp/supabase  → Supabase MCP executor (sandboxId→project→user →
+ *                   vault OAuth token — GROUP 2 session 2)
  *   /tunnel/*      → 404 JSON (unknown tunnel path)
  *   else           → NVIDIA forwarder (unchanged — /v1/*, /vlm/* and
  *                   legacy bare paths)
@@ -270,10 +277,47 @@ async function handleReqFrame(
       id,
       body: JSON.stringify({
         ok: false,
-        error: `unknown tunnel path "${path}" — supported: /tunnel/github`,
+        error: `unknown tunnel path "${path}" — supported: /tunnel/github, /mcp/supabase`,
       }),
     });
     send(conn, { t: "done", id });
+    return;
+  }
+
+  // MCP routing (GROUP 2 session 2): /mcp/<connector> → the vault-backed
+  // MCP executor. This connection is per-sandbox, so the user identity
+  // resolves directly from conn.sandboxId. Any inbound Authorization
+  // header is ignored — the OAuth token is injected server-side only.
+  if (path.startsWith("/mcp/")) {
+    try {
+      let sentHead = false;
+      for await (const event of handleMcpTunnel(conn, frame)) {
+        if (event.kind === "head") {
+          sentHead = true;
+          send(conn, {
+            t: "res",
+            id,
+            status: event.status,
+            headers: event.headers,
+          });
+        } else {
+          if (!sentHead) {
+            // Defensive — proxy should always yield head first.
+            send(conn, { t: "res", id, status: 200, headers: {} });
+            sentHead = true;
+          }
+          send(conn, { t: "chunk", id, body: event.body });
+        }
+      }
+      send(conn, { t: "done", id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "mcp tunnel forward failed";
+      logger.warn(
+        { sandboxId: conn.sandboxId, id, err: message },
+        "reverse-tunnel: mcp request failed",
+      );
+      send(conn, { t: "error", id, message });
+    }
     return;
   }
 

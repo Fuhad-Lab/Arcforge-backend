@@ -271,6 +271,10 @@ APPROVAL_TIMEOUT_S = float(os.environ.get("ORCH_APPROVAL_TIMEOUT_S", str(6 * 360
 # v7 (GROUP 1): mid-run user-question + secret-request interaction timeouts.
 QUESTION_TIMEOUT_S = float(os.environ.get("ORCH_QUESTION_TIMEOUT_S", str(30 * 60)))
 SECRET_TIMEOUT_S = float(os.environ.get("ORCH_SECRET_TIMEOUT_S", str(60 * 60)))
+# GROUP 2 session 2: agent-initiated connector (OAuth) requests. OAuth
+# consent round-trips take minutes — the user leaves the studio, approves
+# on the provider site, and the backend callback resolves us.
+CONNECTOR_TIMEOUT_S = float(os.environ.get("ORCH_CONNECTOR_TIMEOUT_S", str(10 * 60)))
 # v7: the chief's OWN utility tools (terminal/vision/use_skill/ask_user/
 # request_secret/github) are lightweight and do NOT consume the build
 # dispatch budget — this separate cap is their loop safety valve.
@@ -1212,6 +1216,55 @@ def _tunnel_request(path: str, body: Dict[str, Any]) -> Tuple[int, str]:
     return entry.status or 502, "".join(entry.body_parts)
 
 
+def _supabase_mcp_call(tool: str, args: Any) -> Dict[str, Any]:
+    """GROUP 2 session 2: one official Supabase MCP tool call, bridged
+    through the reverse tunnel to the backend's vault-backed executor
+    (/mcp/supabase — same transport as the github tool). The user's
+    Supabase OAuth token NEVER enters the VM: the backend resolves
+    sandbox→project→user, injects the token server-side, and returns a
+    SANITIZED result. Needs-connection outcomes carry a hint that teaches
+    the request_connector tool."""
+    tool = str(tool or "").strip()
+    if not tool:
+        return {"ok": False, "error": "tool required (e.g. apply_migration, "
+                "execute_sql, list_tables, list_projects)"}
+    if isinstance(args, str):
+        # the chief dispatcher stringifies nested dicts — parse leniently
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        status, body = _tunnel_request("/mcp/supabase", {"tool": tool, "args": args})
+    except Exception as exc:  # noqa: BLE001 — transport failure, honest result
+        return {"ok": False, "error": f"supabase_mcp transport failed: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"}
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": f"supabase_mcp: HTTP {status}: {body[:300]}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "supabase_mcp: unexpected response shape"}
+    if data.get("needs_connector"):
+        cap = str(data.get("capability") or "supabase.database.write")
+        return {"ok": False,
+                "error": str(data.get("error") or "supabase is not connected"),
+                "hint": (f"call request_connector {{connector:'supabase', "
+                         f"capability:'{cap}', reason:'<why you need it>'}} "
+                         f"first, wait for the user's consent, then retry")}
+    if not data.get("ok"):
+        return {"ok": False, "error": str(data.get("error") or f"HTTP {status}")}
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    blocks = result.get("content") if isinstance(result.get("content"), list) else []
+    text = "\n".join(str(b.get("text") or "")
+                      for b in blocks if isinstance(b, dict)).strip()
+    if len(text) > 6000:
+        text = text[:6000] + "…[truncated]"
+    return {"ok": True, "tool": tool, "result": text or "(empty result)"}
+
+
 async def _rt_send_and_await(req_id: str, frame: Dict[str, Any]) -> _InflightRT:
     entry = rt_mux.register(req_id)
     try:
@@ -2067,6 +2120,8 @@ TOOL_LABELS = {
     "mailbox_read": "Checking the build log",
     "mcp_list_skills": "Reviewing available skills",
     "mcp_use_skill": "Applying a skill",
+    "request_connector": "Requesting a connector from you",
+    "supabase_mcp": "Using your Supabase project",
     "done": "Wrapping up",
 }
 
@@ -2551,7 +2606,63 @@ def _interaction_toolset(ctx: AgentContext
         return {"ok": False,
                 "error": f"secret storage failed: {res.get('detail', state)}"}
 
-    return {"ask_user": ask_user, "request_secret": request_secret}
+    def request_connector(a: Dict[str, Any]) -> Dict[str, Any]:
+        connector = str(a.get("connector") or "").strip().lower()
+        if connector not in ("supabase", "github"):
+            return {"ok": False, "error": "connector must be 'supabase' or 'github'"}
+        capability = str(a.get("capability") or "").strip()
+        if not capability:
+            capability = ("supabase.database.write" if connector == "supabase"
+                          else "github.repos.write")
+        reason = str(a.get("reason") or "").strip()
+        if not reason:
+            return {"ok": False, "error": "reason required (why you need the "
+                    "connector — shown to the user)"}
+        rid = "c-" + uuid.uuid4().hex[:8]
+        ctx.activity("Requesting a connector from you", "active",
+                     f"{connector} ({capability})")
+        res = connector_request_wait(rid, ctx.task_id,
+                                     {"role": ctx.agent_name,
+                                      "connector": connector,
+                                      "capability": capability,
+                                      "reason": reason})
+        if res is None:
+            ctx.activity("Requesting a connector from you", "done",
+                         "no response in time")
+            return {"ok": False,
+                    "error": "the user did not complete the connection in "
+                             "time — proceed without it or ask what to do"}
+        if not res.get("granted"):
+            ctx.activity("Requesting a connector from you", "done",
+                         "declined — proceeding without it")
+            return {"ok": False,
+                    "error": f"the user declined to connect {connector} — "
+                             "proceed without it or ask what to do"}
+        ctx.activity("Requesting a connector from you", "done",
+                     f"{connector} connected")
+        usage = ("authorization granted — now call the supabase_mcp tool "
+                 "(for supabase) to perform the database operations"
+                 if connector == "supabase" else
+                 "authorization granted — GitHub repository tools are "
+                 "available via the github connector")
+        return {"ok": True, "connector": connector, "capability": capability,
+                "usage": usage}
+
+    def supabase_mcp(a: Dict[str, Any]) -> Dict[str, Any]:
+        tool = str(a.get("tool") or "").strip()
+        if not tool:
+            return {"ok": False, "error": "tool required (e.g. "
+                    "apply_migration, execute_sql, list_tables)"}
+        ctx.activity("Using your Supabase project", "active", tool)
+        res = _supabase_mcp_call(tool, a.get("args"))
+        ctx.activity("Using your Supabase project", "done",
+                     "ok" if res.get("ok")
+                     else f"error: {str(res.get('error', ''))[:140]}")
+        return res
+
+    return {"ask_user": ask_user, "request_secret": request_secret,
+            "request_connector": request_connector,
+            "supabase_mcp": supabase_mcp}
 
 
 def _mailbox_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
@@ -2733,7 +2844,7 @@ WORKFLOW: read the plan → write the code (batch files in ONE write_files call)
 BACKEND CHOICE: Python Flask (requirements.txt + app.py, port 8000, enable CORS for localhost:3000) unless the plan says otherwise.
 FLASK 3 BANS (recurring live failures — the app crashes at boot): NEVER use @app.before_first_request (removed in Flask 3 — initialise the DB at module scope instead), NEVER use @app.route without explicit methods when you expect JSON bodies, and NEVER call json fields that don't exist.
 ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows an empty backend/, your FIRST action must be ONE write_files call carrying the COMPLETE initial server — app.py + requirements.txt + every module the plan's Backend Requirements list (≤12 files). Never dribble files one at a time from a blank slate; write the whole tree, THEN verify and refine.
-SELF-INTERROGATION (before EVERY action): What do I already know? What am I missing? Which of my tools does this step need, and in what order? Must I inspect a result before continuing? If a user decision would unblock me (which provider, which format, which credential), call ask_user NOW instead of guessing. If the app needs an API key or credential, call request_secret — NEVER hardcode a placeholder key or invent one.
+SELF-INTERROGATION (before EVERY action): What do I already know? What am I missing? Which of my tools does this step need, and in what order? Must I inspect a result before continuing? If a user decision would unblock me (which provider, which format, which credential), call ask_user NOW instead of guessing. If the app needs an API key or credential, call request_secret — NEVER hardcode a placeholder key or invent one. If the task needs an external service account (e.g. a Supabase database for the app), call request_connector — never invent connection strings or fake a database; after a grant, use supabase_mcp for real schema/SQL operations.
 SKILLS (MCP): your skill server hosts domain expertise for you. "Sequential Thinking" (multi-step API design) and "FileSystem" (file-layout discipline) are MANDATORY every run — the write tools BOUNCE until you have consulted them (call mcp_use_skill once each, read the guidance, then build with it applied). Your build is judged against the skill guidance too.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
@@ -2746,7 +2857,7 @@ HARD RULES:
 - After writing code: verify_file on every file, then lsp_diagnostics (tsc) until clean; start the dev server via terminal: nohup npx next dev -p 3000 -H 0.0.0.0 & ; then VERIFY with browser_tool: navigate http://localhost:3000 → console_spy → fix every error (yours) or report it to the backend agent (mailbox_send: what you called, what you expected, what you got). You cannot report done while console errors exist OR while http://localhost:3000 shows a 404.
 UI STANDARDS: inline styles or one <style> tag only (NO .css files); every file using hooks/handlers starts with 'use client'; Next 14 <Link> takes NO nested <a>; no lorem ipsum — realistic copy; responsive; loading + empty states.
 ONE-SHOT GREENFIELD (gpt-engineer pattern): when the skeleton shows only the bare scaffold, your FIRST action must be ONE write_files call carrying the COMPLETE initial file tree — every page, component and lib module the plan's Frontend Requirements list (≤12 files; extras via write_file after). Never dribble files one at a time from a blank workspace; write the whole tree, THEN verify and refine.
-SELF-INTERROGATION (before EVERY action): What do I already know? What am I missing? Which of my tools does this step need, and in what order? Must I inspect a result before continuing? If a user decision would unblock me (which design direction, which data shape, which credential), call ask_user NOW instead of guessing. If the app needs an API key or credential, call request_secret — NEVER hardcode a placeholder key or invent one.
+SELF-INTERROGATION (before EVERY action): What do I already know? What am I missing? Which of my tools does this step need, and in what order? Must I inspect a result before continuing? If a user decision would unblock me (which design direction, which data shape, which credential), call ask_user NOW instead of guessing. If the app needs an API key or credential, call request_secret — NEVER hardcode a placeholder key or invent one. If the task needs an external service account (e.g. a Supabase database for the app), call request_connector — never invent connection strings or fake a database; after a grant, use supabase_mcp for real schema/SQL operations.
 SKILLS (MCP): your skill server hosts domain expertise for you. "UI/UX Pro Max" is MANDATORY every run — the write tools BOUNCE until you have consulted it (call mcp_use_skill once, read the guidance, THEN build with it applied). Your build is judged against the skill guidance too.
 If this is a follow-up, preserve existing behaviour — modify only what the task requires."""
 
@@ -3143,11 +3254,13 @@ Your tools:
 - use_skill: consult your MCP skill server (Superpowers, Memory, Sequential Thinking) — {"tool":"use_skill","args":{"skill":"<name>","input":"<question>"}}.
 - ask_user: pause and ask the user a clarifying question with options — {"tool":"ask_user","args":{"question":"<precise question>","options":["..."],"context":"<why you're asking>"}}.
 - request_secret: securely obtain an API key/credential from the user (never hardcode, never see the value) — {"tool":"request_secret","args":{"name":"ENV_VAR_NAME","purpose":"<why the app needs it>","hint":"<where to find it>"}}.
+- request_connector: ask the user to connect an external service account (Supabase, GitHub) via OAuth consent — {"tool":"request_connector","args":{"connector":"supabase","capability":"supabase.database.write","reason":"<why — shown to the user>"}}. NEVER invent connection strings or fake a database.
+- supabase_mcp: real operations on the user's CONNECTED Supabase account (apply_migration, execute_sql, list_tables, list_projects…) — {"tool":"supabase_mcp","args":{"tool":"<mcp tool>","args":{<mcp arguments>}}}. Requires request_connector first.
 - github: GitHub operations via the user's connected account — {"tool":"github","args":{"action":"rest","method":"GET","path":"/user/repos"}} or {"tool":"github","args":{"action":"sync_workspace","repo":"auto-create:<name>","message":"<commit msg>"}}.
 - finish: everything the plan requires is done — no more tool calls.
 BRIEF QUALITY LAW (the platform enforces it): each call's "task" is the sub-agent's ONLY instructions — quote the concrete plan items it must deliver (endpoints with paths and shapes, pages with elements, file names). "Build it" / "do the rest" / "build so-so" briefs get bounced.
 Reply ONLY JSON:
-{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|terminal|vision|use_skill|ask_user|request_secret|github|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","args":{"<tool-specific arguments as shown above>"},"reason":"<one line, internal>"} (omit "task" for tools that take only args; omit both for finish)."""
+{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|terminal|vision|use_skill|ask_user|request_secret|request_connector|supabase_mcp|github|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","args":{"<tool-specific arguments as shown above>"},"reason":"<one line, internal>"} (omit "task" for tools that take only args; omit both for finish)."""
 
 CHIEF_FOLLOWUP_SYSTEM = """You are ArcForge — the user's build agent. An approved plan.md ALREADY exists and the app is built; the user sent a FOLLOW-UP request. INTERROGATE YOURSELF before answering: does this request need a NEW PLAN, or is it a contained change you can build directly under the existing contract — and WHICH of your tools owns it?
 - "direct": contained work — tweaks, fixes, restyling, copy, adding a small component, adjusting behaviour, small additions. No new plan needed: you already know the codebase and the contract. You will be handed the change verbatim and build it immediately.
@@ -3431,6 +3544,10 @@ _QUESTION_EVENTS: Dict[str, threading.Event] = {}
 _QUESTION_ANSWERS: Dict[str, Dict[str, Any]] = {}
 _SECRET_EVENTS: Dict[str, threading.Event] = {}
 _SECRET_STATES: Dict[str, Dict[str, Any]] = {}
+# GROUP 2 session 2: agent-initiated connector (OAuth) requests — the same
+# block-on-Event pattern; /internal/connectors resolves them.
+_CONNECTOR_EVENTS: Dict[str, threading.Event] = {}
+_CONNECTOR_STATES: Dict[str, Dict[str, Any]] = {}
 # Pending (unresolved) interactions — replayed in the sync payload so a
 # reconnecting studio re-surfaces the cards.
 _PENDING_INTERACTIONS: Dict[str, Dict[str, Any]] = {}
@@ -3527,6 +3644,51 @@ def secret_resolve(request_id: str, state: str, detail: str = "") -> bool:
         if ev is None:
             return False
         _SECRET_STATES[request_id] = {"state": state, "detail": detail[:500]}
+    ev.set()
+    return True
+
+
+def connector_request_wait(request_id: str, task_id: str,
+                           payload: Dict[str, Any],
+                           timeout: float = CONNECTOR_TIMEOUT_S
+                           ) -> Optional[Dict[str, Any]]:
+    """GROUP 2 session 2: emit a connector_request event and BLOCK until
+    /internal/connectors resolves it (granted | declined). None on timeout.
+    The pending interaction is replayed in the sync payload, so a
+    reconnecting studio re-surfaces the connector card."""
+    ev = threading.Event()
+    with _INTERACT_LOCK:
+        _CONNECTOR_EVENTS[request_id] = ev
+    event = {"type": "connector_request", "task_id": task_id,
+             "request_id": request_id,
+             "role": str(payload.get("role", "chief")),
+             "connector": str(payload.get("connector", "")),
+             "capability": str(payload.get("capability", "")),
+             "reason": str(payload.get("reason", ""))[:600]}
+    _interaction_pending(event)
+    emit(event)
+    try:
+        decided = ev.wait(timeout=timeout)
+    finally:
+        with _INTERACT_LOCK:
+            _CONNECTOR_EVENTS.pop(request_id, None)
+            state = _CONNECTOR_STATES.pop(request_id, None)
+        _interaction_done(request_id)
+    if not decided or state is None:
+        return None
+    return state
+
+
+def connector_resolve(request_id: str, granted: bool,
+                      detail: str = "") -> bool:
+    """Called by the /internal/connectors route: record the outcome and
+    wake the blocked request_connector tool call."""
+    with _INTERACT_LOCK:
+        ev = _CONNECTOR_EVENTS.get(request_id)
+        if ev is None:
+            return False
+        _CONNECTOR_STATES[request_id] = {"granted": bool(granted),
+                                         "detail": detail[:500]}
     ev.set()
     return True
 
@@ -3858,6 +4020,11 @@ _TOOL_ALIASES = {
     "ask_user_question": "ask_user",
     "request_secret": "request_secret", "secret": "request_secret",
     "secret_request": "request_secret",
+    # GROUP 2 session 2: agent-initiated connectors + the Supabase MCP layer.
+    "request_connector": "request_connector", "connect_connector": "request_connector",
+    "connector": "request_connector", "connect": "request_connector",
+    "supabase_mcp": "supabase_mcp", "supabase": "supabase_mcp",
+    "mcp_supabase": "supabase_mcp", "supabase_mcp_tool": "supabase_mcp",
     "github": "github", "repo": "github", "git": "github",
     "finish": "end", "end": "end", "": "end",
 }
@@ -3865,7 +4032,8 @@ _TOOL_ALIASES = {
 # v7: the chief's own lightweight tools — they don't consume the BUILD
 # dispatch budget (R1); a separate utility cap (R6) is their loop valve.
 _UTILITY_TOOLS = {"terminal", "vision", "use_skill", "ask_user",
-                  "request_secret", "github"}
+                  "request_secret", "request_connector", "supabase_mcp",
+                  "github"}
 
 
 def _dispatch_guardrails(state: Dict[str, Any],
@@ -4212,11 +4380,14 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
         label = {"terminal": "Running a command", "vision": "Looking at the app",
                  "use_skill": "Consulting a skill", "ask_user": "Asking you a question",
                  "request_secret": "Requesting a secret from you",
+                 "request_connector": "Requesting a connector from you",
+                 "supabase_mcp": "Using your Supabase project",
                  "github": "Working with GitHub"}.get(tool, tool)
         emit({"type": "activity", "task_id": task_id,
               "label": label, "state": "active",
               "detail": (str(d_args.get("command") or d_args.get("question")
                              or d_args.get("skill") or d_args.get("name")
+                             or d_args.get("connector") or d_args.get("tool")
                              or d_args.get("action") or task) or "")[:120]})
         return {"next_agent": tool, "dispatch_task": task,
                 "dispatch_args": d_args, "utility_calls": utility_calls,
@@ -4442,6 +4613,72 @@ def github_node(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"reports": reports}
 
 
+def request_connector_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """GROUP 2 session 2: the chief asks the user to connect an external
+    service account (OAuth consent round-trip). The result is a RECEIPT —
+    no token, no connection string ever enters the graph."""
+    task_id = str(state.get("task_id", ""))
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    connector = str(args.get("connector") or "").strip().lower()
+    capability = str(args.get("capability") or "").strip()
+    reason = str(args.get("reason") or state.get("dispatch_task", "")).strip()
+    if connector not in ("supabase", "github"):
+        reports["request_connector"] = {
+            "report": "request_connector: needs {connector: supabase|github, "
+                      "capability, reason}"}
+        return {"reports": reports}
+    if not capability:
+        capability = ("supabase.database.write" if connector == "supabase"
+                      else "github.repos.write")
+    if not reason:
+        reason = f"the build needs your {connector} account"
+    rid = "c-" + uuid.uuid4().hex[:8]
+    res = connector_request_wait(rid, task_id,
+                                 {"role": "chief", "connector": connector,
+                                  "capability": capability, "reason": reason})
+    if res is None:
+        reports[f"request_connector:{connector}"] = {
+            "report": f"no response for the {connector} connection in time — "
+                      "proceed without it or ask the user what to do"}
+    elif not res.get("granted"):
+        reports[f"request_connector:{connector}"] = {
+            "report": f"the user declined to connect {connector} — proceed "
+                      "without it or ask the user what to do"}
+    else:
+        usage = ("real schema/SQL operations are now available via the "
+                 "supabase_mcp tool" if connector == "supabase" else
+                 "GitHub repository tools are available via the github tool")
+        reports[f"request_connector:{connector}"] = {
+            "report": f"{connector} connected ({capability}) — {usage}"}
+    return {"reports": reports}
+
+
+def supabase_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """GROUP 2 session 2: the chief's Supabase MCP tool — real operations
+    on the user's CONNECTED Supabase account, executed server-side through
+    the reverse tunnel (the OAuth token never enters the VM)."""
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    tool = str(args.get("tool") or "").strip()
+    if not tool:
+        reports["supabase_mcp"] = {
+            "report": "supabase_mcp: needs {tool: <mcp tool>, args: {...}} "
+                      "(e.g. apply_migration, execute_sql, list_tables)"}
+        return {"reports": reports}
+    mcp_args = args.get("args")
+    res = _supabase_mcp_call(tool, mcp_args)
+    if res.get("ok"):
+        reports[f"supabase_mcp:{tool}"] = {
+            "report": f"{tool}: {str(res.get('result'))[:2000]}"}
+    else:
+        hint = f" — {res['hint']}" if res.get("hint") else ""
+        reports[f"supabase_mcp:{tool}"] = {
+            "report": f"supabase_mcp ({tool}) failed: "
+                      f"{res.get('error')}{hint}"}
+    return {"reports": reports}
+
+
 def frontend_node(state: Dict[str, Any]) -> Dict[str, Any]:
     task_id = str(state.get("task_id", ""))
     reports = dict(state.get("reports") or {})
@@ -4544,6 +4781,9 @@ def build_swarm_graph():
     g.add_node("ask_user", ask_user_node)
     g.add_node("request_secret", request_secret_node)
     g.add_node("github", github_node)
+    # GROUP 2 session 2: the chief's connector interaction + MCP tools.
+    g.add_node("request_connector", request_connector_node)
+    g.add_node("supabase_mcp", supabase_mcp_node)
     g.add_edge(START, "chief")
     g.add_conditional_edges(
         "chief", _route_from_chief,
@@ -4551,12 +4791,14 @@ def build_swarm_graph():
          "fit_check": "fit_check", "debugger": "debugger",
          "terminal": "terminal", "vision": "vision", "use_skill": "use_skill",
          "ask_user": "ask_user", "request_secret": "request_secret",
+         "request_connector": "request_connector", "supabase_mcp": "supabase_mcp",
          "github": "github", "end": END})
     g.add_edge("backend", "chief")
     g.add_edge("frontend", "chief")
     g.add_edge("fit_check", "chief")
     for util in ("terminal", "vision", "use_skill", "ask_user",
-                 "request_secret", "github"):
+                 "request_secret", "request_connector", "supabase_mcp",
+                 "github"):
         g.add_edge(util, "chief")
     # debugger FAIL → chief (triage/fix loop); PASS → END (the user's spec).
     g.add_conditional_edges("debugger", _route_from_debugger,
@@ -5276,6 +5518,45 @@ async def internal_secrets_route(request: Request):
                f"secret {name} delivered and respawned dev servers "
                f"(vault={vault or 'unknown'})")
     return {"ok": True, "state": state}
+
+
+@app.post("/internal/connectors")
+async def internal_connectors_route(request: Request):
+    """GROUP 2 session 2: the backend resolves an agent-initiated
+    request_connector call HERE — the OAuth callback (granted) or the user's
+    decline route both POST {request_id, granted|declined, capability?,
+    detail?}. The blocked request_connector tool call wakes with the
+    outcome; the studio gets a connector_request_resolved event. No token
+    material ever passes through this route — the vault is the only token
+    store. Guard: ORCH_TOKEN via Authorization header OR X-VM-Token."""
+    if TOKEN:
+        header = request.headers.get("authorization", "")
+        vm_tok = request.headers.get("x-vm-token", "")
+        if not (secrets.compare_digest(header, f"Bearer {TOKEN}")
+                or secrets.compare_digest(vm_tok, TOKEN)):
+            raise HTTPException(status_code=401, detail="unauthorized")
+    body = await request.json()
+    request_id = str(body.get("request_id") or "").strip()
+    if not request_id:
+        return JSONResponse({"error": "request_id required"}, status_code=400)
+    declined = body.get("declined") is True
+    granted = body.get("granted") is True and not declined
+    capability = str(body.get("capability") or "")
+    detail = str(body.get("detail") or
+                 ("the user granted the connection" if granted
+                  else "user declined"))
+    if declined:
+        connector_resolve(request_id, False, "user declined")
+    else:
+        connector_resolve(request_id, granted, detail)
+    emit({"type": "connector_request_resolved", "task_id": None,
+          "request_id": request_id, "granted": granted,
+          "capability": capability[:200] if capability else None,
+          "detail": detail[:200]})
+    append_log(None, "daemon", "info",
+               f"connector request {request_id} resolved "
+               f"({'granted' if granted else 'declined'})")
+    return {"ok": True, "granted": granted}
 
 
 @app.websocket("/ws")

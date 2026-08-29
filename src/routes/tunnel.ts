@@ -18,11 +18,14 @@
  * any NVIDIA traffic. The backend injects the NVIDIA API key
  * server-side; the key never enters the VM.
  *
- * PATH ROUTING (2026-08-28): every `req` frame used to go to
- * forwardToNvidia. Now the frame `path` selects a handler:
+ * PATH ROUTING (2026-08-28 + GROUP 2 session 2): every `req` frame used
+ *   to go to forwardToNvidia. Now the frame `path` selects a handler:
  *   /tunnel/github → services/github-proxy.ts (sandboxId→user→PAT;
  *                   api.github.com REST + workspace sync — the PAT
  *                   never enters the VM)
+ *   /mcp/supabase  → services/supabase-mcp.ts (sandboxId→project→user
+ *                   → vault token → official Supabase MCP server; the
+ *                   OAuth token never enters the VM)
  *   /tunnel/*      → 404 JSON (unknown tunnel path)
  *   anything else  → forwardToNvidia (unchanged — /v1/*, /vlm/* and
  *                   legacy bare paths)
@@ -74,6 +77,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { logger } from "../lib/logger";
 import { forwardToNvidia } from "../services/nvidia-forwarder";
 import { handleGithubTunnel } from "../services/github-proxy";
+import { handleMcpTunnel } from "../services/supabase-mcp";
 
 // ─── Tunnel path ────────────────────────────────────────────────────────
 const TUNNEL_PATH = "/api/tunnel";
@@ -141,6 +145,8 @@ function send(ws: WebSocket, frame: AnyFrame): void {
 /**
  * Handle a single `req` frame end-to-end, ROUTED BY PATH:
  *   /tunnel/github → GitHub proxy (user PAT injected server-side)
+ *   /mcp/supabase  → Supabase MCP executor (vault OAuth token injected
+ *                    server-side — GROUP 2 session 2)
  *   /tunnel/*      → 404 JSON
  *   else           → NVIDIA forwarder (unchanged legacy behavior)
  *
@@ -226,10 +232,58 @@ async function handleReqFrame(
       id,
       body: JSON.stringify({
         ok: false,
-        error: `unknown tunnel path "${path}" — supported: /tunnel/github`,
+        error: `unknown tunnel path "${path}" — supported: /tunnel/github, /mcp/supabase`,
       }),
     });
     send(ws, { t: "done", id });
+    return;
+  }
+
+  // MCP routing (GROUP 2 session 2): /mcp/<connector> → the vault-backed
+  // MCP executor. The inbound Authorization header (already stripped by
+  // the VM-side client) is irrelevant here — the user's OAuth token is
+  // injected server-side ONLY, inside callSupabaseMcpTool.
+  if (path.startsWith("/mcp/")) {
+    const sandboxId =
+      (typeof frame.sandboxId === "string" && frame.sandboxId) || connSandbox.sandboxId;
+    if (!sandboxId) {
+      send(ws, {
+        t: "res",
+        id,
+        status: 403,
+        headers: { "content-type": "application/json" },
+      });
+      send(ws, {
+        t: "chunk",
+        id,
+        body: JSON.stringify({
+          ok: false,
+          error: "no project owner for this sandbox — include a sandboxId field in the req frame",
+        }),
+      });
+      send(ws, { t: "done", id });
+      return;
+    }
+    try {
+      let sentHead = false;
+      for await (const event of handleMcpTunnel({ sandboxId }, frame)) {
+        if (event.kind === "head") {
+          sentHead = true;
+          send(ws, { t: "res", id, status: event.status, headers: event.headers });
+        } else {
+          if (!sentHead) {
+            send(ws, { t: "res", id, status: 200, headers: {} });
+            sentHead = true;
+          }
+          send(ws, { t: "chunk", id, body: event.body });
+        }
+      }
+      send(ws, { t: "done", id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "mcp tunnel forward failed";
+      logger.warn({ id, sandboxId, err: message }, "tunnel: mcp request failed");
+      send(ws, { t: "error", id, message });
+    }
     return;
   }
 

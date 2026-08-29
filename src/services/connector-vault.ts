@@ -131,6 +131,10 @@ export interface ConnectionRow {
   token_expires_at: string | null;
   github_login: string | null;
   connected_at: string | null;
+  /** JSON array string of granted capability ids (GROUP 2 session 2).
+   *  NULL/absent = full grant (backward compat — the user connected the
+   *  whole connector before per-capability grants existed). */
+  granted_capabilities: string | null;
 }
 
 export interface StoredTokens {
@@ -144,11 +148,35 @@ function expiryDate(secondsFromNow: number | null | undefined): string | null {
   return new Date(Date.now() + secondsFromNow * 1000).toISOString();
 }
 
+/** Parse the stored granted-capabilities JSON array. NULL/absent/
+ *  malformed = full grant (null) — the pre-session-2 contract. */
+export function parseGrantedCapabilities(row: { granted_capabilities?: string | null }): string[] | null {
+  const raw = row.granted_capabilities;
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed) && parsed.every((c) => typeof c === "string")) {
+      return parsed.length > 0 ? (parsed as string[]) : null;
+    }
+  } catch {
+    /* fallthrough — malformed = full grant */
+  }
+  return null;
+}
+
 export async function upsertConnection(
   userId: string,
   connectorId: string,
   tokens: StoredTokens,
-  meta: { scopes?: string; accountLabel?: string; projectRef?: string; githubLogin?: string },
+  meta: {
+    scopes?: string;
+    accountLabel?: string;
+    projectRef?: string;
+    githubLogin?: string;
+    /** Capability ids the user granted (GROUP 2 session 2). Omit/null =
+     *  full grant (the whole connector). */
+    grantedCapabilities?: string[] | null;
+  },
 ): Promise<void> {
   if (!isSupabaseConfigured()) throw new Error("Supabase is not configured");
   const { error } = await getServiceSupabase().from("connector_connections").upsert(
@@ -165,6 +193,10 @@ export async function upsertConnection(
         : null,
       token_expires_at: tokens.expiresAt,
       github_login: meta.githubLogin ?? null,
+      granted_capabilities:
+        meta.grantedCapabilities && meta.grantedCapabilities.length > 0
+          ? JSON.stringify(meta.grantedCapabilities)
+          : null,
       connected_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     },
@@ -203,7 +235,7 @@ export async function getConnection(
   const { data, error } = await getServiceSupabase()
     .from("connector_connections")
     .select(
-      "id,user_id,connector_id,status,scopes,account_label,project_ref,token_expires_at,github_login,connected_at",
+      "id,user_id,connector_id,status,scopes,account_label,project_ref,token_expires_at,github_login,connected_at,granted_capabilities",
     )
     .eq("user_id", userId)
     .eq("connector_id", connectorId)
