@@ -215,13 +215,24 @@ router.get("/auth/github/callback", async (req: Request, res: Response) => {
       hashed_token?: string;
       email_otp?: string;
       action_link?: string;
+      // "signup" for brand-new (unconfirmed) users, "magiclink" for
+      // existing ones — the verify endpoint requires the MATCHING type.
+      verification_type?: string;
     };
     const tokenHash = props.hashed_token || "";
     if (!tokenHash) {
       res.redirect(302, `${origin}/auth?auth=github&status=error&message=session_failed`);
       return;
     }
+    const verifyType =
+      props.verification_type === "signup" || props.verification_type === "magiclink"
+        ? props.verification_type
+        : "magiclink";
 
+    // NOTE: /auth/v1/verify with a token_hash must NOT carry the email field
+    // (400 "Only the token_hash and type should be provided" otherwise) and
+    // `type` must match the token's own verification_type (a magiclink
+    // generateLink for a NEW user mints a *signup* confirmation token).
     const verifyRes = await fetch(`${SUPABASE_URL}/auth/v1/verify`, {
       method: "POST",
       headers: {
@@ -230,9 +241,8 @@ router.get("/auth/github/callback", async (req: Request, res: Response) => {
         Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
       },
       body: JSON.stringify({
-        type: "magiclink",
+        type: verifyType,
         token_hash: tokenHash,
-        email,
       }),
     });
     if (!verifyRes.ok) {
