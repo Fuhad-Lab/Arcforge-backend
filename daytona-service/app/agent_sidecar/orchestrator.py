@@ -743,10 +743,19 @@ CREATE TABLE IF NOT EXISTS agent_mailbox (
     to_agent   TEXT NOT NULL,
     message    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS activity_log (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    task_id TEXT,
+    label   TEXT NOT NULL,
+    state   TEXT NOT NULL,
+    detail  TEXT NOT NULL DEFAULT ''
+);
 CREATE INDEX IF NOT EXISTS idx_chat_ts       ON chat_history(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_task_ts  ON process_logs(task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_files_ts      ON files(ts);
 CREATE INDEX IF NOT EXISTS idx_mailbox_ts    ON agent_mailbox(task_id, ts);
+CREATE INDEX IF NOT EXISTS idx_activity_ts   ON activity_log(ts);
 """
 
 _db_lock = threading.RLock()
@@ -787,6 +796,35 @@ def append_log(task_id: Optional[str], source: str, level: str, message: str) ->
     except sqlite3.Error:  # pre-init or locked — logging must never crash a build
         log.log(logging.INFO if level == "info" else logging.WARNING,
                 "[%s/%s] %s", source, level, str(message)[:300])
+
+
+def append_activity(task_id: Optional[str], label: str, state: str,
+                    detail: str = "") -> None:
+    """Persist an activity line — the durable twin of the live broadcast.
+    The sync handshake replays these rows so a reload/reconnect rebuilds
+    the action-pill timeline instead of forgetting the agent's work."""
+    try:
+        with _db_lock, db() as conn:
+            conn.execute(
+                "INSERT INTO activity_log (ts, task_id, label, state, detail) "
+                "VALUES (?,?,?,?,?)",
+                (time.time(), task_id, label, state, str(detail)[:500]),
+            )
+    except sqlite3.Error:  # pre-init or locked — persistence must never crash a build
+        pass
+
+
+def recent_activities(limit: int = 120) -> List[Dict[str, Any]]:
+    with _db_lock, db() as conn:
+        rows = conn.execute(
+            "SELECT id, ts, task_id, label, state, detail FROM activity_log "
+            "ORDER BY ts DESC LIMIT ?", (max(1, limit),),
+        ).fetchall()
+    return [
+        {"id": r["id"], "ts": r["ts"], "task_id": r["task_id"],
+         "label": r["label"], "state": r["state"], "detail": r["detail"]}
+        for r in rows
+    ][::-1]
 
 
 def set_status(key: str, value: Dict[str, Any]) -> None:
@@ -968,6 +1006,16 @@ def emit(event: Dict[str, Any]) -> None:
             _relay(event)
         except Exception:  # noqa: BLE001
             pass
+
+
+def emit_activity(task_id: Optional[str], label: str, state: str,
+                  detail: str = "") -> None:
+    """Broadcast an activity AND persist it to activity_log — one call,
+    one source of truth. Live clients render the broadcast; reconnecting
+    clients rebuild the timeline from the persisted rows via sync."""
+    emit({"type": "activity", "task_id": task_id, "label": label,
+          "state": state, "detail": detail})
+    append_activity(task_id, label, state, detail)
 
 
 # ---------------------------------------------------------------------------
@@ -2143,8 +2191,7 @@ class AgentContext:
         self.started = time.time()
 
     def activity(self, label: str, state: str, detail: str = "") -> None:
-        emit({"type": "activity", "task_id": self.task_id, "label": label,
-              "state": state, "detail": detail})
+        emit_activity(self.task_id, label, state, detail)
         append_log(self.task_id, self.agent_name, "info",
                    f"{label} — {detail}" if detail else label)
 
@@ -4295,9 +4342,8 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "repo_map": generate_repo_map(),
             "file_system_state": file_system_state(task_id),
         })
-        emit({"type": "activity", "task_id": task_id,
-              "label": _fix_activity_label(nxt["task"]), "state": "active",
-              "detail": str(nxt["task"])[:120]})
+        emit_activity(task_id, _fix_activity_label(nxt["task"]), "active",
+                      str(nxt["task"])[:120])
         return update
 
     # 2) Fresh QA failure → the debugger's missing-features checklist goes
@@ -4347,9 +4393,8 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "repo_map": generate_repo_map(),
             "file_system_state": file_system_state(task_id),
         })
-        emit({"type": "activity", "task_id": task_id,
-              "label": _fix_activity_label(nxt["task"]), "state": "active",
-              "detail": str(nxt["task"])[:120]})
+        emit_activity(task_id, _fix_activity_label(nxt["task"]), "active",
+                      str(nxt["task"])[:120])
         return update
 
     # 3) QA passed → finish.
@@ -4383,12 +4428,11 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
                  "request_connector": "Requesting a connector from you",
                  "supabase_mcp": "Using your Supabase project",
                  "github": "Working with GitHub"}.get(tool, tool)
-        emit({"type": "activity", "task_id": task_id,
-              "label": label, "state": "active",
-              "detail": (str(d_args.get("command") or d_args.get("question")
-                             or d_args.get("skill") or d_args.get("name")
-                             or d_args.get("connector") or d_args.get("tool")
-                             or d_args.get("action") or task) or "")[:120]})
+        emit_activity(task_id, label, "active",
+                      (str(d_args.get("command") or d_args.get("question")
+                           or d_args.get("skill") or d_args.get("name")
+                           or d_args.get("connector") or d_args.get("tool")
+                           or d_args.get("action") or task) or "")[:120])
         return {"next_agent": tool, "dispatch_task": task,
                 "dispatch_args": d_args, "utility_calls": utility_calls,
                 "utility_stalls": stalls}
@@ -4705,9 +4749,8 @@ def fit_check_node(state: Dict[str, Any]) -> Dict[str, Any]:
     append_log(task_id, "orchestrator", "info",
                f"servers: {json.dumps(servers)}")
     set_active("building", "testing the app end-to-end")
-    emit({"type": "activity", "task_id": task_id,
-          "label": "Testing the app end-to-end", "state": "active",
-          "detail": "both servers up — checking the live app in the browser"})
+    emit_activity(task_id, "Testing the app end-to-end", "active",
+                  "both servers up — checking the live app in the browser")
     fit = run_frontend_agent(task_id, "", plan_text, fit_check=True)
     reports["fit_check"] = fit
     repairs = int(state.get("repairs") or 0)
@@ -4720,13 +4763,11 @@ def fit_check_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     + "\n".join(f"- {m['message']}" for m in backend_fix_msgs[-4:])
                     + "\nFix the reported endpoint(s), restart your server via "
                       "terminal, and re-publish the api contract if routes changed.")
-        emit({"type": "activity", "task_id": task_id,
-              "label": "Applying a fix", "state": "active",
-              "detail": "backend endpoint repair"})
+        emit_activity(task_id, "Applying a fix", "active",
+                      "backend endpoint repair")
         run_backend_agent(task_id, fix_task, plan_text)
         run_frontend_agent(task_id, "", plan_text, fit_check=True)
-    emit({"type": "activity", "task_id": task_id,
-          "label": "Testing the app end-to-end", "state": "done"})
+    emit_activity(task_id, "Testing the app end-to-end", "done")
     return {"reports": reports, "repairs": repairs,
             "verdict": str(state.get("verdict") or "")}
 
@@ -4973,8 +5014,7 @@ class TaskWorker(threading.Thread):
         started = time.time()
 
         def activity(label: str, state: str, detail: str = "") -> None:
-            emit({"type": "activity", "task_id": task_id, "label": label,
-                  "state": state, "detail": detail})
+            emit_activity(task_id, label, state, detail)
             append_log(task_id, "daemon", "info",
                        f"{label} — {detail}" if detail else label)
 
@@ -5279,6 +5319,7 @@ def _sync_payload() -> Dict[str, Any]:
         "active_status": active,
         "tasks": all_tasks(),
         "logs": recent_logs(LOG_TAIL_FOR_SYNC),
+        "activities": recent_activities(120),
         "pending_approval": _pending_approval_payload(),
         "pending_interactions": pending_interactions(),
         "server": {
