@@ -12,6 +12,7 @@
  * Auth: requireAuth (JWT) on every route — the sandbox VMs are the user's
  * workspaces; nobody may touch another user's VM.
  */
+import { createHmac, randomUUID } from "node:crypto";
 import express, { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
 import { logger } from "../lib/logger";
 import { requireAuth } from "../middleware/auth";
@@ -442,6 +443,57 @@ router.get("/project/:projectId/file-tree", async (req: Request, res: Response, 
     const tree = await getWorkspaceFileTree(row.sandbox_id, maxDepth);
     res.json({ tree, sandbox_id: row.sandbox_id });
   } catch (error) {
+    next(error);
+  }
+});
+
+// ─── GET /api/workspace/project/:projectId/grant ─────────────────────────
+// Mint a Forgvi 2.0 workspace grant — the short-lived HMAC token that binds
+// one engine run to THIS project's sandbox. The engine verifies the
+// signature (shared WORKSPACE_GRANT_SECRET) and then executes the run's
+// bash/edit tools directly against the sandbox, making the VM and the
+// engine one shared workspace (same filesystem Forgvi 1.0's in-VM swarm
+// uses). One grant = one project's sandbox — the engine can never be handed
+// another user's workspace because the grant only exists after this route
+// verified the caller owns the project.
+
+const WORKSPACE_GRANT_TTL_MS = 20 * 60_000; // 20 minutes — engine wake + run start
+
+function mintGrant(row: ProjectRow, userId: string): string {
+  const secret = process.env.WORKSPACE_GRANT_SECRET;
+  if (!secret) {
+    throw new Error("WORKSPACE_GRANT_SECRET is not configured on the backend");
+  }
+  const payload = JSON.stringify({
+    v: 1,
+    projectId: row.id,
+    sandboxId: row.sandbox_id,
+    userId,
+    iat: Date.now(),
+    exp: Date.now() + WORKSPACE_GRANT_TTL_MS,
+    jti: randomUUID(),
+  });
+  const body = Buffer.from(payload, "utf-8").toString("base64url");
+  const mac = createHmac("sha256", secret).update(body).digest("base64url");
+  return `fg1.${body}.${mac}`;
+}
+
+router.get("/project/:projectId/grant", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    if (!row.sandbox_id) {
+      res.status(404).json({ error: "No sandbox for this project yet — the VM is still booting" });
+      return;
+    }
+
+    const grant = mintGrant(row, req.userId!);
+    // The grant is opaque to the browser (it never carries the secret), and
+    // expires in minutes. It is handed to the engine with the next run.
+    res.json({ grant, sandbox_id: row.sandbox_id, expires_in_ms: WORKSPACE_GRANT_TTL_MS });
+  } catch (error) {
+    // The missing-secret case is an honest 500, not an ownership error.
     next(error);
   }
 });
