@@ -177,6 +177,76 @@ router.post("/projects", async (req: Request, res: Response, next: NextFunction)
   }
 });
 
+// ─── PUT /api/db/projects/:id — update a draft project's meta ──────────────
+// THE FORGE TRIGGER path: startBuildFlow creates the project row the
+// moment the user clicks forge (auto name, no logo), the build wizard
+// runs on top of that background work, and its choices (final name,
+// logo, platforms) land HERE. Ownership is enforced — a user can only
+// ever update their own project.
+
+router.put("/projects/:id", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const projectId = req.params.id;
+    if (!projectId) {
+      res.status(400).json({ error: "project id is required" });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) {
+      res.status(400).json({ error: "name is required" });
+      return;
+    }
+    const logoUrl = typeof body.logoUrl === "string" && body.logoUrl ? body.logoUrl : null;
+
+    // Ownership guard: the row must exist AND belong to the caller.
+    const { data: existing, error: findError } = await supabase
+      .from("projects")
+      .select("id,user_id,name,logo_url,platforms,session_id,created_at,updated_at")
+      .eq("id", projectId)
+      .eq("user_id", req.userId)
+      .maybeSingle();
+
+    if (findError) throw new Error(`find project: ${findError.message}`);
+    if (!existing) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("projects")
+      .update({
+        name,
+        logo_url: logoUrl,
+        platforms: toPlatformsColumn(body.platforms) ?? existing.platforms,
+      })
+      .eq("id", projectId)
+      .eq("user_id", req.userId)
+      .select("id,name,logo_url,platforms,session_id,created_at,updated_at")
+      .single();
+
+    if (error) throw new Error(`update project: ${error.message}`);
+
+    res.status(200).json({
+      project: {
+        id: data.id,
+        name: data.name,
+        logoUrl: data.logo_url,
+        platforms: toPlatformsArray(data.platforms),
+        sessionId: data.session_id,
+        createdAt: data.created_at,
+        updatedAt: data.updated_at,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ─── GET /api/db/sessions/:sessionId — session detail + chat history ───────
 
 router.get("/sessions/:sessionId", async (req: Request, res: Response, next: NextFunction) => {
