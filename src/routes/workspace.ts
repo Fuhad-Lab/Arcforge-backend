@@ -498,6 +498,49 @@ router.get("/project/:projectId/grant", async (req: Request, res: Response, next
   }
 });
 
+// ─── POST /api/workspace/project/:projectId/engine-run ────────────────────
+// Record the active Forgvi 2.0 run on the project row — what lets a
+// re-mounted studio RE-ATTACH after a reload or closed tab (get-session
+// hands the record back; the engine's journal replays the run from the
+// recorded runId). Written by the browser at run start (via the vm-ops
+// engine-run-set action) and settled at finish/abort. The columns are
+// engine_run_id / engine_run_origin / engine_run_status /
+// engine_run_objective on public.projects.
+
+router.post("/project/:projectId/engine-run", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const row = await getProjectRow(String(req.params.projectId));
+    if (!isOwnedBy(res, row, req.userId)) return;
+
+    const runId = typeof req.body?.runId === "string" ? req.body.runId.trim() : "";
+    if (!runId) {
+      res.status(400).json({ error: "runId is required" });
+      return;
+    }
+    const engineOrigin = req.body?.engineOrigin === "vm" ? "vm" : "render";
+    const status = typeof req.body?.status === "string" && req.body.status ? req.body.status : "running";
+    const objective = typeof req.body?.objective === "string" ? req.body.objective : null;
+
+    const supabase = getServiceSupabase();
+    const { error } = await supabase
+      .from("projects")
+      .update({
+        engine_run_id: runId,
+        engine_run_origin: engineOrigin,
+        engine_run_status: status,
+        engine_run_objective: objective,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", row.id)
+      .eq("user_id", req.userId!);
+    if (error) throw new Error(`engine-run set: ${error.message}`);
+
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ─── GET /api/workspace/project/:projectId/read ───────────────────────────
 // Read a file from the project's VM.
 

@@ -186,22 +186,43 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
 
     // Primary lookup by session_id; fallback to the project UUID for rows
     // created by direct backend generations (session_id may be null there).
-    let { data: project, error } = await supabase
-      .from("projects")
-      .select("id,user_id,name,logo_url,platforms,session_id,sandbox_id")
-      .eq("session_id", req.params.sessionId)
-      .eq("user_id", req.userId)
-      .maybeSingle();
+    // engine_run_* (optional, Forgvi 2.0 run-in-flight record) rides along
+    // so a re-mounted studio can re-attach to a live run.
+    const PROJECT_SESSION_COLUMNS =
+      "id,user_id,name,logo_url,platforms,session_id,sandbox_id,engine_run_id,engine_run_origin,engine_run_status,engine_run_objective";
+    const PROJECT_SESSION_BASE_COLUMNS =
+      "id,user_id,name,logo_url,platforms,session_id,sandbox_id";
+    /** Select with a deploy-order shield: if the engine_run_* columns are
+     *  not on the table yet (schema applied after this deploy), retry with
+     *  the base column set and read engineRun as null — the studio just
+     *  loses re-attach until the columns land, never the whole session. */
+    const selectProject = async (match: { column: "session_id" | "id"; value: string }) => {
+      const full = await supabase
+        .from("projects")
+        .select(PROJECT_SESSION_COLUMNS)
+        .eq(match.column, match.value)
+        .eq("user_id", req.userId)
+        .maybeSingle();
+      if (!full.error) return { data: full.data, error: null };
+      if (full.error.message.includes("engine_run")) {
+        logger.warn("engine_run_* columns missing — get-session degrades to base columns");
+        const base = await supabase
+          .from("projects")
+          .select(PROJECT_SESSION_BASE_COLUMNS)
+          .eq(match.column, match.value)
+          .eq("user_id", req.userId)
+          .maybeSingle();
+        return { data: base.data, error: base.error };
+      }
+      return { data: full.data, error: full.error };
+    };
+
+    let { data: project, error } = await selectProject({ column: "session_id", value: String(req.params.sessionId) });
 
     if (error) throw new Error(`session lookup: ${error.message}`);
 
     if (!project) {
-      const fallback = await supabase
-        .from("projects")
-        .select("id,user_id,name,logo_url,platforms,session_id,sandbox_id")
-        .eq("id", req.params.sessionId)
-        .eq("user_id", req.userId)
-        .maybeSingle();
+      const fallback = await selectProject({ column: "id", value: String(req.params.sessionId) });
       if (fallback.error) throw new Error(`session lookup: ${fallback.error.message}`);
       project = fallback.data;
     }
@@ -233,6 +254,25 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
       logger.warn({ err: err instanceof Error ? err.message : err }, "chat history lookup failed");
     }
 
+    // The Forgvi 2.0 run-in-flight record — surfaced ONLY while the run
+    // is still going (terminal statuses settle the row and read as null
+    // here, so a remount never re-attaches a finished run).
+    const engineRunCols = project as unknown as {
+      engine_run_id?: string | null;
+      engine_run_origin?: string | null;
+      engine_run_status?: string | null;
+      engine_run_objective?: string | null;
+    };
+    const engineRun =
+      engineRunCols.engine_run_id && engineRunCols.engine_run_status === "running"
+        ? {
+            runId: engineRunCols.engine_run_id,
+            origin: engineRunCols.engine_run_origin === "vm" ? ("vm" as const) : ("render" as const),
+            status: "running",
+            objective: engineRunCols.engine_run_objective ?? null,
+          }
+        : null;
+
     res.json({
       session: {
         id: project.session_id || project.id,
@@ -243,6 +283,7 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
           logoUrl: project.logo_url,
           platforms: toPlatformsArray(project.platforms),
           sandboxId: project.sandbox_id,
+          engineRun,
         },
         messages,
       },
