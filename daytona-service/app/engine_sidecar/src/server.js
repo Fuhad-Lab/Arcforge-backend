@@ -49,8 +49,27 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "256kb" }));
 
-/** CORS with an origin allowlist (credentials never used). */
+/** CORS — HOST MODE ONLY: origin allowlist, credentials never used.
+ *
+ * IN-VM MODE MUST NOT EMIT CORS HEADERS AT ALL. The signed Daytona preview
+ * proxy in front of the in-VM engine already terminates browser CORS: it
+ * echoes the request Origin and answers OPTIONS preflights itself. If this
+ * engine also set Access-Control-Allow-Origin, the browser would receive
+ * the header TWICE and reject the whole response — every fetch from the
+ * site would die with a CORS TypeError (the live "engine is not
+ * responding" bug, observed 2026-09-03). One header, from the proxy. */
 app.use((req, res, next) => {
+  if (ENGINE_IN_VM) {
+    // Preflights are answered by the proxy before they ever reach the
+    // engine; if one still slips through, a bare 204 is a valid answer
+    // (the proxy decorates it with its own CORS headers).
+    if (req.method === "OPTIONS") {
+      res.sendStatus(204);
+      return;
+    }
+    next();
+    return;
+  }
   const origin = req.headers.origin;
   if (origin && ALLOWED_ORIGINS.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -98,6 +117,23 @@ if (BUSY_FILE) {
   if (manager.countActive() > 0) stampBusy();
   else clearBusy();
 }
+
+app.get("/", (_req, res) => {
+  // 200 on the bare URL — uptime monitors (UptimeRobot etc.) pointed at the
+  // service root must see a healthy response, not a 404 from an unrouted
+  // path. Liveness ≠ kernel readiness: /health carries the full truth
+  // (503 when the model provider key is missing); this route only answers
+  // "the engine process is alive".
+  const ready = kernelReady();
+  res.status(200).json({
+    ok: true,
+    engine: "forgvi",
+    version: "1.0.0",
+    mode: ENGINE_IN_VM ? "in-vm" : "host",
+    kernel_ready: ready,
+    hint: ready ? "GET /health for status; POST /runs to start a goal" : "kernel not configured — see /health",
+  });
+});
 
 app.get("/health", (_req, res) => {
   const ready = kernelReady();
