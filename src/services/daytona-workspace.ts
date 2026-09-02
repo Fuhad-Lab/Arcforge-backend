@@ -176,6 +176,14 @@ export type AgentSidecarInfo = {
   alive: boolean;
   app_url?: string | null;
   app_port?: number | null;
+  /** SIGNED Daytona preview URL for the in-VM Forgvi 2.0 engine (port
+   * 8799). Set when the engine's /health answers 200 inside the VM —
+   * even when its LLM bridge is down (engine_alive=false). */
+  engine_url?: string | null;
+  /** True ONLY when the engine is up AND its LLM path (the orchestrator's
+   * /llm/v1/models over the reverse tunnel) answers 200. False ⇒ the
+   * studio falls back to the Render-hosted engine. */
+  engine_alive?: boolean;
 };
 
 /** LLM config handed to the in-VM orchestrator daemon at sandbox creation

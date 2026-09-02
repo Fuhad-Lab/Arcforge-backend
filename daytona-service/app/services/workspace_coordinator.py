@@ -269,6 +269,10 @@ class DaytonaWorkspaceManager:
             install_task = asyncio.create_task(
                 agent_installer.install(
                     sandbox, llm_config=agent_llm, skills=agent_skills,
+                    # project_id feeds the Forgvi 2.0 engine's env
+                    # (ENGINE_PROJECT_ID) when the vendored engine tree
+                    # is present on this host.
+                    project_id=project_id,
                 ),
             )
 

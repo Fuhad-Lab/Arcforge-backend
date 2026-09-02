@@ -178,6 +178,15 @@ SANDBOX_ID = os.environ.get("ORCH_SANDBOX_ID", "")
 SYSTEM_DIR = os.environ.get("ORCH_SYSTEM_DIR", "/home/daytona/.system")
 DB_PATH = os.environ.get("ORCH_DB", os.path.join(SYSTEM_DIR, "state.db"))
 
+# The in-VM Forgvi 2.0 engine's footprint (installed by the sidecar
+# installer as PM2 "forgvi-engine" on :8799 — see agent_installer.py).
+# The engine touches ENGINE_BUSY_FILE every 10s while a run is active so
+# /status (and through it the backend's tunnel sweeper + this daemon's
+# keepalive loop) knows the LLM reverse tunnel must stay up mid-run.
+ENGINE_PORT = int(os.environ.get("ENGINE_PORT", "8799"))
+ENGINE_BUSY_FILE = os.environ.get(
+    "ENGINE_BUSY_FILE", os.path.join(SYSTEM_DIR, "engine_busy"))
+
 LLM_URL = os.environ.get("ORCH_LLM_URL", "http://localhost:7777/v1")
 LLM_USE_REVERSE_TUNNEL = LLM_URL.startswith("reverse-tunnel://")
 if not LLM_USE_REVERSE_TUNNEL:
@@ -749,13 +758,22 @@ CREATE TABLE IF NOT EXISTS activity_log (
     task_id TEXT,
     label   TEXT NOT NULL,
     state   TEXT NOT NULL,
-    detail  TEXT NOT NULL DEFAULT ''
+    detail  TEXT NOT NULL DEFAULT '',
+    kind    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chat_ts       ON chat_history(ts);
 CREATE INDEX IF NOT EXISTS idx_logs_task_ts  ON process_logs(task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_files_ts      ON files(ts);
 CREATE INDEX IF NOT EXISTS idx_mailbox_ts    ON agent_mailbox(task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_activity_ts   ON activity_log(ts);
+CREATE INDEX IF NOT EXISTS idx_activity_task ON activity_log(task_id, ts);
+CREATE TABLE IF NOT EXISTS journal_events (
+    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    task_id TEXT,
+    event   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_journal_task ON journal_events(task_id, seq);
 """
 
 _db_lock = threading.RLock()
@@ -799,32 +817,112 @@ def append_log(task_id: Optional[str], source: str, level: str, message: str) ->
 
 
 def append_activity(task_id: Optional[str], label: str, state: str,
-                    detail: str = "") -> None:
+                    detail: str = "", kind: Optional[str] = None,
+                    activity_id: Optional[int] = None) -> Optional[int]:
     """Persist an activity line — the durable twin of the live broadcast.
     The sync handshake replays these rows so a reload/reconnect rebuilds
-    the action-pill timeline instead of forgetting the agent's work."""
+    the action-pill timeline instead of forgetting the agent's work.
+
+    `activity_id` UPDATEs an existing row — the active→done transition of
+    ONE tool call reuses its row (the wire event carries the same id, so
+    the frontend upserts by identity instead of label). INSERTs return the
+    new row id; failures return None (persistence never crashes a build)."""
     try:
         with _db_lock, db() as conn:
-            conn.execute(
-                "INSERT INTO activity_log (ts, task_id, label, state, detail) "
-                "VALUES (?,?,?,?,?)",
-                (time.time(), task_id, label, state, str(detail)[:500]),
+            if activity_id is not None:
+                conn.execute(
+                    "UPDATE activity_log SET state=?, detail=?, kind=?, ts=? "
+                    "WHERE id=?",
+                    (state, str(detail)[:500], kind, time.time(), int(activity_id)),
+                )
+                return int(activity_id)
+            cur = conn.execute(
+                "INSERT INTO activity_log (ts, task_id, label, state, detail, kind) "
+                "VALUES (?,?,?,?,?,?)",
+                (time.time(), task_id, label, state, str(detail)[:500], kind),
             )
+            return int(cur.lastrowid)
     except sqlite3.Error:  # pre-init or locked — persistence must never crash a build
-        pass
+        return None
 
 
 def recent_activities(limit: int = 120) -> List[Dict[str, Any]]:
     with _db_lock, db() as conn:
         rows = conn.execute(
-            "SELECT id, ts, task_id, label, state, detail FROM activity_log "
+            "SELECT id, ts, task_id, label, state, detail, kind FROM activity_log "
             "ORDER BY ts DESC LIMIT ?", (max(1, limit),),
         ).fetchall()
     return [
         {"id": r["id"], "ts": r["ts"], "task_id": r["task_id"],
-         "label": r["label"], "state": r["state"], "detail": r["detail"]}
+         "label": r["label"], "state": r["state"], "detail": r["detail"],
+         "kind": r["kind"]}
         for r in rows
     ][::-1]
+
+
+# ---------------------------------------------------------------------------
+# THE JOURNAL (Forgvi 2.0's streaming model, ported to 1.0)
+#
+# Every emitted event is persisted to journal_events with a monotonically
+# increasing seq (SQLite AUTOINCREMENT — stable across daemon restarts).
+# A reconnecting client sends {"type":"hello","since":N} and receives
+# exactly the events past its cursor ("journal_replay") — the lossless
+# re-attach contract the 2.0 engine's journal already gives its studio.
+# A server restart (seq reset) or a gap larger than the replay cap falls
+# back to the full snapshot honestly.
+# ---------------------------------------------------------------------------
+
+
+def _journal_persist(event: Dict[str, Any]) -> Optional[int]:
+    """Persist one event envelope; returns the allocated seq or None on
+    failure (the live broadcast must never die for a journaling miss)."""
+    task_id = event.get("task_id") if isinstance(event.get("task_id"), str) else None
+    try:
+        payload = json.dumps(event, ensure_ascii=False, default=str)
+        if len(payload) > 16000:  # giant tool outputs stay live-only
+            payload = json.dumps(
+                {"type": "journal_drop", "reason": "oversize",
+                 "orig_type": str(event.get("type", ""))},
+                ensure_ascii=False,
+            )
+        with _db_lock, db() as conn:
+            cur = conn.execute(
+                "INSERT INTO journal_events (ts, task_id, event) VALUES (?,?,?)",
+                (time.time(), task_id, payload),
+            )
+            return int(cur.lastrowid)
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+def recent_journal(since: int, limit: int = 400) -> List[Dict[str, Any]]:
+    """Journal events past `since`, oldest first (bounded)."""
+    with _db_lock, db() as conn:
+        rows = conn.execute(
+            "SELECT seq, event FROM journal_events WHERE seq > ? "
+            "ORDER BY seq LIMIT ?", (int(since), max(1, limit)),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            ev = json.loads(r["event"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(ev, dict):
+            ev["seq"] = int(r["seq"])
+            out.append(ev)
+    return out
+
+
+def journal_seq() -> int:
+    """The current journal cursor (max allocated seq)."""
+    try:
+        with _db_lock, db() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS s FROM journal_events").fetchone()
+        return int(row["s"]) if row else 0
+    except sqlite3.Error:
+        return 0
 
 
 def set_status(key: str, value: Dict[str, Any]) -> None:
@@ -998,6 +1096,19 @@ _EVENT_RELAYS: List[Callable[[Dict[str, Any]], None]] = []
 
 
 def emit(event: Dict[str, Any]) -> None:
+    """Broadcast one event to every live client (+ relays) AND journal it.
+
+    THE JOURNAL (the 2.0 port): every event is persisted to journal_events
+    and stamped with its monotonic seq before broadcast, so a reconnecting
+    studio can ask for exactly what it missed ({"type":"hello","since":N}
+    → journal_replay) — the same lossless contract as Forgvi 2.0's engine
+    journal. Events that already carry a seq (re-broadcasts) pass through
+    untouched; journaling failures never kill the live path."""
+    event = dict(event)
+    if "seq" not in event:
+        seq = _journal_persist(event)
+        if seq is not None:
+            event["seq"] = seq
     manager.broadcast_from_worker(event)
     # v6: side-channel relays (ACP server notifications, …). A relay must
     # never break the primary broadcast.
@@ -1009,13 +1120,54 @@ def emit(event: Dict[str, Any]) -> None:
 
 
 def emit_activity(task_id: Optional[str], label: str, state: str,
-                  detail: str = "") -> None:
+                  detail: str = "", kind: Optional[str] = None,
+                  activity_id: Optional[int] = None) -> Optional[int]:
     """Broadcast an activity AND persist it to activity_log — one call,
     one source of truth. Live clients render the broadcast; reconnecting
-    clients rebuild the timeline from the persisted rows via sync."""
-    emit({"type": "activity", "task_id": task_id, "label": label,
-          "state": state, "detail": detail})
-    append_activity(task_id, label, state, detail)
+    clients rebuild the timeline from the persisted rows via sync.
+
+    The wire event carries the row's id (stable identity across the
+    active→done transition — the frontend upserts by id, never by label)
+    plus the tool `kind` when known, and the state may now be "error" as
+    well as "active"/"done". Returns the row id."""
+    row_id = append_activity(task_id, label, state, detail, kind=kind,
+                             activity_id=activity_id)
+    emit({"type": "activity", "task_id": task_id, "id": row_id,
+          "label": label, "state": state, "detail": str(detail)[:500],
+          "kind": kind})
+    return row_id
+
+
+def emit_role_spawned(task_id: Optional[str], role: str,
+                      summary: str = "") -> None:
+    """A specialist takes the stage (the 1.0 twin of the 2.0 journal's
+    role_spawned — same event shape, same studio rendering)."""
+    emit({"type": "role_spawned", "task_id": task_id, "role": str(role)[:60],
+          "summary": str(summary)[:400]})
+
+
+def emit_role_finished(task_id: Optional[str], role: str, ok: bool,
+                       summary: str = "") -> None:
+    """A specialist finishes with a verdict (the role_finished twin)."""
+    emit({"type": "role_finished", "task_id": task_id, "role": str(role)[:60],
+          "ok": bool(ok), "summary": str(summary)[:600]})
+
+
+def emit_verification_result(task_id: Optional[str], ok: bool,
+                              summary: str = "",
+                              gaps: Optional[List[str]] = None) -> None:
+    """A QA/fit-check verdict (the verification_result twin)."""
+    emit({"type": "verification_result", "task_id": task_id, "ok": bool(ok),
+          "summary": str(summary)[:600],
+          "gaps": [str(g)[:300] for g in (gaps or [])][:12]})
+
+
+def emit_completion_decision(task_id: Optional[str], action: str,
+                             reason: str = "") -> None:
+    """The task's completion decision (the completion_decision twin) —
+    'complete' on task_done, 'fail' on task_failed."""
+    emit({"type": "completion_decision", "task_id": task_id,
+          "action": str(action)[:40], "reason": str(reason)[:600]})
 
 
 # ---------------------------------------------------------------------------
@@ -1024,13 +1176,19 @@ def emit_activity(task_id: Optional[str], label: str, state: str,
 
 
 class _InflightRT:
-    __slots__ = ("future", "status", "headers", "body_parts")
+    __slots__ = ("future", "status", "headers", "body_parts", "stream_queue")
 
     def __init__(self) -> None:
         self.future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.status: int = 0
         self.headers: Dict[str, str] = {}
         self.body_parts: List[str] = []
+        # STREAMING MODE (the /llm proxy): when set, every protocol frame
+        # for this request is ALSO pushed here as a typed tuple —
+        # ("res", status, headers) | ("chunk", text) | ("done", None) |
+        # ("error", message) — so the proxy can stream SSE chunks to its
+        # HTTP client the moment they arrive instead of buffering.
+        self.stream_queue: Optional[asyncio.Queue] = None
 
 
 class ReverseTunnelMultiplexer:
@@ -1055,27 +1213,42 @@ class ReverseTunnelMultiplexer:
         if e is not None:
             e.status = int(status) if status else 502
             e.headers = headers or {}
+            if e.stream_queue is not None:
+                # (kind, payload) 2-tuple — payload packs (status, headers).
+                e.stream_queue.put_nowait(("res", (e.status, e.headers)))
 
     def on_chunk(self, req_id: str, body: str) -> None:
         e = self._inflight.get(req_id)
         if e is not None:
             e.body_parts.append(body or "")
+            if e.stream_queue is not None:
+                e.stream_queue.put_nowait(("chunk", body or ""))
 
     def on_done(self, req_id: str) -> None:
         e = self._inflight.pop(req_id, None)
-        if e is not None and not e.future.done():
-            e.future.set_result(None)
+        if e is not None:
+            if e.stream_queue is not None:
+                e.stream_queue.put_nowait(("done", None))
+            if not e.future.done():
+                e.future.set_result(None)
 
     def on_error(self, req_id: str, message: str) -> None:
         e = self._inflight.pop(req_id, None)
-        if e is not None and not e.future.done():
-            e.future.set_exception(RuntimeError(f"reverse-tunnel: {message}"))
+        if e is not None:
+            if e.stream_queue is not None:
+                e.stream_queue.put_nowait(("error", str(message)[:400]))
+            if not e.future.done():
+                e.future.set_exception(RuntimeError(f"reverse-tunnel: {message}"))
 
     def cancel(self, req_id: str) -> None:
-        self._inflight.pop(req_id, None)
+        e = self._inflight.pop(req_id, None)
+        if e is not None and e.stream_queue is not None:
+            e.stream_queue.put_nowait(("done", None))
 
     def fail_all(self, reason: str) -> None:
         for e in self._inflight.values():
+            if e.stream_queue is not None:
+                e.stream_queue.put_nowait(("error", str(reason)[:400]))
             if not e.future.done():
                 e.future.set_exception(ConnectionError(reason))
         self._inflight.clear()
@@ -1200,6 +1373,40 @@ def wake_backend(reason: str, timeout_s: float = 90.0) -> bool:
     return False
 
 
+def _engine_busy() -> bool:
+    """True while the in-VM Forgvi 2.0 engine reports an active run —
+    the heartbeat file exists and was touched within the last 30s (the
+    engine stamps it every 10s and removes it when idle)."""
+    try:
+        st = os.stat(ENGINE_BUSY_FILE)
+        return (time.time() - st.st_mtime) < 30
+    except OSError:
+        return False
+
+
+def _engine_alive() -> bool:
+    """Best-effort localhost probe of the engine's /health (never raises,
+    cached for ~10s to keep /status cheap)."""
+    global _ENGINE_ALIVE_CACHE, _ENGINE_ALIVE_TS
+    now = time.time()
+    if now - _ENGINE_ALIVE_TS < 10:
+        return _ENGINE_ALIVE_CACHE
+    _ENGINE_ALIVE_TS = now
+    _ENGINE_ALIVE_CACHE = False
+    try:
+        req = urllib_request.Request(
+            f"http://127.0.0.1:{ENGINE_PORT}/health", method="GET")
+        with urllib_request.urlopen(req, timeout=3) as resp:
+            _ENGINE_ALIVE_CACHE = resp.status == 200
+    except Exception:  # noqa: BLE001 — probe is best-effort
+        pass
+    return _ENGINE_ALIVE_CACHE
+
+
+_ENGINE_ALIVE_CACHE = False
+_ENGINE_ALIVE_TS = 0.0
+
+
 def _backend_keepalive_loop() -> None:
     """While a task is active (state != idle), ping the backend's wake
     endpoint every ~4 min. Two effects in one idempotent call:
@@ -1216,7 +1423,8 @@ def _backend_keepalive_loop() -> None:
             if not (BACKEND_URL or WAKE_EDGE_URL) or not SANDBOX_ID:
                 continue
             st = get_status("active") or {}
-            if str(st.get("state") or "idle") == "idle":
+            if (str(st.get("state") or "idle") == "idle"
+                    and not _engine_busy()):
                 continue
             if time.time() - last_ping < 240:
                 continue
@@ -2190,10 +2398,14 @@ class AgentContext:
         self.contract_reads = 0
         self.started = time.time()
 
-    def activity(self, label: str, state: str, detail: str = "") -> None:
-        emit_activity(self.task_id, label, state, detail)
+    def activity(self, label: str, state: str, detail: str = "",
+                 kind: Optional[str] = None,
+                 activity_id: Optional[int] = None) -> Optional[int]:
+        row_id = emit_activity(self.task_id, label, state, detail,
+                               kind=kind, activity_id=activity_id)
         append_log(self.task_id, self.agent_name, "info",
                    f"{label} — {detail}" if detail else label)
+        return row_id
 
     def say(self, message: str, kind: str = "note") -> None:
         """The agent's own stream line — appended to chat so the UI shows
@@ -2262,6 +2474,7 @@ def run_agent_loop(
                     done_extras[_k] = data[_k]
             break
         fn = toolset.get(tool)
+        aid: Optional[int] = None
         if fn is None:
             result = {"ok": False,
                       "error": f"unknown tool '{tool}' — you have: {tool_names}"}
@@ -2287,16 +2500,19 @@ def run_agent_loop(
             # Redact giant echo-backs from the journaled args
             display_args = {k: (v if not (isinstance(v, str) and len(v) > 90)
                                 else v[:90] + "…") for k, v in args.items()}
-            ctx.activity(_tool_label(tool), "active",
-                         " ".join(f"{k}={v}" for k, v in display_args.items())[:160])
+            aid = ctx.activity(_tool_label(tool), "active",
+                         " ".join(f"{k}={v}" for k, v in display_args.items())[:160],
+                         kind=tool)
             try:
                 result = fn(args)
             except Exception as exc:  # noqa: BLE001 — tools must never kill the loop
                 result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         result_str = json.dumps(result, ensure_ascii=False)[:3500]
-        ctx.activity(_tool_label(tool), "done",
-                     ("ok" if result.get("ok", True) else
-                      f"error: {str(result.get('error', ''))[:140]}"))
+        final_ok = result.get("ok", True) if isinstance(result, dict) else True
+        ctx.activity(_tool_label(tool), "done" if final_ok else "error",
+                     ("ok" if final_ok else
+                      f"error: {str(result.get('error', ''))[:140]}"),
+                     kind=tool, activity_id=aid)
         messages.append({"role": "assistant", "content": reply})
         messages.append({"role": "user", "content": f"TOOL RESULT ({tool}): {result_str}"})
     else:
@@ -2927,6 +3143,7 @@ SKILLS (MCP): "Playwright" is MANDATORY before your first browser audit each run
 
 def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]:
     ctx = AgentContext(task_id, "backend")
+    emit_role_spawned(task_id, "backend", str(task)[:120])
     ctx.activity("Setting up the backend service", "active", task[:120])
     plan_excerpt = plan_text[:2600]
     system = BACKEND_SYSTEM.replace("{plan}", "")
@@ -2965,6 +3182,9 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
 
     ctx.activity("Backend service ready", "done",
                  str(result.get("report", ""))[:200])
+    emit_role_finished(task_id, "backend",
+                       str(result.get("status", "")) != "degraded",
+                       str(result.get("report", ""))[:400])
     ctx.say(f"Backend update: {str(result.get('report',''))[:400]}")
     return result
 
@@ -2972,6 +3192,10 @@ def run_backend_agent(task_id: str, task: str, plan_text: str) -> Dict[str, Any]
 def run_frontend_agent(task_id: str, task: str, plan_text: str,
                        fit_check: bool = False) -> Dict[str, Any]:
     ctx = AgentContext(task_id, "frontend")
+    emit_role_spawned(task_id, "frontend" if not fit_check else "verifier",
+                      ("building the interface — " + str(task)[:100])
+                      if not fit_check else
+                      "end-to-end fit check — proving frontend + backend fit")
     if fit_check:
         ctx.activity("Checking the app in the browser", "active",
                      "proving the frontend and backend fit together")
@@ -3023,6 +3247,9 @@ def run_frontend_agent(task_id: str, task: str, plan_text: str,
 
     ctx.activity("Interface ready", "done",
                  str(result.get("report", ""))[:200])
+    emit_role_finished(task_id, "frontend" if not fit_check else "verifier",
+                       str(result.get("status", "")) != "degraded",
+                       str(result.get("report", ""))[:400])
     ctx.say(f"Interface update: {str(result.get('report',''))[:400]}")
     return result
 
@@ -3098,6 +3325,8 @@ def _deterministic_issues() -> List[Dict[str, str]]:
 
 def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
     ctx = AgentContext(task_id, "debugger")
+    emit_role_spawned(task_id, "debugger",
+                      "end-to-end verification against the approved plan")
     ctx.activity("Verifying the app in the browser", "active",
                  "checking the live app against every plan feature")
     # The plan rides IN the prompt — the agent no longer burns its step
@@ -4786,6 +5015,17 @@ def debugger_node(state: Dict[str, Any]) -> Dict[str, Any]:
     emit({"type": "status", "status": get_status("active")})
     debug = run_debugger_agent(task_id, str(state.get("plan", "")))
     reports["debugger"] = debug
+    # The QA verdict — the 1.0 twin of the 2.0 journal's verification_result
+    # (pass = every plan feature demonstrated; gaps named for the chief).
+    emit_role_finished(task_id, "debugger",
+                       str(debug.get("status", "fail")) == "pass",
+                       str(debug.get("report", ""))[:400])
+    emit_verification_result(
+        task_id, str(debug.get("status", "fail")) == "pass",
+        str(debug.get("report", ""))[:400],
+        [str((m or {}).get("feature") or (m or {}).get("criterion") or "")
+         for m in (debug.get("missing") or [])
+         if isinstance(m, dict)])
     sig = _gap_signature(debug)
     prev_sig = str(state.get("last_gap_sig") or "")
     stagnation = (int(state.get("stagnation") or 0) + 1
@@ -4994,6 +5234,7 @@ class TaskWorker(threading.Thread):
                     f"I hit an error while working on that: {str(error)[:400]}. "
                     "Your prompt is saved — tell me to retry and I'll pick it back up.",
                     {"task_id": task_id, "failed": True})
+        emit_completion_decision(task_id, "fail", str(error)[:400])
         emit({"type": "task_failed", "task_id": task_id, "error": str(error)[:500]})
         emit({"type": "chat", "message": recent_chat(1)[0]})
         set_status("active", {"state": "idle"})
@@ -5090,6 +5331,8 @@ class TaskWorker(threading.Thread):
                         conn.execute(
                             "UPDATE task_queue SET status='done', result_json=? WHERE id=?",
                             (json.dumps(result), task_id))
+                    emit_completion_decision(
+                        task_id, "complete", "question answered")
                     emit({"type": "task_done", "task_id": task_id, "result": result})
                     set_active("idle")
                     emit({"type": "status", "status": get_status("active")})
@@ -5239,6 +5482,10 @@ class TaskWorker(threading.Thread):
             append_chat("assistant", result["summary"],
                         {"task_id": task_id, "result": result})
             emit({"type": "chat", "message": recent_chat(1)[0]})
+            emit_completion_decision(
+                task_id, "complete",
+                (f"verdict: {swarm['verdict']} — "
+                 + (miss_line or "every plan feature demonstrated"))[:500])
             emit({"type": "task_done", "task_id": task_id, "result": result})
             set_active("idle")
             emit({"type": "status", "status": get_status("active")})
@@ -5274,7 +5521,7 @@ def recover_pending_tasks() -> int:
 from fastapi import (  # noqa: E402
     FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 
 STARTED_AT = time.time()
 
@@ -5322,6 +5569,9 @@ def _sync_payload() -> Dict[str, Any]:
         "activities": recent_activities(120),
         "pending_approval": _pending_approval_payload(),
         "pending_interactions": pending_interactions(),
+        # THE JOURNAL CURSOR: the client tracks this and reconnects with
+        # {"type":"hello","since":N} for a lossless delta replay.
+        "journal_seq": journal_seq(),
         "server": {
             "uptime_s": int(time.time() - STARTED_AT),
             "model": LLM_MODEL,
@@ -5445,6 +5695,13 @@ async def status_route(request: Request):
         "skills_usage": (getattr(_skills_server_mod, "usage_summary",
                                   lambda: {})()
                          if _skills_server_mod is not None else {}),
+        # IN-VM ENGINE HEARTBEAT (the PM2 "forgvi-engine" on :8799 touches
+        # ENGINE_BUSY_FILE every 10s while a Forgvi 2.0 run works). The
+        # backend's tunnel sweeper keeps the reverse tunnel alive while
+        # this is true — an idle 1.0 daemon + busy 2.0 engine must never
+        # get its LLM path parked mid-run.
+        "engine_busy": _engine_busy(),
+        "engine_alive": _engine_alive(),
     }
 
 
@@ -5600,6 +5857,249 @@ async def internal_connectors_route(request: Request):
     return {"ok": True, "granted": granted}
 
 
+# ---------------------------------------------------------------------------
+# THE FORGVI 2.0 ENGINE BRIDGE — the engine (PM2 "forgvi-engine", :8799)
+# lives in this same VM and reaches the world THROUGH this daemon:
+#   /llm/v1/chat/completions  — its OpenAI-format LLM path, proxied over
+#                               the reverse tunnel (NVIDIA key stays
+#                               server-side on the backend, never in the VM)
+#   /llm/v1/models            — liveness probe for the bridge
+#   /internal/mcp/github      — its GitHub tool (user PAT injected backend-side)
+#   /internal/mcp/supabase    — its Supabase MCP tool (vault OAuth token)
+#   /internal/mcp/connector   — its request_connector (the SAME consent
+#                               card + OAuth + vault flow 1.0 uses)
+# All guarded by the VM's own ORCH_TOKEN (the engine knows it as
+# ENGINE_LLM_TOKEN) — localhost-only reachability, shared per-VM secret.
+# ---------------------------------------------------------------------------
+
+
+def _engine_guard(request: Request) -> None:
+    """Bearer ORCH_TOKEN (or X-VM-Token) — the shared per-VM secret."""
+    if TOKEN:
+        header = request.headers.get("authorization", "")
+        vm_tok = request.headers.get("x-vm-token", "")
+        if not (secrets.compare_digest(header, f"Bearer {TOKEN}")
+                or secrets.compare_digest(vm_tok, TOKEN)):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+
+@app.get("/llm/v1/models")
+async def engine_llm_models_route(request: Request):
+    """Liveness probe for the engine's LLM path: 200 (with the model list)
+    only while the reverse tunnel is connected."""
+    _engine_guard(request)
+    if not rt_mux.connected:
+        return JSONResponse({"error": "reverse tunnel not connected"},
+                            status_code=503)
+    return {"object": "list",
+            "data": [{"id": LLM_MODEL, "object": "model",
+                      "owned_by": "forgvi-vm-bridge"}]}
+
+
+@app.post("/llm/v1/chat/completions")
+async def engine_llm_proxy_route(request: Request):
+    """The Forgvi 2.0 engine's LLM path — an OpenAI-format streaming proxy
+    over the reverse tunnel. The engine's kernel dials localhost with
+    Bearer ENGINE_LLM_TOKEN (the VM's ORCH_TOKEN); frames bridge through
+    rt_mux (path /v1/chat/completions — the backend injects the real
+    NVIDIA key server-side and streams SSE chunks back). Shared-account
+    pacing + the wake-on-tunnel-drop ladder protect the same NVIDIA quota
+    1.0's own calls share."""
+    _engine_guard(request)
+    raw = await request.body()
+    try:
+        json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    # Shared NVIDIA-account pacing (thread-safe blocking call → off-loop).
+    try:
+        await asyncio.to_thread(pace_for_tpm)
+    except Exception:  # noqa: BLE001 — pacing is best-effort
+        pass
+
+    body_text = raw.decode("utf-8", "replace")
+    backoffs = (8, 20, 45)
+    last_error: Optional[str] = None
+    for attempt in range(4):
+        if not rt_mux.connected:
+            try:
+                await asyncio.to_thread(wake_backend, "engine llm proxy")
+            except Exception:  # noqa: BLE001 — wake is best-effort
+                pass
+        req_id = uuid.uuid4().hex
+        entry = rt_mux.register(req_id)
+        entry.stream_queue = asyncio.Queue()
+        frame = {"t": "req", "id": req_id, "method": "POST",
+                 "path": "/v1/chat/completions",
+                 "headers": {"Content-Type": "application/json"},
+                 "body": body_text}
+        try:
+            await rt_mux.send_req(frame)
+        except Exception as exc:  # noqa: BLE001 — transport; retry ladder
+            rt_mux.cancel(req_id)
+            last_error = f"{type(exc).__name__}: {exc}"
+            try:
+                await asyncio.to_thread(wake_backend, "engine llm send fail")
+            except Exception:  # noqa: BLE001
+                pass
+            if attempt < 3:
+                await asyncio.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+                continue
+            return JSONResponse({"error": f"reverse tunnel unavailable: "
+                                          f"{last_error[:300]}"},
+                                status_code=502)
+        # Wait for the upstream status BEFORE committing to a 200 stream —
+        # errors (429/503/…) must surface as proper HTTP statuses.
+        try:
+            kind, payload = await asyncio.wait_for(
+                entry.stream_queue.get(), timeout=LLM_TIMEOUT_S + 60)
+        except asyncio.TimeoutError:
+            rt_mux.cancel(req_id)
+            return JSONResponse({"error": "upstream timeout"},
+                                status_code=504)
+        if kind == "error":
+            rt_mux.cancel(req_id)
+            last_error = str(payload)
+            if attempt < 3:
+                try:
+                    await asyncio.to_thread(wake_backend, "engine llm error")
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+                continue
+            return JSONResponse(
+                {"error": f"reverse tunnel: {last_error[:300]}"},
+                status_code=502)
+        # kind == "res" — the upstream status frame.
+        status = int(payload[0]) if isinstance(payload, tuple) else 502
+        headers = dict(payload[1]) if isinstance(payload, tuple) and len(payload) > 1 else {}
+        if status >= 400:
+            # Drain the remaining chunks to build the full error body.
+            err_parts: List[str] = []
+            while True:
+                try:
+                    k2, p2 = await asyncio.wait_for(
+                        entry.stream_queue.get(), timeout=30)
+                except asyncio.TimeoutError:
+                    break
+                if k2 in ("chunk",):
+                    err_parts.append(str(p2))
+                elif k2 in ("done", "error"):
+                    break
+            err_body = "".join(err_parts)
+            try:
+                err_json = json.loads(err_body) if err_body else {}
+            except json.JSONDecodeError:
+                err_json = {"error": err_body[:600]}
+            return JSONResponse(err_json, status_code=status)
+
+        # 200 — stream the SSE chunks through as they arrive.
+        media_type = str(headers.get("content-type") or "text/event-stream")
+
+        async def stream_gen():
+            try:
+                while True:
+                    try:
+                        k3, p3 = await asyncio.wait_for(
+                            entry.stream_queue.get(), timeout=LLM_TIMEOUT_S + 30)
+                    except asyncio.TimeoutError:
+                        break
+                    if k3 == "chunk":
+                        yield str(p3)
+                    elif k3 in ("done",):
+                        break
+                    elif k3 == "error":
+                        # Mid-stream drop — end the stream; the client's own
+                        # retry/next-request path handles it honestly.
+                        break
+            finally:
+                rt_mux.cancel(req_id)
+
+        return StreamingResponse(stream_gen(), media_type=media_type)
+
+    return JSONResponse({"error": f"reverse tunnel unavailable after retries: "
+                                  f"{(last_error or '')[:300]}"},
+                        status_code=502)
+
+
+@app.post("/internal/mcp/github")
+async def engine_mcp_github_route(request: Request):
+    """The 2.0 engine's GitHub tool: one REST/sync call bridged through
+    the reverse tunnel to the backend's PAT-injecting executor (the exact
+    transport 1.0's github tool uses). Returns {status, body} so the
+    engine surfaces upstream errors honestly."""
+    _engine_guard(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "object body required"}, status_code=400)
+    try:
+        status, resp = await asyncio.to_thread(
+            _tunnel_request, "/tunnel/github", dict(body))
+        return {"status": int(status), "body": str(resp)[:20000]}
+    except Exception as exc:  # noqa: BLE001 — transport failure, honest result
+        return {"status": 502,
+                "body": f"tunnel transport failed: {type(exc).__name__}: "
+                        f"{str(exc)[:300]}"}
+
+
+@app.post("/internal/mcp/supabase")
+async def engine_mcp_supabase_route(request: Request):
+    """The 2.0 engine's Supabase MCP tool: one official MCP tool call
+    bridged through the reverse tunnel with the user's vault token (same
+    transport + capability gating as 1.0's supabase_mcp)."""
+    _engine_guard(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "object body required"}, status_code=400)
+    tool = str(body.get("tool") or "").strip()
+    if not tool:
+        return JSONResponse({"error": "tool required"}, status_code=400)
+    res = await asyncio.to_thread(_supabase_mcp_call, tool, body.get("args"))
+    return res
+
+
+@app.post("/internal/mcp/connector")
+async def engine_mcp_connector_route(request: Request):
+    """The 2.0 engine's request_connector: ask the user to connect an
+    account. Blocks through the SAME connector_request_wait machinery 1.0
+    uses — the studio's consent card, the OAuth callback, the vault flow,
+    and the /internal/connectors wake all resolve THIS call. No token
+    material ever enters the VM — the engine gets a receipt."""
+    _engine_guard(request)
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    connector = str(body.get("connector") or "").strip().lower()
+    if connector not in ("supabase", "github"):
+        return JSONResponse(
+            {"error": "connector must be supabase|github"}, status_code=400)
+    capability = str(body.get("capability") or "").strip()
+    if not capability:
+        capability = ("supabase.database.write" if connector == "supabase"
+                      else "github.repos.write")
+    reason = str(body.get("reason") or
+                 f"the Forgvi 2.0 run needs your {connector} account").strip()
+    rid = "c-" + uuid.uuid4().hex[:8]
+    res = await asyncio.to_thread(
+        connector_request_wait, rid, None,
+        {"role": "forgvi-2.0", "connector": connector,
+         "capability": capability, "reason": reason[:300]})
+    if res is None:
+        return {"granted": False, "declined": False, "timeout": True,
+                "capability": capability}
+    granted = bool(res.get("granted"))
+    return {"granted": granted, "declined": not granted,
+            "capability": str(res.get("capability") or capability),
+            "detail": str(res.get("detail") or "")[:300]}
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     """The dumb-terminal channel + the approval interaction surface."""
@@ -5619,7 +6119,27 @@ async def ws_endpoint(ws: WebSocket):
             if mtype == "ping":
                 await ws.send_text(json.dumps({"type": "pong", "ts": time.time()}))
             elif mtype == "hello":
-                await ws.send_text(json.dumps(_sync_payload()))
+                # THE JOURNAL REPLAY: a reconnecting client that knows its
+                # cursor (since) gets exactly the events it missed — the
+                # lossless 2.0-style re-attach. A reset server (cursor
+                # ahead of ours) or an oversized gap falls back to the full
+                # snapshot honestly.
+                since = msg.get("since")
+                replayed = False
+                if isinstance(since, (int, float)) and int(since) > 0:
+                    cur = journal_seq()
+                    events = recent_journal(int(since))
+                    if 0 < cur <= int(since):
+                        pass  # server restarted — journal reset; full sync
+                    elif events and len(events) >= 400:
+                        pass  # gap too large — full sync
+                    else:
+                        await ws.send_text(json.dumps({
+                            "type": "journal_replay", "since": int(since),
+                            "journal_seq": cur, "events": events}))
+                        replayed = True
+                if not replayed:
+                    await ws.send_text(json.dumps(_sync_payload()))
             elif mtype == "prompt":
                 text = str(msg.get("text") or "").strip()
                 if not text:

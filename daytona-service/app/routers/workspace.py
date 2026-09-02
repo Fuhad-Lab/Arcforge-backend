@@ -162,6 +162,8 @@ async def get_agent_info(sandbox_id: str) -> AgentSidecarInfo:
         alive=info.get("alive", False),
         app_url=info.get("app_url"),
         app_port=info.get("app_port"),
+        engine_url=info.get("engine_url"),
+        engine_alive=info.get("engine_alive", False),
     )
 
 

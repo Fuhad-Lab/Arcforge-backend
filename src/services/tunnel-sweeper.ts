@@ -29,12 +29,14 @@
  *      a user interacted with this project just now (open studio, fresh
  *      build, editor write).
  *   3. GRACE PROBE — projects.updated_at within GRACE_WINDOW (2h): probe
- *      the VM daemon's /status once per sweep. A non-idle daemon means
- *      the swarm is still working (VM-driven builds and approval waits
+ *      the VM daemon's /status once per sweep. A non-idle daemon OR an
+ *      in-flight Forgvi 2.0 engine run (engine_busy heartbeat) means
+ *      work is still happening (VM-driven builds and approval waits
  *      never bump projects.updated_at) → keep the tunnel. An idle daemon
- *      → disconnect AND PARK (never probe again while the project stays
- *      stale) so the sandbox's lastActivityAt finally ages and the
- *      daytona-service quota reaper can delete it ~30 min later.
+ *      with no engine run → disconnect AND PARK (never probe again while
+ *      the project stays stale) so the sandbox's lastActivityAt finally
+ *      ages and the daytona-service quota reaper can delete it ~30 min
+ *      later.
  *   4. STALE — older than GRACE_WINDOW: disconnect. The reaper will
  *      reclaim the quota.
  *
@@ -84,7 +86,10 @@ interface ProjectRow {
   updated_at: string;
 }
 
-/** Fetch the daemon's orchestrator state ("idle" when nothing runs).
+/** The daemon's orchestrator state + engine heartbeat, from one /status
+ * fetch. "idle" state means nothing runs in the swarm; engine_busy=true
+ * means a Forgvi 2.0 run is in flight (the engine's heartbeat file is
+ * fresh — the orchestrator reports it on /status).
  *
  * AUTH: the orchestrator's `_authorized` accepts ONLY
  * `Authorization: Bearer <token>` — the original probe sent
@@ -92,10 +97,17 @@ interface ProjectRow {
  * + disconnected the tunnel of BUSY sandboxes mid-build (live: the
  * HabitFlow build lost its LLM bridge during fix round 2 and the last
  * debugger round died "backend hasn't dialed in"). */
+interface DaemonProbe {
+  /** "idle" / task-state string, or null when unreachable/bad shape. */
+  state: string | null;
+  /** True while a Forgvi 2.0 engine run is in flight (heartbeat fresh). */
+  engineBusy: boolean;
+}
+
 async function probeDaemonState(
   url: string,
   token: string,
-): Promise<string | null> {
+): Promise<DaemonProbe> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DAEMON_PROBE_TIMEOUT_MS);
   try {
@@ -103,18 +115,23 @@ async function probeDaemonState(
       headers: { "Authorization": `Bearer ${token}` },
       signal: controller.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { state: null, engineBusy: false };
     // /status returns { active: { state } } — a top-level "state" never
     // existed (live bug: every healthy daemon read as unreachable → parked
-    // + tunnel cut after 3 sweeps, even mid-build).
+    // + tunnel cut after 3 sweeps, even mid-build). engine_busy is the
+    // Forgvi 2.0 heartbeat (absent on older daemons ⇒ false).
     const body = (await res.json()) as {
       state?: string;
       active?: { state?: string };
+      engine_busy?: boolean;
     };
     const state = body.active?.state ?? body.state;
-    return typeof state === "string" ? state : null;
+    return {
+      state: typeof state === "string" ? state : null,
+      engineBusy: body.engine_busy === true,
+    };
   } catch {
-    return null;
+    return { state: null, engineBusy: false };
   } finally {
     clearTimeout(timer);
   }
@@ -205,8 +222,8 @@ export async function sweepTunnels(): Promise<void> {
         if (disconnectReverseTunnelIfPresent(sandboxId)) disconnected += 1;
         continue;
       }
-      const state = await probeDaemonState(info.url, info.token);
-      if (state === null) {
+      const probe = await probeDaemonState(info.url, info.token);
+      if (probe.state === null) {
         // Probe FAILED (unreachable/transient) — count it; only park after
         // PROBE_FAIL_PARK_THRESHOLD consecutive failures so a blip can't
         // kill a mid-build tunnel. No tunnel action this sweep.
@@ -223,9 +240,11 @@ export async function sweepTunnels(): Promise<void> {
         continue;
       }
       probeFails.delete(sandboxId);
-      if (state !== "idle") {
-        // The swarm is working (VM-driven build, approval wait, debugger) —
-        // its LLM calls need the tunnel even though the project row is stale.
+      if (probe.state !== "idle" || probe.engineBusy) {
+        // The swarm is working (VM-driven build, approval wait, debugger)
+        // OR a Forgvi 2.0 engine run is in flight (engine_busy heartbeat) —
+        // its LLM calls need the tunnel even though the project row is
+        // stale.
         await ensureReverseTunnel(sandboxId, info.url);
         kept += 1;
       } else {

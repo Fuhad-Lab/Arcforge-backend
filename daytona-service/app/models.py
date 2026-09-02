@@ -379,6 +379,24 @@ class AgentSidecarInfo(BaseModel):
         default=None,
         description="The port app_url points at (3000 or 5173), else None",
     )
+    engine_url: str | None = Field(
+        default=None,
+        description=(
+            "SIGNED Daytona preview URL for the Forgvi 2.0 engine (port "
+            "8799). Set when the engine's /health answers 200 inside the "
+            "VM — even when its LLM bridge is down (see engine_alive)."
+        ),
+    )
+    engine_alive: bool = Field(
+        default=False,
+        description=(
+            "True ONLY when BOTH the engine /health is 200 AND its LLM "
+            "path is live (the orchestrator's /llm/v1/models answers 200 "
+            "with the VM token — i.e. the reverse-tunnel bridge is "
+            "connected). False means the studio should fall back to the "
+            "Render-hosted engine."
+        ),
+    )
 
 
 WorkspaceInitResponse.model_rebuild()
