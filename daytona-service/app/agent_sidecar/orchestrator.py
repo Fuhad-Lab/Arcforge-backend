@@ -1837,13 +1837,16 @@ else:  # pragma: no cover
 def _yjs_note_file(rel: str, old_content: Optional[str],
                    new_content: str) -> None:
     """Mirror one agent file-write into the shared Yjs doc (no-op when the
-    bridge is unavailable)."""
+    bridge is unavailable). A failure here is LOUD (warning): a silent
+    mirror failure is how the 2026-09-02 flush-clobber incident started —
+    the doc went stale and the next client-triggered flush reverted the
+    agent's disk writes to the template."""
     if _yjs_mod is None:
         return
     try:
         _yjs_mod.note_file(rel, old_content, new_content)
     except Exception as exc:  # noqa: BLE001
-        log.debug("yjs note_file failed for %s: %s", rel, exc)
+        log.warning("yjs note_file failed for %s: %s", rel, exc)
 
 
 def _yjs_note_delete(rel: str) -> None:
@@ -3404,7 +3407,12 @@ def run_debugger_agent(task_id: str, plan_text: str) -> Dict[str, Any]:
 
 def ensure_servers_up(task_id: str) -> Dict[str, Any]:
     """Deterministically bring up the frontend + backend dev servers so the
-    Fit Check and the Debugger test a LIVE app. Logs everything honestly."""
+    Fit Check and the Debugger test a LIVE app. Logs everything honestly.
+
+    FAST PATH: when the frontend port already answers, the whole boot is
+    skipped — the QA gate calls this before EVERY audit (see
+    debugger_node) and must not pay a full npm-install + dev-server
+    restart on the happy path."""
     out: Dict[str, Any] = {"frontend": False, "backend": False, "app_port": None}
 
     def sh(cmd: str, cwd: str, timeout: int = 240) -> str:
@@ -3413,25 +3421,49 @@ def ensure_servers_up(task_id: str) -> Dict[str, Any]:
                    f"$ {cmd}\n{r['stdout'] or r['stderr']}"[:1200])
         return r["stdout"] + r["stderr"]
 
+    def port_answers(port: int) -> bool:
+        try:
+            code = shell_run(
+                f"curl -s -o /dev/null -w '%{{http_code}}' "
+                f"http://localhost:{port}/ --max-time 8",
+                WORKSPACE, 12)["stdout"]
+            return str(code).strip().startswith(("2", "3"))
+        except Exception:  # noqa: BLE001
+            return False
+
     fe = os.path.join(WORKSPACE, "frontend")
     if os.path.exists(os.path.join(fe, "package.json")):
-        sh("npm install --no-audit --no-fund --loglevel=error", fe, 600)
-        sh(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1", fe, 15)
-        sh("rm -rf .next node_modules/.cache", fe, 60)
-        # v7 (C2): source the secrets env (mode 600, outside the workspace)
-        # so the app process inherits process.env.<NAME>.
-        sh(f"{_SECRET_ENV_SOURCE} nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
-           f"> /tmp/frontend-dev.log 2>&1 < /dev/null &", fe, 20)
-        for _ in range(6):
-            sh("sleep 5", fe, 10)
-            code = sh(f"curl -s -o /dev/null -w '%{{http_code}}' "
-                      f"http://localhost:{NEXT_DEV_PORT}/ --max-time 20", fe, 30)
-            if code.strip().startswith(("2", "3")):
-                out["frontend"] = True
-                out["app_port"] = NEXT_DEV_PORT
-                break
+        if port_answers(NEXT_DEV_PORT):
+            # Already live (the frontend agent booted it, or a previous
+            # round's boot survived) — nothing to do.
+            out["frontend"] = True
+            out["app_port"] = NEXT_DEV_PORT
+            append_log(task_id, "orchestrator", "info",
+                       f"servers: frontend already live on :{NEXT_DEV_PORT} "
+                       "(fast path)")
+        else:
+            sh("npm install --no-audit --no-fund --loglevel=error", fe, 600)
+            sh(f"fuser -k {NEXT_DEV_PORT}/tcp 2>/dev/null; sleep 1", fe, 15)
+            sh("rm -rf .next node_modules/.cache", fe, 60)
+            # v7 (C2): source the secrets env (mode 600, outside the workspace)
+            # so the app process inherits process.env.<NAME>.
+            sh(f"{_SECRET_ENV_SOURCE} nohup npx next dev -p {NEXT_DEV_PORT} -H 0.0.0.0 "
+               f"> /tmp/frontend-dev.log 2>&1 < /dev/null &", fe, 20)
+            for _ in range(6):
+                sh("sleep 5", fe, 10)
+                code = sh(f"curl -s -o /dev/null -w '%{{http_code}}' "
+                          f"http://localhost:{NEXT_DEV_PORT}/ --max-time 20", fe, 30)
+                if code.strip().startswith(("2", "3")):
+                    out["frontend"] = True
+                    out["app_port"] = NEXT_DEV_PORT
+                    break
     be = os.path.join(WORKSPACE, "backend")
-    if os.path.isdir(be):
+    if os.path.isdir(be) and port_answers(8000):
+        # Fast path: a live backend is already serving :8000.
+        out["backend"] = True
+        append_log(task_id, "orchestrator", "info",
+                   "servers: backend already live on :8000 (fast path)")
+    elif os.path.isdir(be):
         if os.path.exists(os.path.join(be, "requirements.txt")):
             sh("pip install -q -r requirements.txt 2>&1 | tail -n 2", be, 420)
         # Kill ANY stale backend process first — a leftover server from an
@@ -5013,6 +5045,18 @@ def debugger_node(state: Dict[str, Any]) -> Dict[str, Any]:
                           "detail": "end-to-end verification",
                           "task_id": task_id})
     emit({"type": "status", "status": get_status("active")})
+    # DETERMINISTIC BOOT BEFORE EVERY AUDIT (incident 2026-09-02, "the QA
+    # gate that graded a corpse"): guardrail R4 skips fit_check (and its
+    # ensure_servers_up) for no-backend plans — the most common case — so
+    # the debugger audited an app that was never booted: ERR_CONNECTION_
+    # REFUSED, then a question loop asking the USER to start the dev
+    # server (a ghost-question stall: the ask_user card never even
+    # rendered on reconnect). The QA gate now brings the servers up itself
+    # — idempotent (fast-path when the port already answers) and honest
+    # (boot failures are logged and audited, not asked about).
+    boot = ensure_servers_up(task_id)
+    append_log(task_id, "orchestrator", "info",
+               f"QA gate boot: {json.dumps(boot)}")
     debug = run_debugger_agent(task_id, str(state.get("plan", "")))
     reports["debugger"] = debug
     # The QA verdict — the 1.0 twin of the 2.0 journal's verification_result

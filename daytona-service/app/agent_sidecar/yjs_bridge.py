@@ -203,14 +203,42 @@ def _text_insert(ytext: Any, index: int, text: str) -> None:
 
 
 def _text_delete(ytext: Any, index: int, length: int) -> None:
+    """Delete `length` chars at `index` — ACROSS y-py API generations.
+
+    Live incident 2026-09-02 ("the writes that never happened"): the
+    shipped candidates only covered delete(txn, i, len) (0.6.0-style) and
+    delete(i, len) (0.7-style). The VMs install y-py 0.6.2, whose
+    YText.delete(txn, index) removes exactly ONE character and takes NO
+    length — both candidates raised TypeError, every note_file containing
+    a deletion failed, the doc stayed stale, and the debounced flush then
+    materialised the STALE doc over the agent's disk writes (three files
+    reverted to the template in one 21:23:37.277 batch write — verified
+    by mtime forensics). The single-char fallback below closes that gap:
+    when the length forms are unavailable we delete one character at a
+    time, BACKWARDS so the indices stay valid."""
     def txn_form(txn: Any) -> None:
-        _try_candidates((
-            (lambda: ytext.delete(txn, index, length)) if txn is not None
-            else (lambda: ytext.delete(index, length)),
-            (lambda: ytext.delete(index, length)) if txn is not None
-            else (lambda: ytext.delete(txn, index, length)),
-        ))
+        if txn is not None:
+            cands = (
+                lambda: ytext.delete(txn, index, length),
+                lambda: ytext.delete(index, length),
+                lambda: _delete_single_chars(ytext, txn, index, length),
+            )
+        else:
+            cands = (
+                lambda: ytext.delete(index, length),
+                lambda: _delete_single_chars(ytext, None, index, length),
+            )
+        _try_candidates(cands)
     _with_txn(txn_form)
+
+
+def _delete_single_chars(ytext: Any, txn: Any, index: int, length: int) -> None:
+    """y-py 0.6.2 fallback: delete(txn, i) removes one character."""
+    for i in range(index + length - 1, index - 1, -1):
+        if txn is not None:
+            ytext.delete(txn, i)
+        else:
+            ytext.delete(i)
 
 
 def _map_set(ymap: Any, key: str, value: Any) -> None:
@@ -523,6 +551,33 @@ def health() -> Dict[str, Any]:
 _FLUSH_DELAY_S = 1.5
 _flush_lock = threading.Lock()
 
+# Files whose DOC content changed because of a CLIENT update (a user
+# edit in a connected editor). ONLY these are eligible for the disk
+# flush — agent writes are already on disk (write_workspace_file writes
+# directly) and must NEVER be "healed" backwards by a stale doc. Live
+# incident 2026-09-02: note_file failed (y-py delete signature), the doc
+# kept the template, a client update scheduled the flush, and the flush
+# REVERTED three agent-written files to the template in one batch write.
+# The doc-as-source-of-truth healing is now scoped to client edits —
+# exactly the case the flush exists for.
+_client_dirty: set = set()
+_dirty_lock = threading.Lock()
+
+
+def _mark_client_dirty(keys) -> None:
+    with _dirty_lock:
+        _client_dirty.update(keys)
+
+
+def _snapshot_hashes() -> Dict[str, int]:
+    """Worker-thread task: {rel: hash(content)} for the whole doc."""
+    out: Dict[str, int] = {}
+    for key in _map_keys():
+        ytext = _get_ytext(key)
+        if ytext is not None:
+            out[key] = hash(_text_str(ytext))
+    return out
+
 
 def _schedule_flush() -> None:
     global _flush_timer
@@ -547,9 +602,16 @@ def _safe_disk_path(rel: str) -> Optional[str]:
 
 
 def _flush_disk() -> None:
-    """Materialise the merged doc content onto the disk. The doc is the
-    source of truth: this heals every interleaving (user edit mid-agent-
-    write, agent write mid-user-edit) back to the CRDT-merged content."""
+    """Materialise CLIENT-EDITED doc content onto the disk.
+
+    Scope (incident 2026-09-02): only files whose doc content changed via
+    a client update are flushed — that is the flush's one job (user edits
+    → disk). Agent file writes go to disk directly and are mirrored into
+    the doc by note_file; if that mirror ever fails, the flush must NOT
+    "heal" the file back to the stale doc — that path is what reverted
+    live agent work. Non-dirty files are left untouched no matter how
+    far doc and disk have drifted (the next note_file or user edit
+    re-converges them)."""
     if not Y_AVAILABLE or _worker is None:
         return
 
@@ -566,8 +628,14 @@ def _flush_disk() -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("yjs flush snapshot failed: %s", exc)
         return
+    with _dirty_lock:
+        dirty = set(_client_dirty)
+        _client_dirty.clear()
     changed: List[Dict[str, str]] = []
-    for rel, doc_content in snap.items():
+    for rel in dirty:
+        doc_content = snap.get(rel)
+        if doc_content is None:
+            continue  # deleted from the doc — nothing to materialise
         dest = _safe_disk_path(rel)
         if dest is None or len(doc_content) > _MAX_FILE_BYTES:
             continue
@@ -694,6 +762,18 @@ async def yjs_endpoint(ws: WebSocket, room: str = "workspace") -> None:
             elif sub in (SYNC_STEP2, SYNC_UPDATE):
                 # client update → apply, propagate, and schedule the
                 # debounced disk flush (the USER edited something).
+                # CLIENT-DIRTY TRACKING (incident 2026-09-02): snapshot
+                # the doc before/after the update and mark the files the
+                # CLIENT actually changed — the flush materialises ONLY
+                # those (see _flush_disk). A client that merely replays
+                # its stale local state changes nothing and flushes
+                # nothing, so it can no longer clobber agent disk writes.
+                try:
+                    pre = await asyncio.to_thread(_worker.submit,
+                                                  _snapshot_hashes)
+                except Exception:  # noqa: BLE001
+                    pre = {}
+
                 def apply_task() -> None:
                     try:
                         _doc_apply(payload)
@@ -701,6 +781,14 @@ async def yjs_endpoint(ws: WebSocket, room: str = "workspace") -> None:
                         log.warning("yjs apply_update failed: %s", exc)
 
                 await asyncio.to_thread(_worker.submit, apply_task)
+                try:
+                    post = await asyncio.to_thread(_worker.submit,
+                                                   _snapshot_hashes)
+                except Exception:  # noqa: BLE001
+                    post = dict(pre)
+                touched = {k for k, v in post.items() if pre.get(k) != v}
+                if touched:
+                    _mark_client_dirty(touched)
                 await _relay(ws, data)
                 _schedule_flush()
     except Exception as exc:  # noqa: BLE001 — WebSocketDisconnect & friends

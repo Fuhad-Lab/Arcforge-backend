@@ -57,9 +57,16 @@ class Settings(BaseSettings):
     # Absolute lifetime cap for workspace sandboxes regardless of activity
     # (immune to lastActivityAt poisoning). 0 disables the cap.
     sandbox_max_lifetime_seconds: int = 43200  # 12 hours
+    # Absolute lifetime cap for type=probe sandboxes (disposable engine /
+    # health probes — incident 2026-09-02: one leaked "engine-probe"
+    # sandbox held 4 GiB for 21+ hours). Creation-time based, refresh-proof.
+    probe_max_lifetime_seconds: int = 3600  # 1 hour
     # How many oldest sandboxes the emergency force-free path may delete
-    # when a quota-blocked creation must not fail (never the requester's own).
+    # when a quota-blocked creation must not fail. The requester's own
+    # sandboxes created within force_free_protect_recent_seconds are
+    # shielded (in-flight builds); older ones are freed like any corpse.
     quota_force_free_max: int = 3
+    force_free_protect_recent_seconds: int = 1800  # 30 minutes
 
     # --- Module 3 Browser Engine (Playwright-in-VM) ---
     browser_install_timeout_s: int = 300   # max time to install Chromium (~150MB download + deps)

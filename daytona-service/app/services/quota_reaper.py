@@ -103,13 +103,23 @@ async def reap_idle_workspaces(
         absolute cap immune to lastActivityAt poisoning — see the
         incident note below).
 
-    Never touches sandboxes without the workspace label, and never
-    touches recently-active workspaces. Returns the ids deleted.
+    Also reaps type=probe sandboxes (disposable engine/health probes —
+    incident 2026-09-02: a "engine-probe" sandbox created by an engine
+    integration test lived for 21+ HOURS at 4 GiB because the reaper
+    only ever looked at type=workspace; with only 2 sandbox slots on
+    the free tier, one leaked probe is half the org's capacity). Probes
+    get a short absolute lifetime cap (probe_max_lifetime_seconds,
+    default 1 h) — creation time cannot be refreshed by anyone.
+
+    Never touches sandboxes with other/missing type labels (foreign
+    sandboxes), and never touches recently-active workspaces. Returns
+    the ids deleted.
     """
     min_age = min_age_seconds if min_age_seconds is not None else int(
         settings.sandbox_idle_timeout_seconds
     )
     max_lifetime = int(settings.sandbox_max_lifetime_seconds)
+    probe_max_lifetime = max(60, int(getattr(settings, "probe_max_lifetime_seconds", 3600)))
     daytona = get_daytona()
 
     def _list_all() -> list[Any]:
@@ -126,14 +136,26 @@ async def reap_idle_workspaces(
 
     for sbx in sandboxes:
         labels = getattr(sbx, "labels", None) or {}
-        if labels.get("type") != "workspace":
+        sandbox_type = labels.get("type")
+        if sandbox_type not in ("workspace", "probe"):
             continue  # Not ours — never touch foreign sandboxes.
 
         sbx_id = getattr(sbx, "id", "?")
         state = str(getattr(sbx, "state", "") or "").lower()
         name = getattr(sbx, "name", "?")
 
-        if "error" in state:
+        if sandbox_type == "probe":
+            # Disposable by design: a probe exists to answer one health
+            # question. Lifetime-capped on CREATION time (refresh-proof);
+            # error-state probes are corpses. Never idle-gated — a probe
+            # whose activity stays fresh is still dead weight.
+            if "error" in state:
+                reason = "error-state probe corpse"
+            elif _is_older_than(sbx, now, probe_max_lifetime):
+                reason = f"probe older than {probe_max_lifetime}s (lifetime cap)"
+            else:
+                continue
+        elif "error" in state:
             reason = "error-state corpse"
         elif _is_idle(sbx, now, min_age):
             reason = f"idle > {min_age}s"
@@ -199,12 +221,31 @@ def _is_older_than(sandbox: Any, now: datetime, max_age_s: int) -> bool:
     return age >= max_age_s
 
 
-async def force_free_quota(exclude_user_id: str | None = None) -> list[str]:
+async def force_free_quota(
+    exclude_user_id: str | None = None,
+    protect_recent_seconds: int | None = None,
+) -> list[str]:
     """EMERGENCY quota release for quota-blocked sandbox creation.
 
-    Deletes the OLDEST workspace sandboxes (by created_at) — never any
-    labeled with exclude_user_id (the requesting user's own sandboxes,
-    which may be mid-build) — up to settings.quota_force_free_max.
+    Deletes the OLDEST workspace sandboxes (by created_at) — including
+    the requesting user's OWN old ones — up to
+    settings.quota_force_free_max.
+
+    Incident 2026-09-02 ("my new build always fails"): the org has only
+    2 concurrent sandbox slots (10 GiB / 4 GiB each) and ONE real user,
+    so virtually every sandbox in the org carries that user's user_id.
+    The old blanket rule ("never free the requester's sandboxes") meant
+    force_free could NEVER free anything — every new build failed while
+    the user's own day-old sandboxes held the quota hostage.
+
+    What is actually worth protecting is an IN-FLIGHT build: a sandbox
+    the user started minutes ago that may be mid-build. Those are young.
+    So exclude_user_id now only shields the user's sandboxes CREATED
+    within protect_recent_seconds (default 30 min). Everything older —
+    same user or not — is a corpse by comparison and is freed
+    oldest-first. The requesting project's own sandbox cannot be
+    collateral: its creation is the call that just failed, so it does
+    not exist yet.
 
     Only invoked after reap_idle_workspaces() failed to free enough
     quota for a retry to succeed: the alternative is failing the user's
@@ -215,6 +256,10 @@ async def force_free_quota(exclude_user_id: str | None = None) -> list[str]:
     max_deletes = max(0, int(settings.quota_force_free_max))
     if max_deletes == 0:
         return []
+    if protect_recent_seconds is None:
+        protect_recent_seconds = max(
+            0, int(getattr(settings, "force_free_protect_recent_seconds", 1800))
+        )
 
     daytona = get_daytona()
 
@@ -228,16 +273,32 @@ async def force_free_quota(exclude_user_id: str | None = None) -> list[str]:
         return []
 
     candidates: list[tuple[datetime, Any, str]] = []
+    now = datetime.now(timezone.utc)
     for sbx in sandboxes:
         labels = getattr(sbx, "labels", None) or {}
-        if labels.get("type") != "workspace":
-            continue
-        if exclude_user_id and labels.get("user_id") == exclude_user_id:
-            continue  # Never free the requester's own sandboxes.
+        sandbox_type = labels.get("type")
+        if sandbox_type not in ("workspace", "probe"):
+            continue  # Foreign sandboxes are never force-freed.
+        if sandbox_type == "probe":
+            # Probes are disposable by design — never shielded, even the
+            # requester's own (a probe blocking a real build is a bug).
+            pass
         created = _parse_iso(getattr(sbx, "created_at", None))
         if created is None:
             continue
-        candidates.append((created.astimezone(timezone.utc), sbx, str(getattr(sbx, "id", "?"))))
+        created = created.astimezone(timezone.utc)
+        if (
+            exclude_user_id
+            and sandbox_type == "workspace"
+            and labels.get("user_id") == exclude_user_id
+        ):
+            # Shield the requester's IN-FLIGHT work only: young sandboxes
+            # may be mid-build. Old same-user sandboxes are corpses that
+            # are blocking the very build that triggered this call.
+            age_s = (now - created).total_seconds()
+            if age_s < protect_recent_seconds:
+                continue  # Possibly mid-build — protect.
+        candidates.append((created, sbx, str(getattr(sbx, "id", "?"))))
 
     # Oldest first.
     candidates.sort(key=lambda c: c[0])
