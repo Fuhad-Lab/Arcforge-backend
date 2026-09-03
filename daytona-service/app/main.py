@@ -26,6 +26,7 @@ from app.routers import (
     workspace,
 )
 from app.services.quota_reaper import reap_forever
+from app.services.keepalive import keepalive_forever
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -61,10 +62,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # exceeds sandbox_idle_timeout_seconds (30 min) so the reaper's own
     # list() calls cannot self-poison the idle clock (see quota_reaper).
     reaper_task = asyncio.create_task(reap_forever())
+    # Free-tier spin-down guard: self-ping the public URL so Render never
+    # idles the service out (incident 2026-09-03, see keepalive.py).
+    keepalive_task = asyncio.create_task(keepalive_forever())
     yield
     reaper_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await reaper_task
+    keepalive_task.cancel()
+    for task in (reaper_task, keepalive_task):
+        with suppress(asyncio.CancelledError):
+            await task
     logger.info("Shutting down %s", settings.service_name)
 
 

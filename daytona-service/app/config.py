@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     quota_force_free_max: int = 3
     force_free_protect_recent_seconds: int = 1800  # 30 minutes
 
+    # --- Render free-tier keep-alive (incident 2026-09-03: Uptime Robot
+    # "can't be reached" — free services spin down after 15 min idle and the
+    # cold start outlasts monitor timeouts). Self-pings the public URL.
+    keepalive_enabled: bool = True
+    keepalive_interval_seconds: int = 600  # 10 min < Render's 15 min idle cutoff
+    keepalive_path: str = "/health"  # static 200, zero side effects
+
     # --- Module 3 Browser Engine (Playwright-in-VM) ---
     browser_install_timeout_s: int = 300   # max time to install Chromium (~150MB download + deps)
     browser_audit_timeout_s: int = 120     # max time for one audit run (launch + goto + screenshot)
