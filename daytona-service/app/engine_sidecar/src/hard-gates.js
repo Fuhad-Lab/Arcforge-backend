@@ -117,32 +117,38 @@ const BUILD_PROOF = [
   /\bnpm\s+run\s+build\b/,
   /\bnpm\s+run\s+--workspace[^\s]*\s+build\b/,
   /\bnpm\s+--prefix[^\s]*\s+run\s+build\b/,
-  /\bnpm\s+run\s+build\b[^|&;]*/,
   /\bbun\s+run\s+build\b/,
   /\bpnpm\s+(?:run\s+)?build\b/,
   /\bnpm\s+run\s+typecheck\b/,
   /\bnpm\s+run\s+--workspace[^\s]*\s+typecheck\b/,
 ];
 
-/** Does the tool evidence contain a PASSING build/typecheck? */
+/**
+ * Does the tool evidence contain a PASSING build/typecheck?
+ *
+ * MATCHES THE COMMAND NAME ONLY — never the output. (Bug fixed 2026-09-04,
+ * live-observed on run c92327d2: a `cat package.json` command's OUTPUT
+ * contains the text "next build" from the scripts section, and the gate
+ * wrongly credited it as build proof. Only an EXECUTED build counts: the
+ * evidence name is the command line the chief actually ran.)
+ */
 function hasBuildProof(evidence) {
   for (const entry of evidence ?? []) {
     if (entry?.status !== "pass" && entry?.status !== true) continue;
     const name = String(entry?.name ?? "");
-    const output = String(entry?.output ?? "");
-    if (BUILD_PROOF.some((re) => re.test(name)) || BUILD_PROOF.some((re) => re.test(output))) {
-      return name || "build command";
+    if (BUILD_PROOF.some((re) => re.test(name))) {
+      return name;
     }
   }
   return null;
 }
 
-/** Does the evidence contain a bare `next dev <digits>` invocation? */
+/** Does the evidence contain a bare `next dev <digits>` invocation?
+ * (Also name-only — same rationale as hasBuildProof.) */
 function hasBarePortDevCommand(evidence) {
   for (const entry of evidence ?? []) {
     const name = String(entry?.name ?? "");
-    const output = String(entry?.output ?? "");
-    const match = name.match(/next\s+dev\s+(\d{2,5})(?!\S)/) ?? output.match(/next\s+dev\s+(\d{2,5})(?!\S)/);
+    const match = name.match(/next\s+dev\s+(\d{2,5})(?!\S)/);
     if (match) return match[0];
   }
   return null;

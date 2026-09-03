@@ -101,6 +101,18 @@ export function buildVubeScaffold({ appName = "vube-app" } = {}) {
           build: "npm run build --workspace apps/web-client",
           "dev:api": "npm run dev --workspace apps/api-server",
         },
+        // HOISTING FIX (2026-09-04, live-observed on run c92327d2): Next.js's
+        // webpack postcss-loader resolves plugins from the ROOT node_modules
+        // of a monorepo (where `next` itself is hoisted), not the workspace's.
+        // Without these root devDeps the production build dies with
+        // "Cannot find module 'autoprefixer'" even though the web-client
+        // declares them — the chief then burns its budget fighting npm.
+        devDependencies: {
+          postcss: "^8.4.0",
+          autoprefixer: "^10.4.0",
+          tailwindcss: "^3.4.0",
+          "tailwindcss-animate": "^1.0.7",
+        },
       },
       null,
       2,
@@ -158,7 +170,7 @@ export function buildVubeScaffold({ appName = "vube-app" } = {}) {
         dependencies: {
           "react": "^18.3.0",
           "react-dom": "^18.3.0",
-          "next": "^14.2.0",
+          "next": "^14.2.35",
           ...Object.fromEntries(
             Object.entries(STACK_DEPS).filter(([k]) => !["postcss", "autoprefixer"].includes(k)),
           ),
