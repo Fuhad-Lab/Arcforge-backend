@@ -24,6 +24,9 @@ import express from "express";
 import { unlinkSync, existsSync, writeFileSync } from "node:fs";
 import { kernelModelId, kernelReady, requiredKeyEnv, ENGINE_IN_VM } from "./kernel.js";
 import { RunManager } from "./goal-loop.js";
+import { listPersonas, loadPersonas, G } from "./personas.js";
+import { describeCatalog, registrySize } from "./registry.js";
+import "./nodes.js"; // registers the capability graph at boot
 
 const PORT = Number(process.env.PORT ?? 8080);
 const PERSIST_DIR = process.env.ENGINE_PERSIST_DIR ?? null;
@@ -151,7 +154,28 @@ app.get("/health", (_req, res) => {
     persisted: Boolean(PERSIST_DIR),
     activeRuns: manager.countActive(),
     totalRuns: manager.runs.size,
+    personas: G.prompts.size,
+    registryNodes: registrySize(),
   });
+});
+
+/** Persona roster (Vube pillar 4 — dynamic profiles from .prime/prompts/). */
+app.get("/personas", (_req, res) => {
+  res.json({
+    dir: G.promptsDir,
+    personas: listPersonas(),
+  });
+});
+
+/** Reload personas from disk (edit .prime/prompts/*.md → no redeploy). */
+app.post("/personas/reload", (_req, res) => {
+  const count = loadPersonas();
+  res.json({ ok: true, loaded: count, dir: G.promptsDir });
+});
+
+/** Capability registry catalog (Vube pillar 3 — discoverable nodes). */
+app.get("/nodes", (req, res) => {
+  res.type("text/plain").send(describeCatalog({ kind: req.query.kind }));
 });
 
 app.post("/runs", (req, res) => {
@@ -298,7 +322,59 @@ app.use((error, _req, res, _next) => {
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`[forgvi] engine listening on :${PORT} (mode=${ENGINE_IN_VM ? "in-vm" : "host"}${PERSIST_DIR ? ", journal persisted" : ""})`);
   console.log(`[forgvi] kernel: ${kernelReady() ? `ready (${kernelModelId()})` : `NOT READY — set ${requiredKeyEnv()}`}`);
+  console.log(`[forgvi] personas: ${G.prompts.size} loaded from ${G.promptsDir}`);
+  console.log(`[forgvi] registry: ${registrySize()} nodes`);
+  startKeepAlive();
 });
+
+/**
+ * Render free-tier spin-down guard (incident 2026-09-03, same as the
+ * daytona service): free web services sleep after 15 min without inbound
+ * traffic; the cold start can outlast external monitor timeouts (Uptime
+ * Robot's default 30s) which then report "can't be reached". Self-ping
+ * the PUBLIC health endpoint (Render injects RENDER_EXTERNAL_URL) every
+ * 10 minutes so the idle timer never expires. No-ops locally.
+ *
+ * 2026-09-04 — KEEP-ALIVE MESH (the "daytona service is still going down"
+ * incident): self-ping alone guards ONE service; if that service's own
+ * loop dies (restart, event-loop starvation, deploy race) nothing brings
+ * the idle timer back. The engine — the most reliable always-on Node
+ * service — now ALSO pings its two critical siblings on every cycle:
+ *   DAYTONA_KEEPALIVE_URL  (default arcforge-daytona /health) — the
+ *                          sandbox factory; a cold daytona = every new
+ *                          forge boot times out (the user-visible
+ *                          "daytona is down").
+ *   BACKEND_KEEPALIVE_URL  (default arcforge-backend /api/healthz) —
+ *                          auth + workspace grants.
+ * Inbound traffic through the public URL is inbound traffic regardless
+ * of who initiated it, so a sibling's ping is exactly as good as a
+ * self-ping — but now three independent loops cover each service.
+ */
+function startKeepAlive() {
+  const base = (process.env.RENDER_EXTERNAL_URL ?? "").replace(/\/+$/, "");
+  const enabled = (process.env.KEEPALIVE_ENABLED ?? "1") !== "0";
+  if (!enabled || !base) return;
+  const intervalMs = Number(process.env.KEEPALIVE_INTERVAL_SECONDS ?? 600) * 1000;
+  const siblings = [
+    process.env.DAYTONA_KEEPALIVE_URL ?? "https://arcforge-daytona.onrender.com/health",
+    process.env.BACKEND_KEEPALIVE_URL ?? "https://arcforge-backend.onrender.com/api/healthz",
+  ].filter(Boolean);
+  const ping = async (url) => {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+      console.log(`[forgvi] keep-alive ping ${new URL(url).pathname} -> ${res.status}`);
+    } catch (error) {
+      console.warn(`[forgvi] keep-alive ping failed (${url}): ${error?.message ?? error}`);
+    }
+  };
+  const cycle = () => {
+    void ping(`${base}/health`);
+    // Stagger sibling pings by 30s so a shared-rate-limited edge sees them separately.
+    siblings.forEach((url, i) => setTimeout(() => void ping(url), 30_000 * (i + 1)).unref?.());
+  };
+  setTimeout(cycle, 30_000).unref();
+  setInterval(cycle, intervalMs).unref();
+}
 
 const shutdown = () => {
   console.log("[forgvi] shutting down");

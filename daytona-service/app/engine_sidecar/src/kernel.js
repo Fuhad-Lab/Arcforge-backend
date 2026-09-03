@@ -66,6 +66,28 @@ import {
   createRequestConnectorTool,
   createSupabaseTool,
 } from "./connector-tools.js";
+import { buildChiefTools } from "./tools.js";
+
+/**
+ * The chief's tool allowlist — bash + edit (the core workspace tools) plus
+ * the Vube surface: ask_user, connector tools, orchestrate, scaffold_vube,
+ * list_nodes. Without an allowlist prime-agent would also activate its
+ * built-in ipython tool, which would run a LOCAL python kernel and silently
+ * diverge from the VM workspace (the in-VM branch deliberately omits the
+ * allowlist — there the engine lives inside the VM and prime-agent's own
+ * tool defaults are acceptable).
+ */
+const CHIEF_TOOLS = [
+  "bash",
+  "edit",
+  "ask_user",
+  "github",
+  "supabase",
+  "request_connector",
+  "orchestrate",
+  "scaffold_vube",
+  "list_nodes",
+];
 
 /** True when the engine process itself runs INSIDE a Daytona sandbox. */
 export const ENGINE_IN_VM = process.env.ENGINE_IN_VM === "1";
@@ -83,16 +105,22 @@ const WORKSPACE_ROOT = process.env.ENGINE_WORKSPACE_ROOT
  * Provider table — one row per provider defined in .prime-agent/models.json.
  *   keyEnv:      the env var the provider's API key lives in
  *   defaultModel: used when ENGINE_MODEL is unset
+ *
+ * 2026-09-04: the default is Nemotron 3 ULTRA 550B (user mandate — the
+ * weaker super-120b shipped a syntax error + an SSR-unsafe localStorage
+ * read that a human had to fix). Ultra verified live on the NVIDIA NIM
+ * catalog with correct OpenAI tool-calling (prime-agent compatible);
+ * ENGINE_MODEL="nvidia/nemotron-3-super-120b-a12b" still pins the old one.
  */
 const PROVIDERS = {
-  nvidia: { keyEnv: "NVIDIA_API_KEY", defaultModel: "nvidia/nemotron-3-super-120b-a12b" },
+  nvidia: { keyEnv: "NVIDIA_API_KEY", defaultModel: "nvidia/nemotron-3-ultra-550b-a55b" },
   aihubmix: { keyEnv: "AIHUBMIX_API_KEY", defaultModel: "coding-glm-5.3" },
   "aihubmix-alt": { keyEnv: "AIHUBMIX_API_KEY", defaultModel: "coding-glm-5.3" },
   // The in-VM provider: the 1.0 orchestrator daemon (localhost:9000)
   // proxies OpenAI-format requests through its reverse tunnel. The "key"
   // is the VM's own ORCH_TOKEN (a per-VM secret the proxy validates on
   // localhost) — never a provider key, which stays on the backend.
-  "vm-tunnel": { keyEnv: "ENGINE_LLM_TOKEN", defaultModel: "nvidia/nemotron-3-super-120b-a12b" },
+  "vm-tunnel": { keyEnv: "ENGINE_LLM_TOKEN", defaultModel: "nvidia/nemotron-3-ultra-550b-a55b" },
 };
 
 const ENGINE_PROVIDER = (process.env.ENGINE_PROVIDER ?? "nvidia").toLowerCase();
@@ -169,11 +197,15 @@ export function kernelModelId() {
  * The session persists across iterations (the chief keeps its context); the
  * goal loop drives it turn by turn.
  */
-export async function createChiefSession({ runId, sessionId, workspace, interactions }) {
+export async function createChiefSession({ runId, sessionId, workspace, interactions, runCtx = {} }) {
   const model = getModel();
 
   if (ENGINE_IN_VM) {
     mkdirSync(VM_WORKSPACE_ROOT, { recursive: true });
+    // The Vube tools read ctx.vm at CALL time — the in-VM engine has no REST
+    // VM client; the workspace IS this process's filesystem.
+    runCtx.localCwd = VM_WORKSPACE_ROOT;
+    const vube = buildChiefTools(runCtx);
     const { session } = await createAgentSession({
       model,
       thinkingLevel: "off",
@@ -196,6 +228,11 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
         createGithubTool(),
         createSupabaseTool(),
         createRequestConnectorTool(),
+        // The Vube surface: dynamic orchestration + monorepo scaffold +
+        // registry discovery.
+        vube.orchestrate,
+        vube.scaffoldVube,
+        vube.listNodes,
       ],
       sessionStartEvent: {
         type: "session_start",
@@ -209,6 +246,10 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
 
   if (workspace?.sandboxId) {
     const vm = createVmWorkspace(workspace);
+    // The chief's tools read ctx.vm at CALL time — assign once resolved.
+    runCtx.vm = vm;
+    runCtx.localCwd = null;
+    const vube = buildChiefTools(runCtx);
     const { session } = await createAgentSession({
       model,
       thinkingLevel: "off",
@@ -223,15 +264,20 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
       customTools: [
         createBashTool(vm.workspaceRoot, { operations: vm.bashOperations }),
         createEditTool(vm.workspaceRoot, { operations: vm.editOperations }),
-        // GROUP 2 parity on the host engine too: ask_user always works;
-        // the connector tools degrade honestly (no localhost orchestrator
-        // from the engine host — the run's bridge is the VM's daemon).
+        // ask_user (engine-native) + request_connector (honest on host).
         ...(interactions ? [createAskUserTool(interactions)] : []),
-        createGithubTool(),
-        createSupabaseTool(),
         createRequestConnectorTool(),
+        // Host mode: github + supabase run DIRECT against the engine's own
+        // tokens (GITHUB_TOKEN / SUPABASE_*) — functional today; the
+        // tunnel-bridged per-user versions live in the in-VM branch.
+        vube.github,
+        vube.supabase,
+        // The Vube surface.
+        vube.orchestrate,
+        vube.scaffoldVube,
+        vube.listNodes,
       ],
-      tools: ["bash", "edit"],
+      tools: CHIEF_TOOLS,
       sessionStartEvent: {
         type: "session_start",
         sessionId,
@@ -244,6 +290,8 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
 
   const cwd = resolve(WORKSPACE_ROOT, runId);
   mkdirSync(cwd, { recursive: true });
+  runCtx.localCwd = cwd;
+  const vube = buildChiefTools(runCtx);
   const { session } = await createAgentSession({
     model,
     thinkingLevel: "off",
@@ -261,10 +309,14 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
       // Unbound local runs still get ask_user (engine-native); the
       // connector tools report unavailability honestly.
       ...(interactions ? [createAskUserTool(interactions)] : []),
-      createGithubTool(),
-      createSupabaseTool(),
       createRequestConnectorTool(),
+      vube.github,
+      vube.supabase,
+      vube.orchestrate,
+      vube.scaffoldVube,
+      vube.listNodes,
     ],
+    tools: CHIEF_TOOLS,
     sessionStartEvent: {
       type: "session_start",
       sessionId,
@@ -273,6 +325,62 @@ export async function createChiefSession({ runId, sessionId, workspace, interact
     },
   });
   return { session, cwd, vm: null };
+}
+
+/**
+ * Specialist (rlm-style subagent) session — the advisor the chief spawns
+ * through orchestrate. Tool-less by default: specialists return specs,
+ * code, and checklists; the CHIEF applies them so every artifact carries
+ * tool evidence the judge can verify (and concurrent specialists never
+ * race the shared workspace). The persona system prompt is composed into
+ * the first prompt by orchestrator-utils (spawnSpecialistAgent).
+ *
+ * DEBUGGER TERMINAL ACCESS (user mandate 2026-09-04): a specialist with
+ * `tools: ["bash"]` — the QA Verifier / debugger — gets a REAL shell in
+ * the run's workspace so it can run its own probes (npm run build,
+ * tsc --noEmit, curl the dev server, grep for banned patterns) instead
+ * of auditing secondhand state. `workspace` mirrors the chief's backend:
+ *   - in-VM: native bash rooted at the VM workspace root
+ *   - host VM-bound: bash through the daytona-service REST operations
+ *   - local: bash rooted at the run's local directory
+ */
+export async function createSpecialistSession({ tools, workspace } = {}) {
+  const model = getModel();
+  const wantsBash = Array.isArray(tools) && tools.includes("bash");
+  const customTools = [];
+  if (wantsBash) {
+    if (workspace?.vm) {
+      customTools.push(createBashTool(workspace.vm.workspaceRoot, { operations: workspace.vm.bashOperations }));
+    } else {
+      const root = workspace?.localCwd ?? ENGINE_DIR;
+      try {
+        mkdirSync(root, { recursive: true });
+      } catch {
+        /* exists */
+      }
+      customTools.push(createBashTool(root));
+    }
+  }
+  const { session } = await createAgentSession({
+    model,
+    thinkingLevel: "off",
+    authStorage: _auth,
+    modelRegistry: _registry,
+    cwd: workspace?.vm ? workspace.vm.workspaceRoot : (workspace?.localCwd ?? ENGINE_DIR),
+    sessionManager: SessionManager.inMemory(),
+    settingsManager: SettingsManager.inMemory({
+      compaction: { enabled: false },
+      enableBuiltinSkills: false,
+    }),
+    ...(customTools.length > 0 ? { customTools, tools: ["bash"] } : { noTools: "all" }),
+    sessionStartEvent: {
+      type: "session_start",
+      sessionId: `specialist-${Date.now()}`,
+      source: "forgvi-engine-specialist",
+      objective: undefined,
+    },
+  });
+  return { session, lastAssistantText: () => lastAssistantText(session) };
 }
 
 /**

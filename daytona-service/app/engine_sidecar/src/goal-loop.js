@@ -22,6 +22,8 @@ import { ENGINE_IN_VM, createChiefSession, lastAssistantText } from "./kernel.js
 import { RunInteractions } from "./connector-tools.js";
 import { verifyWorkspaceGrant } from "./grant.js";
 import { verifyAcceptance } from "./verify.js";
+import { AgentMailbox } from "./agent-message.js";
+import { getPersona, rosterBlock } from "./personas.js";
 
 /** Clamp helper. */
 const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
@@ -88,13 +90,17 @@ class DeltaPump {
   }
 }
 
-/** Normalize + clamp the client-supplied budgets (the engine sets the ceiling). */
+/** Normalize + clamp the client-supplied budgets (the engine sets the ceiling).
+ * 2026-09-04: ceiling raised — one prompt → fully production-ready app is
+ * the mandate, and Nemotron Ultra 550B turns run 10-25 min each; the old
+ * 30-minute cap cut PROGRESSING runs mid-build. Default 45 min, hard
+ * ceiling 90 (matches the 1.0 ORCH_CONVERGE_MAX_S). */
 function normalizeBudgets(budgets) {
   const b = budgets ?? {};
   return {
-    maxIterations: clamp(Number(b.maxIterations) || 6, 1, 8),
-    wallClockMs: clamp(Number(b.wallClockMs) || 30 * 60_000, 60_000, 30 * 60_000),
-    tokenBudget: clamp(Number(b.tokenBudget) || 500_000, 10_000, 500_000),
+    maxIterations: clamp(Number(b.maxIterations) || 6, 1, 10),
+    wallClockMs: clamp(Number(b.wallClockMs) || 45 * 60_000, 60_000, 90 * 60_000),
+    tokenBudget: clamp(Number(b.tokenBudget) || 500_000, 10_000, 2_000_000),
   };
 }
 
@@ -308,11 +314,16 @@ export class RunManager {
       /** ask_user registry — the journal carries questions to the studio,
        * POST /runs/:id/answer resolves them (see server.js). */
       interactions: new RunInteractions(journal),
+      /** Nuclear-family messaging (Vube pillar 3): chief ↔ specialists ↔
+       * verifier exchange direct messages; cross-run chatter is rejected
+       * and every message lands in the journal (+ its JSONL persistence). */
+      mailbox: null,
       /** @type {Array<{kind: string, name: string, status: string}>} */
       evidence: [],
       lastChiefReport: "",
       promise: null,
     };
+    run.mailbox = new AgentMailbox(journal, { family: ["chief", "verifier", "user"] });
 
     this.runs.set(runId, run);
     run.promise = this.#execute(run).catch((error) => {
@@ -406,13 +417,19 @@ export class RunManager {
       );
     }
 
-    const { session, vm } = await createChiefSession({
+    const { session, vm, cwd, inVm } = await createChiefSession({
       runId: run.runId,
       sessionId: run.sessionId,
       workspace: run.workspace,
       interactions: run.interactions,
+      // The Vube surface (orchestrate / scaffold_vube / list_nodes / direct
+      // github+supabase on host) binds to this per-run context.
+      runCtx: { run, journal, mailbox: run.mailbox, vm: null },
     });
     run.chiefSession = session;
+    // Local-disk runs (host unbound + in-VM runs): the scaffold + github
+    // sync tools write here when no REST VM client exists.
+    run.localCwd = vm ? null : cwd;
 
     // Warm the daytona-service before the first chief command so a Render
     // free-tier cold start doesn't burn the chief's first tool call. Best
@@ -534,7 +551,7 @@ export class RunManager {
 
         run.lastChiefReport = lastAssistantText(session);
 
-        // ── Verification turn (the independent judge) ─────────────────
+        // ── Verification turn (the independent judge + hard gates) ────
         journal.emit({ type: "role_spawned", role: "verifier" }, { role: "verifier", iteration });
         const verdict = await budgetGuard(
           verifyAcceptance({
@@ -542,6 +559,9 @@ export class RunManager {
             acceptance: run.acceptance,
             chiefReport: run.lastChiefReport,
             evidence: run.evidence,
+            // The hard gates execute real commands against the run's REAL
+            // workspace — the same backend the chief's own tools use.
+            workspace: { vm, localCwd: run.localCwd, inVm },
           }),
           null,
         );
@@ -562,6 +582,7 @@ export class RunManager {
             type: "verification_result",
             score: verdict.score,
             verdicts: verdict.verdicts,
+            hardGates: verdict.hardGates ?? [],
           },
           { iteration },
         );
@@ -689,8 +710,59 @@ function recoveredWorkspace(runId) {
   return null;
 }
 
-/** First chief prompt: the contract. */
+/** First chief prompt: the contract + the dynamic Vube surface. */
 function buildFirstPrompt(run) {
+  // The chief's persona doctrine is loaded DYNAMICALLY from
+  // .prime/prompts/chief_orchestrator.md (Vube pillar 4 — no hardcoded
+  // personas in source). Missing file ⇒ the fallback line only.
+  const chiefPersona = getPersona("chief_orchestrator");
+  const personaBlock = chiefPersona
+    ? `YOUR ORCHESTRATION DOCTRINE (from .prime/prompts/chief_orchestrator.md):\n${chiefPersona.markdown}`
+    : "";
+  const roster = `THE SPECIALIST ROSTER (dispatch with the orchestrate tool):\n${rosterBlock()}`;
+  const vubeBlock = [
+    personaBlock,
+    "",
+    roster,
+    "",
+    "You can also: ask the user questions (ask_user) when a decision materially changes",
+    "what gets built; use their connected GitHub account (github) and their connected",
+    "Supabase database (supabase) when the build calls for real repositories or a real",
+    "database — request_connector asks them to connect an account that isn't yet. For web",
+    "application goals, lay the Vube platform monorepo down FIRST with scaffold_vube (the",
+    "pre-installed premium UI stack: Tailwind, shadcn/ui, Motion, Lenis, GSAP, R3F, Radix,",
+    "Lucide, Sonner, Vaul, Embla, TanStack Query, Zustand, React Hook Form, Zod) and build",
+    "inside it. Prefer asking over guessing, and prefer real services over fake stand-ins.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  // THE PRODUCTION-READINESS LAW — engine-level, defense in depth (it is
+  // law, not persona: it holds even if .prime/prompts/ is missing). The
+  // deterministic hard gates ENFORCE every clause (see hard-gates.js);
+  // violating any of them makes completion impossible, so the chief is
+  // told up front, in plain text, what the machine will check.
+  const lawBlock = [
+    "",
+    "THE PRODUCTION-READINESS LAW (machine-enforced — the verifier scans the",
+    "workspace with real commands; a violation makes completion impossible):",
+    "1. NO sqlite. NO localStorage. NO sessionStorage. NO flat-file or",
+    "   in-memory databases. The ONLY accepted persistence is a REAL database",
+    "   (Supabase Postgres via the supabase tool) or cookies (httpOnly,",
+    "   server-side). Zustand must run WITHOUT the localStorage persist",
+    "   middleware. Tokens/preferences go in cookies; data goes in Postgres.",
+    "2. SSR SAFETY: never touch window/document/localStorage at module scope",
+    "   or during render. Browser APIs live inside useEffect, event handlers,",
+    "   or a `typeof window !== \"undefined\"` guard. A server-rendered crash",
+    "   is a defect.",
+    "3. DEV SERVER DISCIPLINE: start dev servers with an explicit port flag —",
+    "   `npx next dev -p 3000` or `npm run dev -- -p 3000`. NEVER `next dev",
+    "   3000`: Next.js parses a bare number as a DIRECTORY, not a port, and",
+    "   the server dies. npm install ONCE before the first start.",
+    "4. BUILD PROOF: for every web app, `npm run build` (or `npx tsc",
+    "   --noEmit`) MUST exit 0 before you report completion. A dev server is",
+    "   NOT build proof. Fix every syntax, type, and SSR error the build",
+    "   surfaces, then re-run until it passes — the verifier checks for it.",
+  ].join("\n");
   if (run.workspace) {
     return [
       "You are the chief agent of a Forgvi 2.0 run. You operate inside the",
@@ -702,17 +774,14 @@ function buildFirstPrompt(run) {
       "Existing files in /workspace may already hold earlier work; inspect them",
       "first (ls, cat) and build on top rather than clobbering blindly.",
       "",
+      vubeBlock,
+      lawBlock,
+      "",
       "OBJECTIVE:",
       run.objective,
       "",
       "ACCEPTANCE CRITERIA — an independent judge will verify each of these exactly as written:",
       ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
-      "",
-      "You can also: ask the user questions (ask_user) when a decision materially changes",
-      "what gets built; use their connected GitHub account (github) and their connected",
-      "Supabase database (supabase) when the build calls for real repositories or a real",
-      "database — request_connector asks them to connect an account that isn't yet. Prefer",
-      "asking over guessing, and prefer real services over fake stand-ins.",
       "",
       `You have at most ${run.budgets.maxIterations} iterations. Claims are not proof: the judge`,
       "scores only what your tool evidence demonstrates. Work in /workspace, build the",
@@ -724,14 +793,14 @@ function buildFirstPrompt(run) {
     "You are the chief agent of a Forgvi 2.0 run. You operate inside the engine's workspace:",
     "every file you create is a real artifact on disk, and every command you run is real.",
     "",
+    vubeBlock,
+    lawBlock,
+    "",
     "OBJECTIVE:",
     run.objective,
     "",
     "ACCEPTANCE CRITERIA — an independent judge will verify each of these exactly as written:",
     ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
-    "",
-    "You can also: ask the user questions (ask_user) when a decision materially changes",
-    "what gets built. Prefer asking over guessing.",
     "",
     `You have at most ${run.budgets.maxIterations} iterations. Claims are not proof: the judge`,
     "scores only what your tool evidence demonstrates. Work in this workspace, build the",

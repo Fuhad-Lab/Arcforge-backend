@@ -1,14 +1,22 @@
 /**
- * Forgvi Engine — the verifier (independent judge).
+ * Forgvi Engine — the verifier (independent judge + deterministic gates).
  *
  * The engine's law: claims are not proof. After each chief iteration the
  * judge — a fresh, tool-less session that never saw the chief's reasoning —
  * scores every acceptance criterion PASS/FAIL and names the gaps. The
  * completion policy (goal-loop.js) decides what happens next; the judge
  * only decides what is true.
+ *
+ * HARD GATES (2026-09-04, the no-human-in-the-loop mandate): before the
+ * LLM scores anything, deterministic gates run REAL commands against the
+ * run's workspace (banned storage/db scan, build proof, dev-port law).
+ * Gate failures are merged into the verdict as FORCED gaps — no model
+ * opinion can mark a run complete while a gate is red. The LLM judge sees
+ * the gate report and is instructed that gates are authoritative.
  */
 
 import { createJudgeSession, lastAssistantText } from "./kernel.js";
+import { runHardGates } from "./hard-gates.js";
 
 /**
  * Run one verification turn.
@@ -21,7 +29,19 @@ import { createJudgeSession, lastAssistantText } from "./kernel.js";
  *   ok: boolean
  * }>}
  */
-export async function verifyAcceptance({ objective, acceptance, chiefReport, evidence }) {
+export async function verifyAcceptance({ objective, acceptance, chiefReport, evidence, workspace }) {
+  // ── Deterministic hard gates first — they cannot be argued with. ────
+  let gateResult = { gaps: [], checks: [], report: "(hard gates not run — no workspace)" };
+  try {
+    gateResult = await runHardGates({ workspace, evidence });
+  } catch (error) {
+    gateResult = {
+      gaps: [],
+      checks: [{ name: "hard-gates", status: "skipped", detail: String(error?.message ?? error).slice(0, 200) }],
+      report: `[SKIPPED] hard-gates: ${String(error?.message ?? error).slice(0, 200)}`,
+    };
+  }
+
   const evidenceBlock = (evidence ?? [])
     .slice(-24)
     .map((e, i) => {
@@ -44,6 +64,10 @@ export async function verifyAcceptance({ objective, acceptance, chiefReport, evi
     "",
     "TOOL EVIDENCE (commands the worker actually executed):",
     evidenceBlock || "(no tool evidence recorded)",
+    "",
+    "DETERMINISTIC GATE RESULTS (authoritative — a red gate overrides any",
+    "worker claim; FAIL any criterion a red gate contradicts):",
+    gateResult.report,
     "",
     "Judge each criterion strictly on the evidence available. Do not give benefit of the doubt:",
     "if the report asserts something the evidence does not support, FAIL that criterion.",
@@ -79,19 +103,25 @@ export async function verifyAcceptance({ objective, acceptance, chiefReport, evi
       if (verdicts.length > 0) {
         const passed = verdicts.filter((v) => v.pass).length;
         const score = passed / acceptance.length;
-        const gaps = verdicts.filter((v) => !v.pass).map((v) => v.criterion);
+        const judgeGaps = verdicts.filter((v) => !v.pass).map((v) => v.criterion);
+        // HARD-GATE MERGE: gate failures are forced gaps — completion is
+        // impossible while any deterministic gate is red, regardless of
+        // what the LLM believes.
+        const gaps = [...gateResult.gaps, ...judgeGaps];
         return {
           verdicts,
           score,
           gaps,
           summary: String(parsed.summary ?? "").slice(0, 500),
           ok: gaps.length === 0,
+          hardGates: gateResult.checks,
         };
       }
     }
   }
 
   // Unparseable verdict — the honest outcome is FAIL with a named gap.
+  // (Hard-gate failures still hold — they merge in here too.)
   return {
     verdicts: acceptance.map((a) => ({
       criterion: a,
@@ -99,9 +129,13 @@ export async function verifyAcceptance({ objective, acceptance, chiefReport, evi
       evidence: "verifier output was unparseable — no verdict recorded",
     })),
     score: 0,
-    gaps: acceptance.map((a) => `${a} (unverified — judge output invalid)`),
+    gaps: [
+      ...gateResult.gaps,
+      ...acceptance.map((a) => `${a} (unverified — judge output invalid)`),
+    ],
     summary: "The verifier could not produce a parseable verdict.",
     ok: false,
+    hardGates: gateResult.checks,
   };
 }
 
