@@ -227,8 +227,7 @@ async def force_free_quota(
 ) -> list[str]:
     """EMERGENCY quota release for quota-blocked sandbox creation.
 
-    Deletes the OLDEST workspace sandboxes (by created_at) — including
-    the requesting user's OWN old ones — up to
+    Deletes the OLDEST workspace sandboxes (by created_at) up to
     settings.quota_force_free_max.
 
     Incident 2026-09-02 ("my new build always fails"): the org has only
@@ -238,27 +237,31 @@ async def force_free_quota(
     force_free could NEVER free anything — every new build failed while
     the user's own day-old sandboxes held the quota hostage.
 
-    What is actually worth protecting is an IN-FLIGHT build: a sandbox
-    the user started minutes ago that may be mid-build. Those are young.
-    So exclude_user_id now only shields the user's sandboxes CREATED
-    within protect_recent_seconds (default 30 min). Everything older —
-    same user or not — is a corpse by comparison and is freed
-    oldest-first. The requesting project's own sandbox cannot be
-    collateral: its creation is the call that just failed, so it does
-    not exist yet.
+    Incident 2026-09-03 16:04 (live, run c92327d2 — the "daytona is going
+    down" root cause): the requester-only 30-minute shield let force_free
+    delete a 60-minute-old sandbox that was MID-RUN (an active engine
+    build shows no Daytona-API activity, so age was the only signal).
+    PROTECTION IS NOW OWNER-BLIND: every workspace sandbox younger than
+    protect_recent_seconds (default 7200s ≥ the max run budget) is
+    treated as possibly mid-build and shielded — whichever user's init
+    triggered the emergency. Everything older (same user or not) is a
+    corpse by comparison and is freed oldest-first. The requesting
+    project's own sandbox cannot be collateral: its creation is the call
+    that just failed, so it does not exist yet.
 
     Only invoked after reap_idle_workspaces() failed to free enough
-    quota for a retry to succeed: the alternative is failing the user's
-    NEW build while corpses hold the org quota hostage. Oldest-first
-    minimizes the chance of hitting an in-flight build (builds are
-    minutes old, corpses are hours old).
+    quota for a retry to succeed. When everything is young (a user
+    genuinely running two concurrent builds), the new creation FAILS
+    HONESTLY with the quota error instead of silently killing a live
+    build — the correct trade: a visible boot error beats a dead run.
+    Oldest-first minimizes the chance of hitting an in-flight build.
     """
     max_deletes = max(0, int(settings.quota_force_free_max))
     if max_deletes == 0:
         return []
     if protect_recent_seconds is None:
         protect_recent_seconds = max(
-            0, int(getattr(settings, "force_free_protect_recent_seconds", 1800))
+            0, int(getattr(settings, "force_free_protect_recent_seconds", 7200))
         )
 
     daytona = get_daytona()
@@ -287,14 +290,11 @@ async def force_free_quota(
         if created is None:
             continue
         created = created.astimezone(timezone.utc)
-        if (
-            exclude_user_id
-            and sandbox_type == "workspace"
-            and labels.get("user_id") == exclude_user_id
-        ):
-            # Shield the requester's IN-FLIGHT work only: young sandboxes
-            # may be mid-build. Old same-user sandboxes are corpses that
-            # are blocking the very build that triggered this call.
+        if sandbox_type == "workspace":
+            # OWNER-BLIND in-flight shield: a young sandbox may be mid-run
+            # (engine runs are up to 90 min and generate no Daytona-API
+            # activity). Age is the only honest signal — protect every
+            # young workspace, not just the requester's.
             age_s = (now - created).total_seconds()
             if age_s < protect_recent_seconds:
                 continue  # Possibly mid-build — protect.

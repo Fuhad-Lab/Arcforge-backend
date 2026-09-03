@@ -62,11 +62,18 @@ class Settings(BaseSettings):
     # sandbox held 4 GiB for 21+ hours). Creation-time based, refresh-proof.
     probe_max_lifetime_seconds: int = 3600  # 1 hour
     # How many oldest sandboxes the emergency force-free path may delete
-    # when a quota-blocked creation must not fail. The requester's own
-    # sandboxes created within force_free_protect_recent_seconds are
-    # shielded (in-flight builds); older ones are freed like any corpse.
+    # when a quota-blocked creation must not fail. Workspace sandboxes
+    # created within force_free_protect_recent_seconds are shielded
+    # (in-flight builds — ANY owner's: an active engine run can be up to
+    # 90 min long and shows no Daytona-API activity while it works, so a
+    # young sandbox may well be mid-build); older ones are freed like any
+    # corpse. INCIDENT 2026-09-03 16:04 (live, run c92327d2): the user
+    # opened two other projects while a 60-minute-old ForgeDo sandbox was
+    # MID-RUN; the 30-min requester-only shield did not cover it, and
+    # force_free deleted the live build VM to make room — the exact
+    # "daytona is going down" experience. 7200s covers the max run budget.
     quota_force_free_max: int = 3
-    force_free_protect_recent_seconds: int = 1800  # 30 minutes
+    force_free_protect_recent_seconds: int = 7200  # 2 hours
 
     # --- Render free-tier keep-alive (incident 2026-09-03: Uptime Robot
     # "can't be reached" — free services spin down after 15 min idle and the
