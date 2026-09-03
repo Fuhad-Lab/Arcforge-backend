@@ -460,6 +460,36 @@ export class RunManager {
     let previousGaps = [];
     let escalate = false;
 
+    // MID-TURN BUDGET GUARD (2026-09-03 fix): the between-iteration check
+    // below can never fire while a single LLM turn streams forever
+    // (live-observed: a 35-minute thinking marathon on a 30-minute budget —
+    // 6600 journal events, still "iteration 1"). The guard races each
+    // awaited turn against the REMAINING wall clock; on expiry it aborts
+    // the chief session (prompt settles) and flags the run so the honest
+    // incomplete path takes over — the run can never outlive its budget.
+    const budgetGuard = (promise, session) => {
+      const remaining = run.budgets.wallClockMs - (Date.now() - run.startedAt);
+      if (remaining <= 0) return promise; // the top-of-loop check settles it
+      let timer = null;
+      const expired = new Promise((resolve) => {
+        timer = setTimeout(() => {
+          run.abortRequested = true;
+          run.abortReason = "wall clock budget exhausted";
+          journal.emit({ type: "run_error", error: "wall clock budget exhausted" });
+          try {
+            session?.abort?.()?.catch?.(() => {});
+          } catch {
+            /* already idle */
+          }
+          resolve("budget-exhausted");
+        }, remaining);
+      });
+      return Promise.race([
+        Promise.resolve(promise).finally(() => clearTimeout(timer)),
+        expired,
+      ]);
+    };
+
     try {
       for (
         let iteration = 1;
@@ -494,7 +524,7 @@ export class RunManager {
         });
 
         try {
-          await session.prompt(chiefPrompt);
+          await budgetGuard(session.prompt(chiefPrompt), session);
         } finally {
           unsubStream();
           pump.finish();
@@ -506,12 +536,18 @@ export class RunManager {
 
         // ── Verification turn (the independent judge) ─────────────────
         journal.emit({ type: "role_spawned", role: "verifier" }, { role: "verifier", iteration });
-        const verdict = await verifyAcceptance({
-          objective: run.objective,
-          acceptance: run.acceptance,
-          chiefReport: run.lastChiefReport,
-          evidence: run.evidence,
-        });
+        const verdict = await budgetGuard(
+          verifyAcceptance({
+            objective: run.objective,
+            acceptance: run.acceptance,
+            chiefReport: run.lastChiefReport,
+            evidence: run.evidence,
+          }),
+          null,
+        );
+        // Budget expired mid-verdict: the guard resolves the sentinel —
+        // settle through the honest incomplete path (no verdict to trust).
+        if (verdict === "budget-exhausted") break;
         journal.emit(
           {
             type: "role_finished",
@@ -596,7 +632,7 @@ export class RunManager {
       run.status === "complete"
         ? []
         : [
-            ...(run.abortRequested ? ["run aborted by user"] : []),
+            ...(run.abortRequested ? [run.abortReason ?? "run aborted by user"] : []),
             ...(verdict?.gaps ?? run.acceptance.map((a) => `${a} (not verified within the iteration budget)`)),
           ];
 
