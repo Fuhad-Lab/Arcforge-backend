@@ -283,6 +283,12 @@ export class RunManager {
     const sessionId = randomUUID();
     const goalId = randomUUID();
     const clamped = normalizeBudgets(budgets);
+    // The journal is created BEFORE the run object: the interactions
+    // registry (below) must hold the SAME Journal instance, and a sibling
+    // property is not a binding — referencing `journal` inside the object
+    // literal was a live ReferenceError ("journal is not defined", the
+    // first 2.0 run after the CORS fix, 2026-09-03).
+    const journal = new Journal(runId, sessionId, goalId, { persistDir: this.persistDir });
 
     const run = {
       runId,
@@ -298,7 +304,7 @@ export class RunManager {
       finishedAt: null,
       abortRequested: false,
       report: null,
-      journal: new Journal(runId, sessionId, goalId, { persistDir: this.persistDir }),
+      journal,
       /** ask_user registry — the journal carries questions to the studio,
        * POST /runs/:id/answer resolves them (see server.js). */
       interactions: new RunInteractions(journal),
