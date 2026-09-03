@@ -122,7 +122,7 @@ class AgentInstaller:
             "key": (llm_config or {}).get("key", ""),
             "model": (llm_config or {}).get("model", "nvidia/nemotron-3-ultra-550b-a55b"),
             "chief_fallback_model": os.environ.get(
-                "ORCH_CHIEF_FALLBACK_MODEL", "openai/gpt-oss-120b"),
+                "ORCH_CHIEF_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
             "agent_model": os.environ.get(
                 "ORCH_AGENT_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
             "frontend_model": os.environ.get(

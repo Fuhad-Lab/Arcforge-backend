@@ -200,8 +200,9 @@ LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
 # head on the REAL tool loops — see worklog Task 28):
 #   CHIEF      = nemotron-3-ultra-550b-a55b (550B MoE/55B active — the big
 #                planning brain; drifts from JSON schemas occasionally and
-#                503s under load → falls back to gpt-oss-120b, the proven
-#                planner: 8.3s plans with acceptance criteria).
+#                503s under load → falls back to nemotron-3-super-120b-a12b
+#                (2026-10 fix: the old fallback openai/gpt-oss-120b was
+#                EOL'd by NVIDIA — live 410 Gone, killed whole turns).).
 #   FRONTEND   = minimaxai/minimax-m3 (genuinely good JSON tool-caller that
 #                writes real React AND is multimodal — described a UI
 #                screenshot accurately in 6.7s; BUT the account's rate
@@ -223,7 +224,7 @@ LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
 # ─────────────────────────────────────────────────────────────────────────
 AGENT_MODEL = os.environ.get("ORCH_AGENT_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 CHIEF_FALLBACK_MODEL = os.environ.get(
-    "ORCH_CHIEF_FALLBACK_MODEL", "openai/gpt-oss-120b")
+    "ORCH_CHIEF_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 FRONTEND_MODEL = os.environ.get(
     "ORCH_FRONTEND_MODEL", "minimaxai/minimax-m3")
 BACKEND_MODEL = os.environ.get(

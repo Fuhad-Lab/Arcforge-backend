@@ -165,45 +165,34 @@ export type ProjectState = {
   negotiationState: NegotiationState;
 };
 
-// GROQ MIGRATION (2026-08-27, user mandate): NVIDIA integrate.api.nvidia.com
-// measured 10s+ per completion with frequent connect blips — the whole
-// pipeline felt slow. Groq serves the same OpenAI-compatible shape at
-// ~10-30x the tokens/sec (live-measured 0.85s round-trips via the backend
-// proxy). The user asked for "Llama 3 70B or Qwen 32B" — PROBED LIVE:
-// this Groq account has BOTH lines decommissioned/unavailable
-// (llama-3.3-70b-versatile/qwen3-32b -> model_not_found,
-// llama-3.3-70b-specdec/r1-distill-70b -> model_decommissioned). Best
-// available code model: openai/gpt-oss-120b (120B MoE, JSON-mode capable,
-// reasoning isolated to a separate field so content stays clean); fast
-// alternate openai/gpt-oss-20b. Env overrides keep the NVIDIA_* names so
-// existing Render config keeps working; only the defaults changed.
+// MODEL ROUTING (2026-10 fix, live-verified): the previous Groq-era
+// defaults pointed at openai/gpt-oss-120b, which NVIDIA NIM has since
+// EOL'd (live 410 Gone: "reached its end of life on 2026-09-03"). The
+// role defaults now mirror the in-VM sidecar's live-measured routing
+// table (worklog Task 28) — every id below was confirmed present in the
+// NVIDIA NIM /v1/models catalog at fix time. Env overrides keep the
+// NVIDIA_* names so existing Render config keeps working.
 const DEFAULT_MODELS: Record<Role, string> = {
-  leader: process.env.NVIDIA_LEADER_MODEL ?? "openai/gpt-oss-120b",
-  backend: process.env.NVIDIA_BACKEND_MODEL ?? "openai/gpt-oss-120b",
-  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "openai/gpt-oss-120b",
-  debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "openai/gpt-oss-20b",
+  leader: process.env.NVIDIA_LEADER_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b",
+  backend: process.env.NVIDIA_BACKEND_MODEL ?? "deepseek-ai/deepseek-v4-pro-0813",
+  frontend: process.env.NVIDIA_FRONTEND_MODEL ?? "minimaxai/minimax-m3",
+  debugger: process.env.NVIDIA_DEBUGGER_MODEL ?? "nvidia/nemotron-3-super-120b-a12b",
 };
 
 // ──────────────────────────────────────────────────────────────────────────
-// GROQ ROUTING FOR SINGLE ("SOLO") MODE
+// SINGLE ("SOLO") MODE ROUTING
 // ──────────────────────────────────────────────────────────────────────────
 // The single-agent ("Solo") mode — the config that powers the In-VM sidecar
 // pipeline (handed to the orchestrator daemon at sandbox creation via
-// daytona-workspace) — runs on Groq per the user's mandate (speed). The
-// requested "Llama 3 70B / Qwen 32B" ids are NOT served by this Groq
-// account (probed live: model_not_found / model_decommissioned), so the
-// best available code model wins: openai/gpt-oss-120b (JSON-mode capable,
-// reasoning isolated, 32k output budget verified). Alternate: gpt-oss-20b.
-//
-// Groq is OpenAI-compatible (same /v1/chat/completions shape NVIDIA used),
-// so every call path (host pipeline + reverse-tunnel forwarder) is unchanged
-// apart from URL/key/model. On Render, set:
-//   GROQ_API_KEY            = gsk_...                         (required)
-//   GROQ_BASE_URL           = https://api.groq.com/openai/v1  (default)
-//   SINGLE_MODE_MODEL       = llama-3.3-70b-versatile         (default)
-// Legacy NVIDIA keys are kept as last-resort fallbacks for stale dev envs.
+// daytona-workspace). Live Render config routes this at NVIDIA NIM:
+//   SINGLE_MODE_API_URL  = https://integrate.api.nvidia.com/v1/chat/completions
+//   SINGLE_MODE_API_KEY  = nvapi-...
+//   SINGLE_MODE_MODEL    = nvidia/nemotron-3-ultra-550b-a55b
+// The 2026-10 fix replaced the dead openai/gpt-oss-120b default (NVIDIA
+// EOL'd it — live 410) with the same live nemotron-3-ultra default the
+// Render env already pins. All ids verified live in the NIM catalog.
 export const SINGLE_MODE_MODEL =
-  process.env.SINGLE_MODE_MODEL ?? "openai/gpt-oss-120b";
+  process.env.SINGLE_MODE_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b";
 const SINGLE_MODE_API_URL =
   process.env.SINGLE_MODE_API_URL ??
   (process.env.GROQ_BASE_URL
