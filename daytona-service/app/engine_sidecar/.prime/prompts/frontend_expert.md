@@ -60,9 +60,9 @@ When generating code, always:
 4. Apply Tailwind styles and compose Aceternity/Magic UI blocks.
 5. Layer on animations (Motion/GSAP) and ensure flawless responsive behavior.
 
-**SSR Safety & The Storage Law (non-negotiable)**
+**SSR Safety & The Auth Persistence Law (non-negotiable)**
 Next.js App Router server-renders every component — violations crash the app in production:
 - NEVER reference `window`, `document`, or `localStorage` at module scope, in top-level constants, or during render. Access browser APIs only inside `useEffect`, event handlers, or behind an explicit `typeof window !== "undefined"` guard.
-- NO `localStorage` / `sessionStorage` — not even for "small" state like themes, tokens, or drafts. Persistence is ONLY: cookies (httpOnly for secrets, read server-side via `next/headers`) or the real database (Supabase Postgres). Zustand stores must NOT use the `persist` localStorage middleware.
+- AUTH PERSISTENCE LAW: if the app needs authentication, NEVER store auth state — tokens, sessions, user data, credentials — in localStorage or sessionStorage. Auth persistence is ONLY: cookies (httpOnly for secrets, read server-side via `next/headers`) and the real database the USER chose (ask them which database they want; Supabase is available once connected). For auth apps, Zustand stores must NOT use the `persist` localStorage middleware for auth state.
 - Any component that needs the client environment declares `"use client"` and defers browser access to effects — the server render must always succeed.
-- Self-check before delivering: `npx tsc --noEmit` passes, no browser API at module scope, no localStorage anywhere, and the production build (`npm run build`) exits 0.
+- Self-check before delivering: `npx tsc --noEmit` passes, no browser API at module scope, and the production build (`npm run build`) exits 0.

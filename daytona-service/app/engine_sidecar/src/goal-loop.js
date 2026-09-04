@@ -7,7 +7,9 @@
  *     → chief iteration (prime-agent kernel, real tools, real artifacts)
  *     → independent verification (the judge scores every criterion)
  *     → completion decision (complete | continue | escalate)
- *     → repeat within the iteration budget
+ *     → repeat until the judge passes every criterion or the user aborts
+ *       (NO hardcoded time/iteration/token budget — the run is free and
+ *       dynamic, user mandate 2026-09-05)
  *     → completion report with evidence, score, and remaining issues
  *
  * Claims are not proof: the chief cannot finish the run; only the judge
@@ -90,19 +92,9 @@ class DeltaPump {
   }
 }
 
-/** Normalize + clamp the client-supplied budgets (the engine sets the ceiling).
- * 2026-09-04: ceiling raised — one prompt → fully production-ready app is
- * the mandate, and Nemotron Ultra 550B turns run 10-25 min each; the old
- * 30-minute cap cut PROGRESSING runs mid-build. Default 45 min, hard
- * ceiling 90 (matches the 1.0 ORCH_CONVERGE_MAX_S). */
-function normalizeBudgets(budgets) {
-  const b = budgets ?? {};
-  return {
-    maxIterations: clamp(Number(b.maxIterations) || 6, 1, 10),
-    wallClockMs: clamp(Number(b.wallClockMs) || 45 * 60_000, 60_000, 90 * 60_000),
-    tokenBudget: clamp(Number(b.tokenBudget) || 500_000, 10_000, 2_000_000),
-  };
-}
+// (No budget machinery: runs are free and dynamic — they end when the
+// independent judge passes every acceptance criterion or the user aborts.
+// `budgets` fields sent by older frontends are accepted and ignored.)
 
 /**
  * RunManager — the registry of live runs.
@@ -154,7 +146,6 @@ export class RunManager {
         goalId: runId,
         objective: first?.event?.objective ?? "(recovered run)",
         acceptance: first?.event?.acceptance ?? [],
-        budgets: first?.event?.budgets ?? normalizeBudgets(null),
         workspace: recoveredWorkspace(runId),
         status: "incomplete",
         iteration: rec.journal.entries.at(-1)?.iteration ?? 0,
@@ -234,7 +225,7 @@ export class RunManager {
    * local disk when the caller asked for the project workspace (that would
    * split the workspace in two: the user's VM and a hidden engine copy).
    */
-  start({ objective, acceptance, budgets, workspaceGrant }) {
+  start({ objective, acceptance, workspaceGrant }) {
     const cleanObjective = String(objective ?? "").trim();
     const cleanAcceptance = (Array.isArray(acceptance) ? acceptance : [])
       .map((a) => String(a ?? "").trim())
@@ -288,7 +279,6 @@ export class RunManager {
     const runId = randomUUID();
     const sessionId = randomUUID();
     const goalId = randomUUID();
-    const clamped = normalizeBudgets(budgets);
     // The journal is created BEFORE the run object: the interactions
     // registry (below) must hold the SAME Journal instance, and a sibling
     // property is not a binding — referencing `journal` inside the object
@@ -302,7 +292,6 @@ export class RunManager {
       goalId,
       objective: cleanObjective,
       acceptance: cleanAcceptance,
-      budgets: clamped,
       workspace,
       status: "running",
       iteration: 0,
@@ -374,7 +363,6 @@ export class RunManager {
       objective: run.objective,
       acceptance: run.acceptance,
       iteration: run.iteration,
-      budgets: run.budgets,
       workspace: run.workspace
         ? { sandboxId: run.workspace.sandboxId, projectId: run.workspace.projectId, bound: true }
         : { bound: false },
@@ -397,7 +385,6 @@ export class RunManager {
         type: "run_started",
         objective: run.objective,
         acceptance: run.acceptance,
-        budgets: run.budgets,
       },
       {},
     );
@@ -477,49 +464,16 @@ export class RunManager {
     let previousGaps = [];
     let escalate = false;
 
-    // MID-TURN BUDGET GUARD (2026-09-03 fix): the between-iteration check
-    // below can never fire while a single LLM turn streams forever
-    // (live-observed: a 35-minute thinking marathon on a 30-minute budget —
-    // 6600 journal events, still "iteration 1"). The guard races each
-    // awaited turn against the REMAINING wall clock; on expiry it aborts
-    // the chief session (prompt settles) and flags the run so the honest
-    // incomplete path takes over — the run can never outlive its budget.
-    const budgetGuard = (promise, session) => {
-      const remaining = run.budgets.wallClockMs - (Date.now() - run.startedAt);
-      if (remaining <= 0) return promise; // the top-of-loop check settles it
-      let timer = null;
-      const expired = new Promise((resolve) => {
-        timer = setTimeout(() => {
-          run.abortRequested = true;
-          run.abortReason = "wall clock budget exhausted";
-          journal.emit({ type: "run_error", error: "wall clock budget exhausted" });
-          try {
-            session?.abort?.()?.catch?.(() => {});
-          } catch {
-            /* already idle */
-          }
-          resolve("budget-exhausted");
-        }, remaining);
-      });
-      return Promise.race([
-        Promise.resolve(promise).finally(() => clearTimeout(timer)),
-        expired,
-      ]);
-    };
-
+    // FREE AND DYNAMIC (user mandate 2026-09-05): no timer, no iteration
+    // cap, no token budget. The loop runs until the independent judge
+    // passes every acceptance criterion, the user aborts, or the loop
+    // throws — completion is the engine's decision, never a clock's.
     try {
       for (
         let iteration = 1;
-        iteration <= run.budgets.maxIterations && run.status === "running";
+        run.status === "running";
         iteration++
       ) {
-        // Wall-clock budget check.
-        if (Date.now() - run.startedAt > run.budgets.wallClockMs) {
-          journal.emit({ type: "run_error", error: "wall clock budget exhausted" });
-          run.status = "incomplete";
-          break;
-        }
-
         run.iteration = iteration;
         journal.emit({ type: "iteration_started", iteration }, { iteration });
 
@@ -541,7 +495,7 @@ export class RunManager {
         });
 
         try {
-          await budgetGuard(session.prompt(chiefPrompt), session);
+          await session.prompt(chiefPrompt);
         } finally {
           unsubStream();
           pump.finish();
@@ -553,21 +507,15 @@ export class RunManager {
 
         // ── Verification turn (the independent judge + hard gates) ────
         journal.emit({ type: "role_spawned", role: "verifier" }, { role: "verifier", iteration });
-        const verdict = await budgetGuard(
-          verifyAcceptance({
-            objective: run.objective,
-            acceptance: run.acceptance,
-            chiefReport: run.lastChiefReport,
-            evidence: run.evidence,
-            // The hard gates execute real commands against the run's REAL
-            // workspace — the same backend the chief's own tools use.
-            workspace: { vm, localCwd: run.localCwd, inVm },
-          }),
-          null,
-        );
-        // Budget expired mid-verdict: the guard resolves the sentinel —
-        // settle through the honest incomplete path (no verdict to trust).
-        if (verdict === "budget-exhausted") break;
+        const verdict = await verifyAcceptance({
+          objective: run.objective,
+          acceptance: run.acceptance,
+          chiefReport: run.lastChiefReport,
+          evidence: run.evidence,
+          // The hard gates execute real commands against the run's REAL
+          // workspace — the same backend the chief's own tools use.
+          workspace: { vm, localCwd: run.localCwd, inVm },
+        });
         journal.emit(
           {
             type: "role_finished",
@@ -654,7 +602,7 @@ export class RunManager {
         ? []
         : [
             ...(run.abortRequested ? [run.abortReason ?? "run aborted by user"] : []),
-            ...(verdict?.gaps ?? run.acceptance.map((a) => `${a} (not verified within the iteration budget)`)),
+            ...(verdict?.gaps ?? run.acceptance.map((a) => `${a} (not verified before the run ended)`)),
           ];
 
     run.report = {
@@ -736,20 +684,21 @@ function buildFirstPrompt(run) {
   ]
     .filter(Boolean)
     .join("\n");
-  // THE PRODUCTION-READINESS LAW — engine-level, defense in depth (it is
-  // law, not persona: it holds even if .prime/prompts/ is missing). The
-  // deterministic hard gates ENFORCE every clause (see hard-gates.js);
-  // violating any of them makes completion impossible, so the chief is
-  // told up front, in plain text, what the machine will check.
+  // THE PRODUCTION-READINESS LAW — injected as the chief's system prompt
+  // (user mandate 2026-09-05: the auth/database rule is PROMPT LAW, not a
+  // hardcoded machine gate — the database choice is the USER's, never
+  // assumed). The deterministic verifier gates enforce build proof + dev
+  // port only (see hard-gates.js); the clauses below are law the chief
+  // follows because it was told, up front, in plain text.
   const lawBlock = [
     "",
-    "THE PRODUCTION-READINESS LAW (machine-enforced — the verifier scans the",
-    "workspace with real commands; a violation makes completion impossible):",
-    "1. NO sqlite. NO localStorage. NO sessionStorage. NO flat-file or",
-    "   in-memory databases. The ONLY accepted persistence is a REAL database",
-    "   (Supabase Postgres via the supabase tool) or cookies (httpOnly,",
-    "   server-side). Zustand must run WITHOUT the localStorage persist",
-    "   middleware. Tokens/preferences go in cookies; data goes in Postgres.",
+    "THE PRODUCTION-READINESS LAW (the verifier checks the machine gates with",
+    "real commands; every clause below is law you must follow):",
+    "1. AUTH PERSISTENCE LAW: if the app needs authentication, it should",
+    "   NEVER use sqlite or local storage (or sessionStorage). Only a REAL",
+    "   database is allowed — ASK THE USER which database they want to use",
+    "   (ask_user; Supabase is available through the supabase tool when they",
+    "   connect it) — and cookies (httpOnly, server-side) for session state.",
     "2. SSR SAFETY: never touch window/document/localStorage at module scope",
     "   or during render. Browser APIs live inside useEffect, event handlers,",
     "   or a `typeof window !== \"undefined\"` guard. A server-rendered crash",
@@ -783,7 +732,10 @@ function buildFirstPrompt(run) {
       "ACCEPTANCE CRITERIA — an independent judge will verify each of these exactly as written:",
       ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
       "",
-      `You have at most ${run.budgets.maxIterations} iterations. Claims are not proof: the judge`,
+      "The run is FREE — there is no time limit, iteration cap, or token budget:",
+      "take as many iterations as the goal genuinely needs. The run ends only",
+      "when the judge passes every criterion (or the user aborts), so honest,",
+      "verified work is the fastest path to done. Claims are not proof: the judge",
       "scores only what your tool evidence demonstrates. Work in /workspace, build the",
       "artifacts, verify your own work with commands before you claim it, then end with a short",
       "report: what you built, where it lives, and how each criterion is demonstrated.",
@@ -802,7 +754,10 @@ function buildFirstPrompt(run) {
     "ACCEPTANCE CRITERIA — an independent judge will verify each of these exactly as written:",
     ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
     "",
-    `You have at most ${run.budgets.maxIterations} iterations. Claims are not proof: the judge`,
+    "The run is FREE — there is no time limit, iteration cap, or token budget:",
+    "take as many iterations as the goal genuinely needs. The run ends only",
+    "when the judge passes every criterion (or the user aborts), so honest,",
+    "verified work is the fastest path to done. Claims are not proof: the judge",
     "scores only what your tool evidence demonstrates. Work in this workspace, build the",
     "artifacts, verify your own work with commands before you claim it, then end with a short",
     "report: what you built, where it lives, and how each criterion is demonstrated.",
@@ -834,7 +789,8 @@ function buildFollowUpPrompt({ run, gaps, escalate, iteration }) {
     `Acceptance criteria (unchanged, the judge re-checks every one):`,
     ...run.acceptance.map((a, i) => `${i + 1}. ${a}`),
     "",
-    `Iterations remaining including this one: ${run.budgets.maxIterations - iteration + 1}.`,
+    "The run remains FREE — no time limit, no iteration cap. Keep closing gaps",
+    "until the judge passes every criterion (or the user aborts).",
   );
   return lines.join("\n");
 }

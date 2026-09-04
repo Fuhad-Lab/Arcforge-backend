@@ -9,8 +9,9 @@
  *
  * HARD GATES (2026-09-04, the no-human-in-the-loop mandate): before the
  * LLM scores anything, deterministic gates run REAL commands against the
- * run's workspace (banned storage/db scan, build proof, dev-port law).
- * Gate failures are merged into the verdict as FORCED gaps — no model
+ * run's workspace (build proof, dev-port law — the auth-persistence rule
+ * is system-prompt law only, per the 2026-09-05 user mandate). Gate
+ * failures are merged into the verdict as FORCED gaps — no model
  * opinion can mark a run complete while a gate is red. The LLM judge sees
  * the gate report and is instructed that gates are authoritative.
  */

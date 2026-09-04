@@ -166,7 +166,7 @@ registerNode({
   kind: "verification",
   label: "Run the deterministic hard gates",
   description:
-    "Run the machine-enforced production-readiness gates against the run's workspace: banned storage (localStorage/sessionStorage) scan, banned database (sqlite) scan, production build proof, and the dev-server port law. Gate failures make run completion impossible.",
+    "Run the deterministic production-readiness gates against the run's workspace: production build proof and the dev-server port law. Gate failures make run completion impossible. (The auth-persistence law — real database chosen with the user + cookies, never sqlite/localStorage — is system-prompt law, not a machine gate.)",
   schema: createSchema("verify.hard_gates", [
     { name: "command", type: "string", required: false, description: "unused — gates run their fixed probe set" },
   ]),

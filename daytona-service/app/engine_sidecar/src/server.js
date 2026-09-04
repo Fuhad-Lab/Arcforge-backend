@@ -183,9 +183,13 @@ app.post("/runs", (req, res) => {
     res.status(503).json({ error: `engine kernel is not configured (missing ${requiredKeyEnv()})` });
     return;
   }
-  const { objective, acceptance, budgets, workspaceGrant } = req.body ?? {};
+  // `budgets` (sent by older frontends) is accepted and IGNORED — runs are
+  // free and dynamic: no timer, no iteration cap, no token budget (user
+  // mandate 2026-09-05). The run ends when the judge passes every
+  // criterion or the user aborts.
+  const { objective, acceptance, workspaceGrant } = req.body ?? {};
   try {
-    const run = manager.start({ objective, acceptance, budgets, workspaceGrant });
+    const run = manager.start({ objective, acceptance, workspaceGrant });
     res.status(201).json({
       runId: run.runId,
       goalId: run.goalId,
