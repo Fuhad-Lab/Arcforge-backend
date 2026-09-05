@@ -43,6 +43,7 @@ import {
   dbUpdateProject,
   getServiceSupabase,
   isSupabaseConfigured,
+  recordProjectContributor,
   type DbProject,
 } from "../lib/supabase-db";
 import {
@@ -221,28 +222,49 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
 
       // ── 1. PROJECT LINKAGE ────────────────────────────────────────────
       // Resolve (or create) the projects row this generation belongs to.
+      // Task 50 (Templates/shared projects): an EXISTING project resolves
+      // when the caller owns it OR it is public — a non-owner generating on
+      // a public project edits the SAME shared code and is recorded in
+      // project_contributors. Private/foreign projects do NOT resolve here,
+      // so the caller falls through to their own fresh project row.
       let dbProject: DbProject | null = null;
 
       if (isSupabaseConfigured()) {
         try {
           if (bodyProjectId) {
             const row = await dbGetProject(bodyProjectId);
-            if (row && row.user_id === userId) dbProject = row;
+            if (row && (row.user_id === userId || row.visibility === "public")) {
+              dbProject = row;
+            }
           }
           if (!dbProject && sessionId) {
+            // session_id is UNIQUE (schema 001) — no user_id filter needed;
+            // accessibility is decided after the row is in hand.
             const supabase = getServiceSupabase();
             const { data, error } = await supabase
               .from("projects")
               .select()
               .eq("session_id", sessionId)
-              .eq("user_id", userId)
               .maybeSingle();
-            if (!error && data) dbProject = data as DbProject;
+            if (!error && data) {
+              const row = data as DbProject;
+              if (row.user_id === userId || row.visibility === "public") {
+                dbProject = row;
+              }
+            }
           }
           if (!dbProject) {
-            // No existing project — create the canonical DB row ourselves so
-            // the pipeline, chat, and VM all share ONE project id.
+            // No accessible project — create the canonical DB row ourselves
+            // so the pipeline, chat, and VM all share ONE project id.
             dbProject = await dbCreateProject(userId, prompt, mode);
+          }
+
+          // Task 50: a non-owner generating on a public (template) project
+          // becomes a CONTRIBUTOR — their chat is their contribution. The
+          // upsert is idempotent and never throws (recordProjectContributor
+          // swallows failures), so it can never fail the generation.
+          if (dbProject && dbProject.user_id !== userId) {
+            await recordProjectContributor(dbProject.id, userId, req.userEmail);
           }
         } catch (err: unknown) {
           logger.warn(
@@ -253,12 +275,15 @@ router.post("/generate", requireAuth, (req: Request, res: Response) => {
         }
 
         // Keep the row in sync with what the frontend knows and touch
-        // updated_at. A failed sync must NOT discard the linkage.
+        // updated_at. A failed sync must NOT discard the linkage. Task 50:
+        // only the OWNER may rename/re-platform the project — a contributor
+        // just touches updated_at (and gets contributor-recorded above).
         if (dbProject) {
+          const isOwner = dbProject.user_id === userId;
           const patch: Record<string, unknown> = {};
           if (sessionId && !dbProject.session_id) patch.session_id = sessionId;
-          if (appName) patch.name = appName;
-          if (platforms.length > 0) patch.platforms = platforms.join(",");
+          if (isOwner && appName) patch.name = appName;
+          if (isOwner && platforms.length > 0) patch.platforms = platforms.join(",");
           try {
             dbProject = await dbUpdateProject(dbProject.id, patch);
           } catch (err: unknown) {

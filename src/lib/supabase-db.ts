@@ -21,6 +21,8 @@ export type DbProject = {
   skills_used: string[];
   phases_completed: string[];
   negotiation_rounds: number;
+  /** 'public' | 'private' (migration 005; default 'public'). */
+  visibility: string;
   created_at: string;
   updated_at: string;
 };
@@ -89,6 +91,15 @@ export type DbChatMessage = {
   role: string;
   content: string;
   meta: unknown | null;
+  created_at: string;
+};
+
+export type DbProjectContributor = {
+  id: string;
+  project_id: string;
+  user_id: string;
+  user_email: string | null;
+  contributed_at: string;
   created_at: string;
 };
 
@@ -573,7 +584,8 @@ export async function dbSaveChatMessage(
 }
 
 /**
- * Get chat history for a project.
+ * Get chat history for a project (all users' per-user chats — callers that
+ * render a user's chat MUST filter by user_id; see /api/db/sessions/:id).
  */
 export async function dbGetChatMessages(
   projectId: string,
@@ -592,6 +604,54 @@ export async function dbGetChatMessages(
   }
 
   return (data ?? []) as DbChatMessage[];
+}
+
+// ─── PROJECT CONTRIBUTORS (migration 005) ──────────────────────────────
+
+/**
+ * Upsert a contributor row for a shared (public) project.
+ *
+ * Called when a non-owner chats/generates on a project they can access —
+ * their chat is their contribution. Idempotent: the UNIQUE(project_id,
+ * user_id) constraint + onConflict merge means repeat activity just bumps
+ * contributed_at. Failures are logged and swallowed — contributor tracking
+ * must NEVER fail the user's actual work.
+ *
+ * (The db-ops edge function implements the same pattern directly against
+ * PostgREST: POST /rest/v1/project_contributors?on_conflict=project_id,user_id
+ * with Prefer: resolution=merge-duplicates.)
+ */
+export async function recordProjectContributor(
+  projectId: string,
+  userId: string,
+  email: string | null | undefined,
+): Promise<void> {
+  if (!projectId || !userId) return;
+  try {
+    const client = getSupabaseClient();
+    const { error } = await client
+      .from("project_contributors")
+      .upsert(
+        {
+          project_id: projectId,
+          user_id: userId,
+          user_email: email ?? null,
+          contributed_at: new Date().toISOString(),
+        },
+        { onConflict: "project_id,user_id" },
+      );
+    if (error) {
+      logger.warn(
+        { projectId, userId, err: error.message },
+        "recordProjectContributor: upsert failed (non-fatal)",
+      );
+    }
+  } catch (err: unknown) {
+    logger.warn(
+      { projectId, userId, err: err instanceof Error ? err.message : err },
+      "recordProjectContributor: upsert threw (non-fatal)",
+    );
+  }
 }
 
 // ─── SKILL LOGS ───────────────────────────────────────────────────────────

@@ -3,14 +3,16 @@
  *
  * Three families of routes:
  *   1. Project-scoped (preferred): resolve sandbox_id from the projects
- *      table and enforce ownership (project.user_id === req.userId).
+ *      table and enforce ACCESS (owner, OR public project — Task 50
+ *      templates/shared code; delete routes stay owner-only).
  *   2. Preview proxy (Module 2): `/preview/:sandboxId/:port[/<path>]`
  *      resolves a public/loopback URL per (sandbox, port) pair and
  *      proxies HTTP through to the VM via in-VM curl.
  *   3. Legacy sandboxId-based proxies (kept for the AI agent tooling).
  *
- * Auth: requireAuth (JWT) on every route — the sandbox VMs are the user's
- * workspaces; nobody may touch another user's VM.
+ * Auth: requireAuth (JWT) on every route — the sandbox VMs are the users'
+ * workspaces; nobody may touch another user's PRIVATE VM. Public
+ * projects deliberately share their sandbox (Templates feature).
  */
 import { createHmac, randomUUID } from "node:crypto";
 import express, { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
@@ -20,6 +22,7 @@ import { getServiceSupabase, isSupabaseConfigured } from "../lib/supabase-db";
 import {
   getProjectRow,
   getProjectRowBySandbox,
+  isProjectAccessible,
   type ProjectRow,
 } from "../lib/project-lookup";
 import {
@@ -78,6 +81,31 @@ function isOwnedBy(
   return true;
 }
 
+/**
+ * Accessibility guard (Task 50 — Templates / shared projects): identical to
+ * isOwnedBy EXCEPT a row with visibility === "public" passes for ANY
+ * authenticated user. Non-owners get the project's SHARED sandbox code
+ * (their activity is recorded in project_contributors by the chat +
+ * generate paths); private foreign projects keep the exact 403 as before.
+ *
+ * Delete/destroy routes must keep isOwnedBy — owner-only, forever.
+ */
+function isAccessibleBy(
+  res: Response,
+  row: ProjectRow | null,
+  userId?: string,
+): row is ProjectRow {
+  if (!row) {
+    res.status(404).json({ error: "Project not found" });
+    return false;
+  }
+  if (!userId || !isProjectAccessible(row, userId)) {
+    res.status(403).json({ error: "Forbidden — project belongs to another user" });
+    return false;
+  }
+  return true;
+}
+
 async function saveSandboxId(projectId: string, sandboxId: string): Promise<void> {
   const supabase = getServiceSupabase();
   const { error } = await supabase
@@ -88,9 +116,11 @@ async function saveSandboxId(projectId: string, sandboxId: string): Promise<void
 }
 
 /**
- * Ownership guard variant for the preview proxy routes: when the DB
- * is configured, the sandbox MUST be owned by a project whose user_id
- * matches the caller. When Supabase is NOT configured (local dev), the
+ * Access guard variant for the preview proxy + legacy sandbox routes: when
+ * the DB is configured, the sandbox must belong to a project the caller can
+ * ACCESS — the owner, or any authenticated user when the project is public
+ * (Task 50 templates). `ownerOnly: true` (the legacy DELETE route) keeps the
+ * strict ownership rule. When Supabase is NOT configured (local dev), the
  * sandbox is allowed through so preview works in offline development.
  *
  * Returns the validated `ProjectRow` (or `null` in dev mode) when the
@@ -100,6 +130,7 @@ async function authorizeSandboxAccess(
   req: Request,
   res: Response,
   sandboxId: string,
+  opts: { ownerOnly?: boolean } = {},
 ): Promise<ProjectRow | null | false> {
   // Dev fallback: no DB → skip ownership check (matches the legacy
   // sandbox-id proxy behavior elsewhere in this router).
@@ -120,9 +151,11 @@ async function authorizeSandboxAccess(
     return false;
   }
 
-  // 2. Caller must own the project that owns this sandbox.
+  // 2. Caller must own (ownerOnly) or be able to access (owner OR public
+  //    project) the project that owns this sandbox.
   const row = await getProjectRowBySandbox(sandboxId);
-  if (!isOwnedBy(res, row, req.userId)) return false;
+  const guard = opts.ownerOnly ? isOwnedBy : isAccessibleBy;
+  if (!guard(res, row, req.userId)) return false;
   return row;
 }
 
@@ -144,7 +177,7 @@ router.get("/agent-info/:projectId", async (req: Request, res: Response, next: N
     }
 
     const row = await getProjectRow(projectId);
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     // No sandbox provisioned yet — nothing to probe.
     if (!row?.sandbox_id) {
@@ -263,7 +296,7 @@ router.post("/secrets/:projectId", async (req: Request, res: Response, next: Nex
 
     // 1. Ownership check (same guard as agent-info).
     const row = await getProjectRow(projectId);
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet" });
@@ -406,7 +439,7 @@ router.post("/init", async (req: Request, res: Response, next: NextFunction) => 
 
     // 1. Ownership check.
     const row = await getProjectRow(projectId);
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     // 2-6. Reuse live sandbox or provision + scaffold + logo, then fetch tree.
     const ensured = await ensureProjectSandbox(row, {
@@ -431,7 +464,7 @@ router.post("/init", async (req: Request, res: Response, next: NextFunction) => 
 router.get("/project/:projectId/file-tree", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const row = await getProjectRow(String(req.params.projectId));
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       // No VM yet — frontend renders the scaffold-empty state.
@@ -453,9 +486,12 @@ router.get("/project/:projectId/file-tree", async (req: Request, res: Response, 
 // signature (shared WORKSPACE_GRANT_SECRET) and then executes the run's
 // bash/edit tools directly against the sandbox, making the VM and the
 // engine one shared workspace (same filesystem Forgvi 1.0's in-VM swarm
-// uses). One grant = one project's sandbox — the engine can never be handed
-// another user's workspace because the grant only exists after this route
-// verified the caller owns the project.
+// uses). One grant = one project's sandbox. Guarded by isAccessibleBy
+// (Task 50): the owner mints grants for their project, and ANY user may
+// mint a grant for a PUBLIC (template) project — the sandbox belongs to the
+// project, so a non-owner grant still binds {userId: caller, projectId,
+// sandboxId: the project's shared sandbox} sanely; private foreign projects
+// get the 403 and never hand the engine anything.
 
 const WORKSPACE_GRANT_TTL_MS = 20 * 60_000; // 20 minutes — engine wake + run start
 
@@ -481,7 +517,7 @@ function mintGrant(row: ProjectRow, userId: string): string {
 router.get("/project/:projectId/grant", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const row = await getProjectRow(String(req.params.projectId));
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet — the VM is still booting" });
@@ -547,7 +583,7 @@ router.post("/project/:projectId/engine-run", async (req: Request, res: Response
 router.get("/project/:projectId/read", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const row = await getProjectRow(String(req.params.projectId));
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet" });
@@ -575,7 +611,7 @@ router.get("/project/:projectId/read", async (req: Request, res: Response, next:
 router.post("/project/:projectId/write", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const row = await getProjectRow(String(req.params.projectId));
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet" });
@@ -605,7 +641,7 @@ router.post("/project/:projectId/write", async (req: Request, res: Response, nex
 router.post("/project/:projectId/write-bulk", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const row = await getProjectRow(String(req.params.projectId));
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet" });
@@ -634,7 +670,7 @@ router.post("/project/:projectId/write-bulk", async (req: Request, res: Response
 router.post("/project/:projectId/terminal", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const row = await getProjectRow(String(req.params.projectId));
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet" });
@@ -667,7 +703,7 @@ const logoRawBody = express.raw({ type: ["image/*", "application/octet-stream"],
 router.post("/project/:projectId/logo", logoRawBody, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const row = await getProjectRow(String(req.params.projectId));
-    if (!isOwnedBy(res, row, req.userId)) return;
+    if (!isAccessibleBy(res, row, req.userId)) return;
 
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet" });
@@ -1037,7 +1073,9 @@ router.post("/:sandboxId/terminal", async (req: Request, res: Response, next: Ne
 router.delete("/:sandboxId", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sandboxId = String(req.params.sandboxId);
-    if (!(await authorizeSandboxAccess(req, res, sandboxId))) return;
+    // Destroying a sandbox is owner-only, forever (public projects must not
+    // let a viewer delete the shared VM).
+    if (!(await authorizeSandboxAccess(req, res, sandboxId, { ownerOnly: true }))) return;
     await proxyToDaytona(`/${encodeURIComponent(sandboxId)}`, { method: "DELETE" });
     res.status(204).send();
   } catch (error) {

@@ -18,6 +18,77 @@ import {
 
 const router: IRouter = Router();
 
+// ─── GET /api/db/templates — the Templates tab listing (Task 50) ──────────
+// Every PUBLIC project, newest first. Public is the DB default, so all
+// projects appear here until the owner flips them private. The creator's
+// email comes from public.users; contributorsCount is a PostgREST count
+// embed on project_contributors.
+//
+// AUTH-EXEMPT (registered BEFORE the requireAuth middleware): public
+// templates are public by definition — anonymous visitors on the landing
+// page browse the same grid; isYours is simply false without a session.
+
+router.get("/templates", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const { data, error } = await supabase
+      .from("projects")
+      .select("id,user_id,name,description,logo_url,platforms,updated_at,project_contributors(count)")
+      .eq("visibility", "public")
+      .order("updated_at", { ascending: false })
+      .limit(60);
+
+    if (error) throw new Error(`templates list: ${error.message}`);
+
+    type TemplateRow = {
+      id: string;
+      user_id: string;
+      name: string;
+      description: string | null;
+      logo_url: string | null;
+      platforms: string | string[] | null;
+      updated_at: string;
+      project_contributors: Array<{ count: number }> | null;
+    };
+    const rows = (data ?? []) as TemplateRow[];
+
+    // Creator emails in ONE users query (avoids 60 sequential round-trips).
+    const creatorIds = Array.from(new Set(rows.map((r) => r.user_id)));
+    const emailById = new Map<string, string>();
+    if (creatorIds.length > 0) {
+      const { data: userRows, error: userError } = await supabase
+        .from("users")
+        .select("id,email")
+        .in("id", creatorIds);
+      if (userError) {
+        logger.warn({ err: userError.message }, "templates list: creator emails lookup failed");
+      } else {
+        for (const u of (userRows ?? []) as Array<{ id: string; email: string | null }>) {
+          if (u.email) emailById.set(u.id, u.email);
+        }
+      }
+    }
+
+    res.json({
+      templates: rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        logoUrl: row.logo_url,
+        platforms: toPlatformsArray(row.platforms),
+        updatedAt: row.updated_at,
+        creatorEmail: emailById.get(row.user_id) ?? null,
+        contributorsCount: row.project_contributors?.[0]?.count ?? 0,
+        isYours: row.user_id === req.userId,
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // JWT auth on every /api/db route.
 router.use(requireAuth);
 
@@ -48,6 +119,27 @@ function toPlatformsColumn(value: unknown): string | null {
   }
   if (typeof value === "string" && value.trim().length > 0) return value.trim();
   return null;
+}
+
+/** Contributor row (migration 005) as stored by PostgREST. */
+type ContributorRow = {
+  user_id: string;
+  user_email: string | null;
+  contributed_at: string;
+};
+
+/** Uniform contributor shape for the templates + template-session APIs. */
+function toContributor(row: ContributorRow) {
+  return {
+    userId: row.user_id,
+    email: row.user_email ?? null,
+    contributedAt: row.contributed_at,
+  };
+}
+
+/** PostgREST .eq("id", <uuid>) 400s on garbage — pre-validate ids. */
+function isUuid(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function requireSupabase(res: Response): ReturnType<typeof getServiceSupabase> | null {
@@ -177,68 +269,68 @@ router.post("/projects", async (req: Request, res: Response, next: NextFunction)
   }
 });
 
-// ─── PUT /api/db/projects/:id — update a draft project's meta ──────────────
-// THE FORGE TRIGGER path: startBuildFlow creates the project row the
-// moment the user clicks forge (auto name, no logo), the build wizard
-// runs on top of that background work, and its choices (final name,
-// logo, platforms) land HERE. Ownership is enforced — a user can only
-// ever update their own project.
+// ─── PUT /api/db/projects/:id — update a project (owner-only) ──────────────
+// Owner-scoped update (Task 50): name / logo / platforms / description /
+// session linkage AND visibility ("public" | "private"). The user_id filter
+// in the UPDATE means a foreign project simply matches zero rows → 404.
 
 router.put("/projects/:id", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const supabase = requireSupabase(res);
     if (!supabase) return;
 
-    const projectId = req.params.id;
-    if (!projectId) {
-      res.status(400).json({ error: "project id is required" });
+    const projectId = String(req.params.id || "");
+    if (!isUuid(projectId)) {
+      res.status(404).json({ error: "Project not found" });
       return;
     }
 
     const body = req.body ?? {};
-    const name = typeof body.name === "string" ? body.name.trim() : "";
-    if (!name) {
-      res.status(400).json({ error: "name is required" });
-      return;
+    const patch: Record<string, unknown> = {};
+
+    if (typeof body.name === "string" && body.name.trim()) patch.name = body.name.trim();
+    if (body.logoUrl !== undefined) {
+      patch.logo_url = typeof body.logoUrl === "string" && body.logoUrl ? body.logoUrl : null;
     }
-    const logoUrl = typeof body.logoUrl === "string" && body.logoUrl ? body.logoUrl : null;
+    if (body.platforms !== undefined) patch.platforms = toPlatformsColumn(body.platforms);
+    if (typeof body.description === "string") patch.description = body.description;
+    if (typeof body.sessionId === "string" && body.sessionId) patch.session_id = body.sessionId;
+    if (body.visibility !== undefined) {
+      if (body.visibility !== "public" && body.visibility !== "private") {
+        res.status(400).json({ error: "visibility must be 'public' or 'private'" });
+        return;
+      }
+      patch.visibility = body.visibility;
+    }
 
-    // Ownership guard: the row must exist AND belong to the caller.
-    const { data: existing, error: findError } = await supabase
-      .from("projects")
-      .select("id,user_id,name,logo_url,platforms,session_id,created_at,updated_at")
-      .eq("id", projectId)
-      .eq("user_id", req.userId)
-      .maybeSingle();
-
-    if (findError) throw new Error(`find project: ${findError.message}`);
-    if (!existing) {
-      res.status(404).json({ error: "Project not found" });
+    if (Object.keys(patch).length === 0) {
+      res.status(400).json({ error: "No updatable fields provided" });
       return;
     }
 
     const { data, error } = await supabase
       .from("projects")
-      .update({
-        name,
-        logo_url: logoUrl,
-        platforms: toPlatformsColumn(body.platforms) ?? existing.platforms,
-      })
+      .update({ ...patch, updated_at: new Date().toISOString() })
       .eq("id", projectId)
       .eq("user_id", req.userId)
-      .select("id,name,logo_url,platforms,session_id,created_at,updated_at")
-      .single();
+      .select("id,name,logo_url,platforms,session_id,description,visibility,updated_at")
+      .maybeSingle();
 
     if (error) throw new Error(`update project: ${error.message}`);
+    if (!data) {
+      res.status(404).json({ error: "Project not found (or not yours)" });
+      return;
+    }
 
-    res.status(200).json({
+    res.json({
       project: {
         id: data.id,
         name: data.name,
         logoUrl: data.logo_url,
         platforms: toPlatformsArray(data.platforms),
         sessionId: data.session_id,
-        createdAt: data.created_at,
+        description: data.description,
+        visibility: data.visibility,
         updatedAt: data.updated_at,
       },
     });
@@ -247,115 +339,237 @@ router.put("/projects/:id", async (req: Request, res: Response, next: NextFuncti
   }
 });
 
+// ─── GET /api/db/templates/:projectId — template detail page (Task 50) ────
+// Public (or owned-by-caller) project + creator + contributors. The response
+// carries the sandbox coordinates so the studio can open the SHARED code.
+
+router.get("/templates/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const projectId = String(req.params.projectId || "");
+    if (!isUuid(projectId)) {
+      res.status(404).json({ error: "Template not found" });
+      return;
+    }
+
+    const { data: project, error } = await supabase
+      .from("projects")
+      .select("id,user_id,name,description,logo_url,session_id,sandbox_id,visibility")
+      .eq("id", projectId)
+      .maybeSingle();
+
+    if (error) throw new Error(`template lookup: ${error.message}`);
+    if (!project) {
+      res.status(404).json({ error: "Template not found" });
+      return;
+    }
+    if (project.visibility !== "public" && project.user_id !== req.userId) {
+      // Owner may inspect their own (private) template page; everyone else 403.
+      res.status(403).json({ error: "Forbidden — project belongs to another user" });
+      return;
+    }
+
+    // Creator identity.
+    const { data: creatorRow, error: creatorError } = await supabase
+      .from("users")
+      .select("id,email")
+      .eq("id", project.user_id)
+      .maybeSingle();
+    if (creatorError) {
+      logger.warn({ err: creatorError.message }, "template detail: creator lookup failed");
+    }
+
+    // Contributors (chronological — the collaboration story of the project).
+    const { data: contribRows, error: contribError } = await supabase
+      .from("project_contributors")
+      .select("user_id,user_email,contributed_at")
+      .eq("project_id", project.id)
+      .order("contributed_at", { ascending: true });
+    if (contribError) {
+      logger.warn({ err: contribError.message }, "template detail: contributors lookup failed");
+    }
+
+    res.json({
+      template: {
+        id: project.id,
+        name: project.name,
+        description: project.description,
+        logoUrl: project.logo_url,
+        sessionId: project.session_id,
+        sandboxId: project.sandbox_id,
+        visibility: project.visibility,
+        creator: {
+          userId: project.user_id,
+          email: (creatorRow as { email: string | null } | null)?.email ?? null,
+        },
+        contributors: ((contribRows ?? []) as ContributorRow[]).map(toContributor),
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ─── GET /api/db/sessions/:sessionId — session detail + chat history ───────
+// Task 50: owner path (unchanged shape, per-user messages) + TEMPLATE path
+// — a public project opened by a non-owner returns the SAME shape with
+// messages: [] (their own chat starts fresh; the creator's chat is NEVER
+// leaked) plus isTemplate/owner/contributors.
 
 router.get("/sessions/:sessionId", async (req: Request, res: Response, next: NextFunction) => {
   try {
     const supabase = requireSupabase(res);
     if (!supabase) return;
 
-    // Primary lookup by session_id; fallback to the project UUID for rows
-    // created by direct backend generations (session_id may be null there).
-    // engine_run_* (optional, Forgvi 2.0 run-in-flight record) rides along
-    // so a re-mounted studio can re-attach to a live run.
-    const PROJECT_SESSION_COLUMNS =
-      "id,user_id,name,logo_url,platforms,session_id,sandbox_id,engine_run_id,engine_run_origin,engine_run_status,engine_run_objective";
-    const PROJECT_SESSION_BASE_COLUMNS =
-      "id,user_id,name,logo_url,platforms,session_id,sandbox_id";
-    /** Select with a deploy-order shield: if the engine_run_* columns are
-     *  not on the table yet (schema applied after this deploy), retry with
-     *  the base column set and read engineRun as null — the studio just
-     *  loses re-attach until the columns land, never the whole session. */
-    const selectProject = async (match: { column: "session_id" | "id"; value: string }) => {
-      const full = await supabase
-        .from("projects")
-        .select(PROJECT_SESSION_COLUMNS)
-        .eq(match.column, match.value)
-        .eq("user_id", req.userId)
-        .maybeSingle();
-      if (!full.error) return { data: full.data, error: null };
-      if (full.error.message.includes("engine_run")) {
-        logger.warn("engine_run_* columns missing — get-session degrades to base columns");
-        const base = await supabase
-          .from("projects")
-          .select(PROJECT_SESSION_BASE_COLUMNS)
-          .eq(match.column, match.value)
-          .eq("user_id", req.userId)
-          .maybeSingle();
-        return { data: base.data, error: base.error };
-      }
-      return { data: full.data, error: full.error };
+    const SESSION_COLUMNS = "id,user_id,name,logo_url,platforms,session_id,sandbox_id,visibility";
+    type SessionProject = {
+      id: string;
+      user_id: string;
+      name: string;
+      logo_url: string | null;
+      platforms: string | string[] | null;
+      session_id: string | null;
+      sandbox_id: string | null;
+      visibility: string;
     };
 
-    let { data: project, error } = await selectProject({ column: "session_id", value: String(req.params.sessionId) });
+    // ── 1. OWNER PATH (unchanged shape): the caller's own project by
+    // session_id first, then by project UUID.
+    let { data: project, error } = await supabase
+      .from("projects")
+      .select(SESSION_COLUMNS)
+      .eq("session_id", req.params.sessionId)
+      .eq("user_id", req.userId)
+      .maybeSingle();
 
     if (error) throw new Error(`session lookup: ${error.message}`);
 
-    if (!project) {
-      const fallback = await selectProject({ column: "id", value: String(req.params.sessionId) });
+    if (!project && isUuid(req.params.sessionId)) {
+      const fallback = await supabase
+        .from("projects")
+        .select(SESSION_COLUMNS)
+        .eq("id", req.params.sessionId)
+        .eq("user_id", req.userId)
+        .maybeSingle();
       if (fallback.error) throw new Error(`session lookup: ${fallback.error.message}`);
       project = fallback.data;
     }
 
-    if (!project) {
+    if (project) {
+      const owned = project as SessionProject;
+
+      // Chat history (most recent 200 messages, chronological) — PER-USER
+      // chats now: the creator sees only their own conversation. Legacy rows
+      // written before per-user chats (user_id NULL — only the owner could
+      // write then) are still shown to the owner so nobody loses history.
+      let messages: Array<{ role: string; content: string }> = [];
+      try {
+        const { data: chatRows, error: chatError } = await supabase
+          .from("chat_messages")
+          .select("role,content,created_at")
+          .eq("project_id", owned.id)
+          .or(`user_id.eq.${req.userId},user_id.is.null`)
+          .order("created_at", { ascending: true })
+          .limit(200);
+
+        if (chatError) {
+          logger.warn({ err: chatError.message }, "chat history lookup failed");
+        } else {
+          messages = ((chatRows ?? []) as ChatMessageRow[]).map((m) => ({
+            role: m.role,
+            content: m.content,
+          }));
+        }
+      } catch (err: unknown) {
+        logger.warn({ err: err instanceof Error ? err.message : err }, "chat history lookup failed");
+      }
+
+      res.json({
+        session: {
+          id: owned.session_id || owned.id,
+          title: owned.name,
+          project: {
+            id: owned.id,
+            name: owned.name,
+            logoUrl: owned.logo_url,
+            platforms: toPlatformsArray(owned.platforms),
+            sandboxId: owned.sandbox_id,
+            visibility: owned.visibility,
+          },
+          messages,
+        },
+      });
+      return;
+    }
+
+    // ── 2. TEMPLATE PATH (Task 50): not the owner's project — look the
+    // session/project up WITHOUT the user filter. Public → serve the SHARED
+    // project with an EMPTY chat (the caller's own chat starts fresh; the
+    // creator's chat must NEVER leak). Private/foreign → existing 404.
+    let shared: SessionProject | null = null;
+    const sharedSession = await supabase
+      .from("projects")
+      .select(SESSION_COLUMNS)
+      .eq("session_id", req.params.sessionId)
+      .maybeSingle();
+    if (sharedSession.error) {
+      throw new Error(`session lookup: ${sharedSession.error.message}`);
+    }
+    shared = (sharedSession.data ?? null) as SessionProject | null;
+
+    if (!shared && isUuid(req.params.sessionId)) {
+      const byId = await supabase
+        .from("projects")
+        .select(SESSION_COLUMNS)
+        .eq("id", req.params.sessionId)
+        .maybeSingle();
+      if (byId.error) throw new Error(`session lookup: ${byId.error.message}`);
+      shared = (byId.data ?? null) as SessionProject | null;
+    }
+
+    if (!shared || shared.visibility !== "public") {
       res.status(404).json({ error: "Session not found" });
       return;
     }
 
-    // Chat history (most recent 200 messages, chronological).
-    let messages: Array<{ role: string; content: string }> = [];
+    // Contributors (chronological) — the collaboration story of the template.
+    let contributors: Array<ReturnType<typeof toContributor>> = [];
     try {
-      const { data: chatRows, error: chatError } = await supabase
-        .from("chat_messages")
-        .select("role,content,created_at")
-        .eq("project_id", project.id)
-        .order("created_at", { ascending: true })
-        .limit(200);
-
-      if (chatError) {
-        logger.warn({ err: chatError.message }, "chat history lookup failed");
+      const { data: contribRows, error: contribError } = await supabase
+        .from("project_contributors")
+        .select("user_id,user_email,contributed_at")
+        .eq("project_id", shared.id)
+        .order("contributed_at", { ascending: true });
+      if (contribError) {
+        logger.warn({ err: contribError.message }, "template session: contributors lookup failed");
       } else {
-        messages = ((chatRows ?? []) as ChatMessageRow[]).map((m) => ({
-          role: m.role,
-          content: m.content,
-        }));
+        contributors = ((contribRows ?? []) as ContributorRow[]).map(toContributor);
       }
     } catch (err: unknown) {
-      logger.warn({ err: err instanceof Error ? err.message : err }, "chat history lookup failed");
+      logger.warn({ err: err instanceof Error ? err.message : err }, "template session: contributors lookup failed");
     }
-
-    // The Forgvi 2.0 run-in-flight record — surfaced ONLY while the run
-    // is still going (terminal statuses settle the row and read as null
-    // here, so a remount never re-attaches a finished run).
-    const engineRunCols = project as unknown as {
-      engine_run_id?: string | null;
-      engine_run_origin?: string | null;
-      engine_run_status?: string | null;
-      engine_run_objective?: string | null;
-    };
-    const engineRun =
-      engineRunCols.engine_run_id && engineRunCols.engine_run_status === "running"
-        ? {
-            runId: engineRunCols.engine_run_id,
-            origin: engineRunCols.engine_run_origin === "vm" ? ("vm" as const) : ("render" as const),
-            status: "running",
-            objective: engineRunCols.engine_run_objective ?? null,
-          }
-        : null;
 
     res.json({
       session: {
-        id: project.session_id || project.id,
-        title: project.name,
+        id: shared.session_id || shared.id,
+        title: shared.name,
         project: {
-          id: project.id,
-          name: project.name,
-          logoUrl: project.logo_url,
-          platforms: toPlatformsArray(project.platforms),
-          sandboxId: project.sandbox_id,
-          engineRun,
+          id: shared.id,
+          name: shared.name,
+          logoUrl: shared.logo_url,
+          platforms: toPlatformsArray(shared.platforms),
+          sandboxId: shared.sandbox_id,
+          visibility: shared.visibility,
         },
-        messages,
+        // The caller's OWN chat on the shared project — starts fresh. The
+        // real history (if any) is loaded per-user via the db-ops
+        // get-messages action with the user_id filter.
+        messages: [],
+        isTemplate: true,
+        owner: false,
+        contributors,
       },
     });
   } catch (error) {
