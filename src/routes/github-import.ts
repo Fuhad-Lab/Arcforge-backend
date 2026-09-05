@@ -48,7 +48,9 @@ import { getServiceSupabase } from "../lib/supabase-db";
 import { SKIP_DIRS, TEXT_EXTENSIONS, TEXT_FILENAMES } from "../services/github-filters";
 
 const router: IRouter = Router();
-router.use(requireAuth);
+// Path-scoped auth (see connectors.ts note): this router mounts
+// unprefixed, so gate only its own route family.
+router.use("/github", requireAuth);
 
 const GITHUB_API_BASE = "https://api.github.com";
 const GH_FETCH_TIMEOUT_MS = 30_000;

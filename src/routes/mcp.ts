@@ -15,7 +15,9 @@ const execFileAsync = promisify(execFile);
 const router: IRouter = Router();
 
 // JWT auth at the router level — these routes were previously fully public.
-router.use(requireAuth);
+// Path-scoped auth (see connectors.ts note): this router mounts
+// unprefixed, so gate only its own route family.
+router.use("/mcp", requireAuth);
 
 // ─── RESOURCES ────────────────────────────────────────────────────────
 

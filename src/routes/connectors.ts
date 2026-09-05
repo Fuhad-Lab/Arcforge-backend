@@ -378,7 +378,11 @@ router.get("/connectors/callback", async (req: Request, res: Response) => {
 // Authenticated routes below this line — every connector operation is
 // authorized for the caller's user. Subagent capability declarations are
 // resolved through the SAME vault (no bypass path exists).
-router.use(requireAuth);
+// Path-scoped auth: this router is mounted WITHOUT a path prefix in
+// routes/index.ts, so a bare router.use(requireAuth) here would gate EVERY
+// /api/* request (it broke the auth-exempt /api/db/templates listing).
+// Scope it to this router's own route family instead.
+router.use("/connectors", requireAuth);
 
 /** ── LIST ─────────────────────────────────────────────────────────── */
 router.get("/connectors", async (req: Request, res: Response) => {
