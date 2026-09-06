@@ -280,7 +280,14 @@ router.get("/auth/github/callback", async (req: Request, res: Response) => {
     const otc = stashSession({
       accessToken: session.access_token,
       refreshToken: session.refresh_token,
-      expiresAt: session.expires_at ?? Date.now() + 3600_000,
+      // expires_at is UNIX SECONDS (Supabase/GoTrue convention) — the
+      // fallback must match the unit, or the client would treat the token
+      // as valid for ~1800 years and never refresh it.
+      expiresAt:
+        session.expires_at ??
+        (session.expires_in && session.expires_in > 0
+          ? Math.floor(Date.now() / 1000) + session.expires_in
+          : Math.floor(Date.now() / 1000) + 3600),
       userId: session.user?.id ?? "",
       email: session.user?.email ?? email,
     });
