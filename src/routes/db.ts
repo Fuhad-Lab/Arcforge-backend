@@ -89,6 +89,186 @@ router.get("/templates", async (req: Request, res: Response, next: NextFunction)
   }
 });
 
+// ─── GET /api/db/showcase — published-app index (sitemap feed) ───────────
+// PUBLISH/SHOWCASE LOOP (SEO growth loop): every PUBLISHED project, newest
+// first. "Published" = slug IS NOT NULL AND visibility = 'public' — the
+// studio Publish button sets both atomically. This feeds the dynamic
+// sitemap (app/sitemap.xml/route.ts) so Google discovers every user app.
+//
+// AUTH-EXEMPT (registered BEFORE requireAuth): the sitemap + showcase pages
+// are crawled anonymously by Googlebot — no JWT exists on those requests.
+// Creator emails are MASKED: showcase pages get indexed by search engines,
+// and full inboxes on a public SEO page would be a harvesting gift.
+
+const SHOWCASE_COLUMNS = "id,slug,name,description,logo_url,session_id,visibility,published_at,updated_at";
+
+type ShowcaseRow = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  logo_url: string | null;
+  session_id: string | null;
+  visibility: string;
+  published_at: string | null;
+  updated_at: string;
+};
+
+/** Slug format guard — anything else 404s before it ever reaches Postgres. */
+function isSlug(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
+}
+
+/** Mask an email for public/SEO surfaces: "fuhaddesmond145@gmail.com" → "fuh•••••@gmail.com". */
+function maskEmail(email: string | null | undefined): string | null {
+  if (!email || !email.includes("@")) return null;
+  const [local, domain] = email.split("@");
+  if (!local || !domain) return null;
+  const head = local.slice(0, 3);
+  return `${head}${local.length > 3 ? "•••" : ""}@${domain}`;
+}
+
+router.get("/showcase", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const { data, error } = await supabase
+      .from("projects")
+      .select(SHOWCASE_COLUMNS)
+      .not("slug", "is", null)
+      .eq("visibility", "public")
+      .order("published_at", { ascending: false, nullsFirst: false })
+      .limit(500);
+
+    if (error) throw new Error(`showcase list: ${error.message}`);
+
+    const rows = (data ?? []) as ShowcaseRow[];
+    res.json({
+      projects: rows.map((row) => ({
+        slug: row.slug,
+        name: row.name,
+        description: row.description,
+        logoUrl: row.logo_url,
+        sessionId: row.session_id,
+        publishedAt: row.published_at,
+        updatedAt: row.updated_at,
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── GET /api/db/showcase/:slug — the public showcase page payload ────────
+// Server-rendered page data (app/showcase/[slug]/page.tsx): metadata the
+// crawler reads + a previewAvailable flag (the HTML snapshot is fetched
+// separately by the /preview route so the page payload stays light).
+// Private/never-published projects simply do not match → 404.
+
+router.get("/showcase/:slug", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const slug = String(req.params.slug || "");
+    if (!isSlug(slug)) {
+      res.status(404).json({ error: "Showcase app not found" });
+      return;
+    }
+
+    const { data: row, error } = await supabase
+      .from("projects")
+      .select(`${SHOWCASE_COLUMNS},user_id,preview_html,project_contributors(count)`)
+      .eq("slug", slug)
+      .eq("visibility", "public")
+      .not("slug", "is", null)
+      .maybeSingle();
+
+    if (error) throw new Error(`showcase lookup: ${error.message}`);
+    if (!row) {
+      res.status(404).json({ error: "Showcase app not found" });
+      return;
+    }
+
+    const project = row as ShowcaseRow & {
+      user_id: string;
+      preview_html: string | null;
+      project_contributors: Array<{ count: number }> | null;
+    };
+
+    // Creator identity (masked) — one lookup, missing row tolerated.
+    let creatorMasked: string | null = null;
+    const { data: creatorRow, error: creatorError } = await supabase
+      .from("users")
+      .select("email")
+      .eq("id", project.user_id)
+      .maybeSingle();
+    if (creatorError) {
+      logger.warn({ err: creatorError.message }, "showcase: creator lookup failed");
+    } else {
+      creatorMasked = maskEmail((creatorRow as { email: string | null } | null)?.email);
+    }
+
+    res.json({
+      showcase: {
+        id: project.id,
+        slug: project.slug,
+        name: project.name,
+        description: project.description,
+        logoUrl: project.logo_url,
+        sessionId: project.session_id,
+        creatorEmail: creatorMasked,
+        contributorsCount: project.project_contributors?.[0]?.count ?? 0,
+        previewAvailable: Boolean(project.preview_html),
+        publishedAt: project.published_at,
+        updatedAt: project.updated_at,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── GET /api/db/showcase/:slug/preview — the publish-time HTML snapshot ────
+// Serves ONLY the stored preview_html (the exact document the studio
+// Preview tab showed when the owner hit Publish) for the iframe embed.
+// Kept separate from the page payload so crawlers never download megabytes
+// of transpiled app code while indexing the page metadata.
+
+router.get("/showcase/:slug/preview", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const slug = String(req.params.slug || "");
+    if (!isSlug(slug)) {
+      res.status(404).json({ error: "Showcase app not found" });
+      return;
+    }
+
+    const { data: row, error } = await supabase
+      .from("projects")
+      .select("slug,visibility,preview_html")
+      .eq("slug", slug)
+      .eq("visibility", "public")
+      .not("slug", "is", null)
+      .maybeSingle();
+
+    if (error) throw new Error(`showcase preview: ${error.message}`);
+    if (!row) {
+      res.status(404).json({ error: "Showcase app not found" });
+      return;
+    }
+
+    res.json({
+      previewHtml: (row as { preview_html: string | null }).preview_html ?? "",
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // JWT auth on every /api/db route.
 router.use(requireAuth);
 
@@ -313,7 +493,7 @@ router.put("/projects/:id", async (req: Request, res: Response, next: NextFuncti
       .update({ ...patch, updated_at: new Date().toISOString() })
       .eq("id", projectId)
       .eq("user_id", req.userId)
-      .select("id,name,logo_url,platforms,session_id,description,visibility,updated_at")
+      .select("id,name,logo_url,platforms,session_id,description,visibility,slug,published_at,updated_at")
       .maybeSingle();
 
     if (error) throw new Error(`update project: ${error.message}`);
@@ -331,7 +511,154 @@ router.put("/projects/:id", async (req: Request, res: Response, next: NextFuncti
         sessionId: data.session_id,
         description: data.description,
         visibility: data.visibility,
+        slug: (data as { slug: string | null }).slug,
+        publishedAt: (data as { published_at: string | null }).published_at,
         updatedAt: data.updated_at,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── POST /api/db/projects/:id/publish — flip a project LIVE (SEO loop) ────
+// The studio Publish button: mints the project's PERMANENT showcase slug
+// (stable across re-publishes — Google-indexed URLs must never break),
+// forces visibility=public, stamps published_at, and refreshes the app
+// snapshot (preview_html = exactly what the studio Preview tab shows).
+//
+// Slug minting: slugify(name) → numeric suffixes on collision → short random
+// suffix after 5 tries. A project keeps the slug it already has.
+
+/** URL-safe slug from a project name ("Invoice Calculator!" → "invoice-calculator"). */
+function slugifyName(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || "app";
+}
+
+/** Mint a slug that no OTHER project holds (uniqueness via the partial unique index). */
+async function mintUniqueSlug(
+  supabase: NonNullable<ReturnType<typeof getServiceSupabase>>,
+  name: string,
+): Promise<string> {
+  const base = slugifyName(name);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate =
+      attempt === 0
+        ? base
+        : attempt < 5
+          ? `${base}-${attempt + 1}`
+          : `${base}-${Math.random().toString(36).slice(2, 6)}`;
+    const { data, error } = await supabase
+      .from("projects")
+      .select("id")
+      .eq("slug", candidate)
+      .maybeSingle();
+    if (error) throw new Error(`slug mint: ${error.message}`);
+    if (!data) return candidate;
+  }
+  // All 8 candidates collided (practically impossible) — time-based fallback.
+  return `${base}-${Date.now().toString(36)}`;
+}
+
+router.post("/projects/:id/publish", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const projectId = String(req.params.id || "");
+    if (!isUuid(projectId)) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const patch: Record<string, unknown> = {};
+
+    // App snapshot — the exact document the studio Preview tab renders.
+    // Capped at 2MB; an absent/empty string CLEARS the stored snapshot
+    // (honest: nothing to show), undefined keeps the previous one.
+    if (body.previewHtml !== undefined) {
+      if (typeof body.previewHtml !== "string") {
+        res.status(400).json({ error: "previewHtml must be a string" });
+        return;
+      }
+      if (body.previewHtml.length > 2_000_000) {
+        res.status(400).json({ error: "Preview snapshot too large (2MB limit)" });
+        return;
+      }
+      patch.preview_html = body.previewHtml.length > 0 ? body.previewHtml : null;
+    }
+    if (typeof body.description === "string") {
+      patch.description = body.description.trim().slice(0, 280) || null;
+    }
+
+    // The project must belong to the caller — foreign publishes are silent 404s.
+    const { data: existing, error: loadError } = await supabase
+      .from("projects")
+      .select("id,name,slug")
+      .eq("id", projectId)
+      .eq("user_id", req.userId)
+      .maybeSingle();
+    if (loadError) throw new Error(`publish: project lookup: ${loadError.message}`);
+    if (!existing) {
+      res.status(404).json({ error: "Project not found (or not yours)" });
+      return;
+    }
+
+    // Stable slug: reuse the one Google already indexed; mint only on first publish.
+    const existingRow = existing as { id: string; name: string; slug: string | null };
+    const slug = existingRow.slug ?? (await mintUniqueSlug(supabase, existingRow.name));
+
+    const { data, error } = await supabase
+      .from("projects")
+      .update({
+        ...patch,
+        slug,
+        visibility: "public",
+        published_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", projectId)
+      .eq("user_id", req.userId)
+      .select("id,name,slug,description,logo_url,session_id,visibility,published_at,updated_at")
+      .maybeSingle();
+
+    if (error) throw new Error(`publish: ${error.message}`);
+    if (!data) {
+      res.status(404).json({ error: "Project not found (or not yours)" });
+      return;
+    }
+
+    const published = data as {
+      id: string;
+      name: string;
+      slug: string;
+      description: string | null;
+      logo_url: string | null;
+      session_id: string | null;
+      visibility: string;
+      published_at: string | null;
+      updated_at: string;
+    };
+
+    res.json({
+      project: {
+        id: published.id,
+        name: published.name,
+        slug: published.slug,
+        description: published.description,
+        logoUrl: published.logo_url,
+        sessionId: published.session_id,
+        visibility: published.visibility,
+        publishedAt: published.published_at,
+        updatedAt: published.updated_at,
+        showcasePath: `/showcase/${published.slug}`,
       },
     });
   } catch (error) {
@@ -423,7 +750,10 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
     const supabase = requireSupabase(res);
     if (!supabase) return;
 
-    const SESSION_COLUMNS = "id,user_id,name,logo_url,platforms,session_id,sandbox_id,visibility";
+    // slug + published_at ride along so the studio Publish button can show
+    // its LIVE state without an extra round-trip.
+    const SESSION_COLUMNS =
+      "id,user_id,name,logo_url,platforms,session_id,sandbox_id,visibility,slug,published_at";
     type SessionProject = {
       id: string;
       user_id: string;
@@ -433,6 +763,8 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
       session_id: string | null;
       sandbox_id: string | null;
       visibility: string;
+      slug: string | null;
+      published_at: string | null;
     };
 
     // ── 1. OWNER PATH (unchanged shape): the caller's own project by
@@ -497,6 +829,8 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
             platforms: toPlatformsArray(owned.platforms),
             sandboxId: owned.sandbox_id,
             visibility: owned.visibility,
+            slug: owned.slug,
+            publishedAt: owned.published_at,
           },
           messages,
         },
@@ -562,6 +896,8 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
           platforms: toPlatformsArray(shared.platforms),
           sandboxId: shared.sandbox_id,
           visibility: shared.visibility,
+          slug: shared.slug,
+          publishedAt: shared.published_at,
         },
         // The caller's OWN chat on the shared project — starts fresh. The
         // real history (if any) is loaded per-user via the db-ops
