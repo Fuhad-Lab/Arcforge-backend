@@ -761,4 +761,186 @@ router.get("/account/export", async (req: Request, res: Response, next: NextFunc
   }
 });
 
+// ─── GET /api/db/messages/:projectId — per-user chat persistence ───────────
+// Architecture note: the db-ops EDGE function forwards here. Only THIS
+// backend touches the Supabase database — the edge function is a pure
+// proxy (user mandate). The logic mirrors the previous edge-side
+// implementation exactly: the owner OR any authenticated user on a PUBLIC
+// project (templates) may read/write; chats are PER-USER (the creator's
+// conversation never displays to anyone else); a non-owner's chat counts
+// as a contribution (project_contributors upsert, best-effort).
+router.get("/messages/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const projectId = String(req.params.projectId || "");
+    if (!isUuid(projectId)) {
+      res.status(400).json({ error: "A valid projectId is required." });
+      return;
+    }
+
+    const access = await resolveProjectAccess(supabase, projectId, req.userId);
+    if (!access) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+
+    const { data: rows, error } = await supabase
+      .from("chat_messages")
+      .select("role,content,meta,created_at")
+      .eq("project_id", projectId)
+      // Owner also matches legacy user_id-NULL rows (pre-per-user era);
+      // non-owners are matched STRICTLY — the creator's chat never leaks.
+      .or(
+        access.isOwner
+          ? `user_id.eq.${req.userId},user_id.is.null`
+          : `user_id.eq.${req.userId}`,
+      )
+      .order("created_at", { ascending: true })
+      .limit(2000);
+
+    if (error) throw new Error(`messages read: ${error.message}`);
+
+    res.json({
+      messages: ((rows ?? []) as Array<ChatMessageRow & { meta: unknown }>).map((m) => ({
+        role: m.role,
+        content: m.content,
+        meta: m.meta ?? null,
+      })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── PUT /api/db/messages/:projectId — replace the CALLER's conversation ───
+// The frontend always sends the full current message list — delete the
+// caller's rows then insert (idempotent). project_id and user_id are
+// forced SERVER-side; only role/content/meta come from the payload.
+router.put("/messages/:projectId", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const supabase = requireSupabase(res);
+    if (!supabase) return;
+
+    const projectId = String(req.params.projectId || "");
+    if (!isUuid(projectId)) {
+      res.status(400).json({ error: "A valid projectId is required." });
+      return;
+    }
+
+    const access = await resolveProjectAccess(supabase, projectId, req.userId);
+    if (!access) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+
+    const raw = (req.body || {}) as { messages?: unknown };
+    if (!Array.isArray(raw.messages)) {
+      res.status(400).json({ error: "messages must be an array" });
+      return;
+    }
+    // Sanitize rows — only role/content/meta are stored.
+    const rows: Array<{ role: string; content: string; meta: Record<string, unknown> | null }> = [];
+    for (const m of raw.messages) {
+      if (!m || typeof m !== "object") continue;
+      const obj = m as Record<string, unknown>;
+      const role = typeof obj.role === "string" ? obj.role.slice(0, 32) : "assistant";
+      const content = typeof obj.content === "string" ? obj.content.slice(0, 200_000) : "";
+      const meta =
+        obj.meta && typeof obj.meta === "object" && !Array.isArray(obj.meta)
+          ? (obj.meta as Record<string, unknown>)
+          : null;
+      rows.push({ role, content, meta });
+    }
+
+    // 1. Delete ONLY the caller's existing messages for this project.
+    //    (Filters AND-compose: project_id = X AND (user_id = caller [OR
+    //    user_id IS NULL for the owner's legacy rows]).)
+    let del = supabase
+      .from("chat_messages")
+      .delete()
+      .eq("project_id", projectId)
+      .eq("user_id", req.userId);
+    if (access.isOwner) {
+      // The owner's scope also clears legacy user_id-NULL rows — rows they
+      // are about to rewrite with their user_id stamped.
+      del = supabase
+        .from("chat_messages")
+        .delete()
+        .eq("project_id", projectId)
+        .or(`user_id.eq.${req.userId},user_id.is.null`);
+    }
+    const delRes = await del;
+    if (delRes.error) throw new Error(`messages clear: ${delRes.error.message}`);
+
+    // 2. Insert the caller's new conversation with their user_id stamped.
+    if (rows.length > 0) {
+      const ins = await supabase
+        .from("chat_messages")
+        .insert(
+          rows.map((r) => ({
+            project_id: projectId,
+            user_id: req.userId,
+            role: r.role,
+            content: r.content,
+            meta: r.meta,
+          })),
+        );
+      if (ins.error) throw new Error(`messages write: ${ins.error.message}`);
+    }
+
+    // 3. Contributor upsert — a non-owner's chat IS their contribution
+    //    (best-effort: never fails the save).
+    if (!access.isOwner) {
+      try {
+        await supabase
+          .from("project_contributors")
+          .upsert(
+            {
+              project_id: projectId,
+              user_id: req.userId,
+              user_email: req.userEmail ?? null,
+              contributed_at: new Date().toISOString(),
+            },
+            { onConflict: "project_id,user_id" },
+          );
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : err },
+          "contributor upsert failed (non-fatal)",
+        );
+      }
+    }
+
+    res.json({ ok: true, count: rows.length });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/** Shared access probe for the per-user chat routes: the project must
+ *  exist AND the caller must be the owner or the project must be public. */
+async function resolveProjectAccess(
+  supabase: ReturnType<typeof getServiceSupabase>,
+  projectId: string,
+  userId: string | undefined,
+): Promise<{ isOwner: boolean } | null> {
+  if (!userId) return null;
+  const { data, error } = await supabase
+    .from("projects")
+    .select("id,user_id,visibility")
+    .eq("id", projectId)
+    .maybeSingle();
+  if (error) {
+    logger.warn({ err: error.message }, "messages access probe failed");
+    return null;
+  }
+  if (!data) return null;
+  const row = data as { id: string; user_id: string; visibility: string };
+  const isOwner = row.user_id === userId;
+  if (!isOwner && row.visibility !== "public") return null;
+  return { isOwner };
+}
+
 export default router;

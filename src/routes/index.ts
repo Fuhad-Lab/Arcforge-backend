@@ -8,6 +8,7 @@ import dbRouter from "./db";
 import llmRouter from "./llm";
 import tunnelWakeRouter from "./tunnel-wake";
 import authOauthRouter from "./auth-oauth";
+import authSessionRouter from "./auth-session";
 import connectorsRouter from "./connectors";
 import githubImportRouter from "./github-import";
 
@@ -26,6 +27,11 @@ router.use(tunnelWakeRouter);
 // /api/auth/github/* — GitHub Sign-In (edge-relayed; anonymous-safe routes:
 // signed OAuth state + single-use one-time codes provide the security).
 router.use(authOauthRouter);
+
+// /api/auth/session/* — email/password session management (edge-relayed;
+// anonymous-safe by design — the credential check IS the security, with
+// per-email/IP rate limiting layered on top).
+router.use(authSessionRouter);
 
 // /api/connectors/* — generic connector system (GROUP 2). The OAuth
 // callback inside is public-by-design (signed state); everything else
