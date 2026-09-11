@@ -13,7 +13,16 @@
  * Chief Agent pipeline, the routes, or the frontend contract.
  */
 
-export type ConnectorAuthMethod = "oauth_supabase" | "oauth_github_app";
+export type ConnectorAuthMethod =
+  | "oauth_supabase"
+  | "oauth_github_app"
+  | "oauth_github";
+
+/** Which Supabase Edge Function is the OAuth provider's REGISTERED
+ *  callback target for this connector. The redirect_uri sent at authorize
+ *  and exchange time is resolved from this — it must match the callback
+ *  URL registered on the provider's app exactly. */
+export type ConnectorRedirectKind = "connector-ops" | "auth-oauth";
 
 export interface ConnectorCapability {
   /** Capability identifier, e.g. "supabase.database.write". */
@@ -33,6 +42,8 @@ export interface ConnectorDefinition {
   /** OAuth mechanism this connector uses (generic flow, no provider-specific
    *  logic leaks into the Chief Agent — only this registry knows it). */
   authMethod: ConnectorAuthMethod;
+  /** Registered OAuth callback edge function (see ConnectorRedirectKind). */
+  redirectKind: ConnectorRedirectKind;
   /** Capability catalogue the agent may request. */
   capabilities: ConnectorCapability[];
   /** Whether delegated subagents may be granted scoped access. */
@@ -41,8 +52,12 @@ export interface ConnectorDefinition {
    *  (Render environment variables — never in source, never in the frontend). */
   envClientId: string;
   envClientSecret: string;
-  /** Additional OAuth authorize scopes (GitHub sign-in only; Supabase scopes
-   *  are configured on the OAuth app itself — the scope param is deprecated). */
+  /**
+   * Additional OAuth authorize scopes. Used by "oauth_github" (classic
+   * OAuth App flow — scopes are requested per-authorization); Supabase
+   * scopes are configured on the OAuth app itself (the scope param is
+   * deprecated) and GitHub App permissions are baked into the app.
+   */
   authorizeScopes?: string;
   /** Backend tool / MCP capability this connector unlocks. */
   mcpCapability: string;
@@ -57,6 +72,7 @@ export const CONNECTORS: ConnectorDefinition[] = [
       "behalf through the official Supabase MCP server.",
     category: "Database",
     authMethod: "oauth_supabase",
+    redirectKind: "connector-ops",
     delegationSupported: true,
     envClientId: "SUPABASE_OAUTH_CLIENT_ID",
     envClientSecret: "SUPABASE_OAUTH_CLIENT_SECRET",
@@ -84,12 +100,23 @@ export const CONNECTORS: ConnectorDefinition[] = [
     name: "GitHub",
     description:
       "Import repositories, sync workspace code, and manage repos through the " +
-      "Forge-AI App Builder GitHub App.",
+      "Forgeyn GitHub connection.",
     category: "Code",
-    authMethod: "oauth_github_app",
+    // 2026-09-12 (user fix): the GitHub App client secret stored in env was
+    // found INVALID against GitHub ("incorrect_client_credentials" — verified
+    // live), so every token exchange failed and the connector read as broken
+    // even though consent worked. The GitHub connector now runs on the
+    // VERIFIED-WORKING classic OAuth App pair (GITHUB_SIGNIN_* — the same
+    // credentials GitHub Sign-In uses, proven valid in production) with
+    // explicit repo scopes. The "oauth_github_app" flow stays supported for
+    // future connectors; if the App secret is ever regenerated, its flow can
+    // return without pipeline changes.
+    authMethod: "oauth_github",
+    redirectKind: "auth-oauth",
     delegationSupported: true,
-    envClientId: "GITHUB_APP_CLIENT_ID",
-    envClientSecret: "GITHUB_APP_CLIENT_SECRET",
+    envClientId: "GITHUB_SIGNIN_CLIENT_ID",
+    envClientSecret: "GITHUB_SIGNIN_CLIENT_SECRET",
+    authorizeScopes: "read:user user:email repo",
     mcpCapability: "github-rest",
     capabilities: [
       {

@@ -9,8 +9,8 @@
  * Every agent invocation (Chief Agent OR delegated subagent) declares
  * REQUIRED CAPABILITIES; resolveCapability() maps them to connectors and
  * the vault decides authorization. No provider-specific logic exists
- * outside the registry — future connectors register without touching the
- * Chief Agent pipeline.
+ * outside the registry/connector-oauth — future connectors register
+ * without touching the Chief Agent pipeline.
  *
  * Routes (all under /api, mounted in routes/index.ts):
  *   GET  /connectors                      → sanitized list + per-user status
@@ -21,6 +21,11 @@
  *   POST /connectors/:id/disconnect       → revoke
  *   POST /connectors/:id/decline          → agent-initiated request cancelled
  *
+ * OAuth round-trip mechanics live in services/connector-oauth.ts (shared
+ * with the auth-oauth callback route — the github connector's registered
+ * callback edge function is auth-oauth, so its codes land there; see the
+ * registry's redirectKind).
+ *
  * Tokens: AES-256-GCM at rest in public.connector_connections (RLS enabled,
  * zero policies — service-role only). Refreshed on use (Supabase OAuth tokens
  * are short-lived). NEVER returned to the frontend, never logged, never
@@ -30,8 +35,6 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
 import { requireAuth } from "../middleware/auth";
-import { getProjectRow } from "../lib/project-lookup";
-import { getAgentInfo } from "../services/daytona-workspace";
 import {
   CONNECTORS,
   connectorCredentials,
@@ -44,154 +47,20 @@ import {
   getConnection,
   getTokens,
   markConnectionStatus,
-  mintState,
-  upsertConnection,
-  verifyState,
-  expiryDate,
 } from "../services/connector-vault";
+import {
+  allowedLandingBase,
+  buildAuthorizeUrl,
+  completeConnectorOAuth,
+  mintConnectorState,
+  notifySidecarConnector,
+  preflightAuthorize,
+  safeReturnPath,
+} from "../services/connector-oauth";
 
 const router: IRouter = Router();
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const EDGE_BASE = process.env.EDGE_FUNCTION_BASE_URL || "";
-
-function connectorCallbackUrl(): string {
-  if (EDGE_BASE) return `${EDGE_BASE.replace(/\/+$/, "")}/connector-ops`;
-  if (SUPABASE_URL) return `${SUPABASE_URL.replace(/\/+$/, "")}/functions/v1/connector-ops`;
-  return "https://arcforge-edge.invalid/functions/v1/connector-ops";
-}
-
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://forgeyn.com.ng";
-
-/** ORIGIN-AWARE LANDING (user fix 2026-09-11): the OAuth round-trip must
- *  return users to the origin they started from. forgeyn.com.ng is the
- *  canonical public domain (the frontend hardcodes nothing — it sends
- *  window.location.origin on authorize); extra origins can be allow
- *  listed without a redeploy via the FRONTEND_ORIGINS env var
- *  (comma-separated absolute origins, no trailing slash). */
-const CANONICAL_FRONTEND_ORIGINS = [
-  "https://forgeyn.com.ng",
-  "https://www.forgeyn.com.ng",
-  ...(process.env.FRONTEND_ORIGINS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
-];
-
-/** Validate a caller-supplied origin for post-OAuth landing. Accepted:
- *  the canonical public domain(s), the configured FRONTEND_URL, any
- *  FRONTEND_ORIGINS entry, and the platform/dev suffix hosts. Anything
- *  else falls back to FRONTEND_URL — never an open redirect. */
-function allowedLandingBase(raw: string | undefined | null): string {
-  if (!raw) return FRONTEND_URL;
-  try {
-    const url = new URL(raw);
-    const origin = url.origin;
-    if (
-      (url.protocol === "https:" && CANONICAL_FRONTEND_ORIGINS.includes(origin)) ||
-      (url.protocol === "https:" && origin === new URL(FRONTEND_URL).origin)
-    ) {
-      return origin;
-    }
-    const host = url.hostname;
-    if (
-      (url.protocol === "https:" &&
-        (host.endsWith(".onrender.com") || host.endsWith(".arcforge.app") || host.endsWith(".vercel.app"))) ||
-      (url.protocol === "http:" && (host === "localhost" || host === "127.0.0.1"))
-    ) {
-      return origin;
-    }
-  } catch {
-    /* malformed — fall through */
-  }
-  return FRONTEND_URL;
-}
-
-/** In-VM sidecar delivery timeout (local HTTP inside the VM via the
- *  preview URL — same budget as workspace.ts's secrets route). */
-const SIDECAR_NOTIFY_TIMEOUT_MS = 20_000;
-
-/** ── VM NOTIFICATION (GROUP 2 session 2) ─────────────────────────────
- *  Resolve the project's sandbox → VM sidecar url+token (same brokering
- *  as workspace.ts postSecretToSidecar) and POST /internal/connectors so
- *  the blocked request_connector tool call wakes and the paused task
- *  resumes. Ownership is enforced: the project row's user_id MUST match
- *  `userId` (the HMAC-signed state identity on the public callback path;
- *  req.userId on the authenticated decline path). Failures are logged
- *  honestly and NEVER fail the caller — the connection itself already
- *  succeeded; only the task resume degrades. */
-async function notifySidecarConnector(
-  userId: string,
-  projectId: string | undefined,
-  payload: { request_id?: string; granted?: boolean; declined?: boolean; capability?: string; detail?: string },
-): Promise<void> {
-  if (!projectId) {
-    logger.warn(
-      { userId, requestId: payload.request_id ?? null },
-      "connector-resume: no projectId in the request context — the sidecar was not notified",
-    );
-    return;
-  }
-  try {
-    const row = await getProjectRow(projectId);
-    if (!row) {
-      logger.warn(
-        { userId, projectId, requestId: payload.request_id ?? null },
-        "connector-resume: project row not found — the sidecar was not notified",
-      );
-      return;
-    }
-    if (row.user_id !== userId) {
-      // User isolation: the state's user must own the project row.
-      logger.warn(
-        { userId, projectId, requestId: payload.request_id ?? null },
-        "connector-resume: project belongs to a different user — refusing to notify the sidecar",
-      );
-      return;
-    }
-    if (!row.sandbox_id) {
-      logger.warn(
-        { userId, projectId, requestId: payload.request_id ?? null },
-        "connector-resume: project has no sandbox — the sidecar was not notified",
-      );
-      return;
-    }
-    const info = await getAgentInfo(row.sandbox_id);
-    if (!info?.url || !info.token) {
-      logger.warn(
-        { userId, projectId, sandboxId: row.sandbox_id, requestId: payload.request_id ?? null },
-        "connector-resume: VM sidecar unreachable — the task resume degrades",
-      );
-      return;
-    }
-    const res = await fetch(`${info.url.replace(/\/+$/, "")}/internal/connectors`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-VM-Token": info.token,
-      },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(SIDECAR_NOTIFY_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      logger.warn(
-        { userId, projectId, sandboxId: row.sandbox_id, requestId: payload.request_id ?? null, status: res.status, detail: text.slice(0, 200) },
-        "connector-resume: sidecar /internal/connectors responded non-2xx",
-      );
-      return;
-    }
-    logger.info(
-      { userId, projectId, sandboxId: row.sandbox_id, requestId: payload.request_id ?? null, granted: payload.granted === true, declined: payload.declined === true },
-      "connector-resume: sidecar notified (token value never logged)",
-    );
-  } catch (err) {
-    logger.warn(
-      { userId, projectId, requestId: payload.request_id ?? null, err: err instanceof Error ? err.message : "unknown" },
-      "connector-resume: sidecar notification failed — the task resume degrades",
-    );
-  }
-}
 
 /** Status derivation: DB row + token freshness. Sanitized — no token
  *  material, no env names. */
@@ -217,208 +86,18 @@ function sanitizedStatus(
   };
 }
 
-/** Safe post-connect landing path (GROUP 3 import flow): a RELATIVE path
- *  on the frontend origin only — starts with "/", not "//" (protocol
- *  relative), no scheme/host, bounded length. Returns null otherwise. */
-function safeReturnPath(raw: unknown): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.length > 128) return undefined;
-  if (!trimmed.startsWith("/") || trimmed.startsWith("//") || trimmed.includes(":\\")) {
-    return undefined;
-  }
-  try {
-    const url = new URL(trimmed, "https://arcforge.invalid");
-    // Only same-origin paths survive (URL() resolves ?query/#hash fine).
-    if (url.origin !== "https://arcforge.invalid") return undefined;
-    return trimmed;
-  } catch {
-    return undefined;
-  }
-}
-
-/** Post-connect landing base: the state's validated landingBase (the
- *  origin the user started the connect from — see allowedLandingBase),
- *  falling back to FRONTEND_URL. The path stays same-origin. */
-function landing(state: { landingBase?: string; returnPath?: string }): string {
-  const base = state.landingBase || FRONTEND_URL;
-  return `${base}${safeReturnPath(state.returnPath) || "/connectors"}`;
-}
-
 /** ── OAUTH CALLBACK (provider → edge → here) ────────────────────────
  * PUBLIC BY DESIGN and registered BEFORE requireAuth: the browser lands
  * here via a top-level redirect from the OAuth provider with no Supabase
- * JWT. Security = the HMAC-signed state, which this backend minted for an
- * authenticated user at authorize time (carries user + resume context). */
+ * JWT. Security = the HMAC-signed state (see connector-oauth.ts). The
+ * github connector's callbacks land on the auth-oauth route instead
+ * (that edge function is its registered redirect target) — both entry
+ * points funnel into the SAME completion engine. */
 router.get("/connectors/callback", async (req: Request, res: Response) => {
   const code = typeof req.query.code === "string" ? req.query.code : "";
   const stateRaw = typeof req.query.state === "string" ? req.query.state : "";
-  const state = verifyState(stateRaw);
-  if (!code || !state || state.purpose !== "connector" || !state.connector || !state.userId) {
-    res.redirect(302, `${FRONTEND_URL}/connectors?connected=unknown&status=error`);
-    return;
-  }
-  const connector = getConnector(state.connector);
-  if (!connector) {
-    res.redirect(302, `${landing(state)}?connected=${state.connector}&status=error`);
-    return;
-  }
-  const creds = connectorCredentials(connector);
-  if (!creds) {
-    res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=not_configured`);
-    return;
-  }
-  const userId = state.userId;
-
-  try {
-    let accessToken = "";
-    let refreshToken: string | null = null;
-    let expiresIn: number | null = null;
-    let accountLabel: string | undefined;
-    let scopes: string | undefined;
-    let githubLogin: string | undefined;
-
-    if (connector.authMethod === "oauth_supabase") {
-      // Supabase OAuth token exchange — Basic auth, form-urlencoded body.
-      const tokenRes = await fetch("https://api.supabase.com/v1/oauth/token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-          Authorization: `Basic ${Buffer.from(`${creds.clientId}:${creds.clientSecret}`).toString("base64")}`,
-        },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: connectorCallbackUrl(),
-        }),
-      });
-      if (!tokenRes.ok) {
-        const detail = await tokenRes.text();
-        logger.warn(
-          { connector: connector.id, status: tokenRes.status, detail: detail.slice(0, 200) },
-          "connector-oauth: token exchange failed",
-        );
-        await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-        res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=exchange_failed`);
-        return;
-      }
-      const tokenJson = (await tokenRes.json()) as {
-        access_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-        scope?: string;
-      };
-      accessToken = tokenJson.access_token || "";
-      refreshToken = tokenJson.refresh_token || null;
-      expiresIn = tokenJson.expires_in ?? null;
-      scopes = tokenJson.scope ?? undefined;
-
-      // Resolve the account identity for the connection label (never the
-      // token): the OAuth user endpoint is the documented identity call.
-      if (accessToken) {
-        try {
-          const meRes = await fetch("https://api.supabase.com/v1/oauth/user", {
-            headers: { Authorization: `Bearer ${accessToken}` },
-          });
-          if (meRes.ok) {
-            const me = (await meRes.json()) as { email?: string; name?: string; user_name?: string };
-            accountLabel = me.email || me.name || me.user_name || undefined;
-          }
-        } catch {
-          /* label is best-effort */
-        }
-      }
-    } else {
-      // GitHub App user-to-server token exchange.
-      const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          "User-Agent": "arcforge",
-        },
-        body: JSON.stringify({
-          client_id: creds.clientId,
-          client_secret: creds.clientSecret,
-          code,
-          redirect_uri: connectorCallbackUrl(),
-        }),
-      });
-      const tokenJson = (await tokenRes.json()) as {
-        access_token?: string;
-        refresh_token?: string;
-        expires_in?: number;
-        error?: string;
-      };
-      accessToken = tokenJson.access_token || "";
-      refreshToken = tokenJson.refresh_token || null;
-      expiresIn = tokenJson.expires_in ?? null;
-      if (!accessToken) {
-        logger.warn({ err: tokenJson.error }, "connector-oauth: github exchange failed");
-        await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-        res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=exchange_failed`);
-        return;
-      }
-      // Label with the resolved GitHub login.
-      const meRes = await fetch("https://api.github.com/user", {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "arcforge",
-        },
-      });
-      if (meRes.ok) {
-        const me = (await meRes.json()) as { login?: string };
-        accountLabel = me.login || undefined;
-        githubLogin = me.login || undefined;
-      }
-    }
-
-    if (!accessToken) {
-      await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-      res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=no_token`);
-      return;
-    }
-
-    // Capability grant bookkeeping (GROUP 2 session 2): an authorize call
-    // WITH a specific capability grants exactly that one; the Connectors
-    // page (no capability) grants ALL connector capabilities — the user
-    // explicitly connected the whole connector.
-    const grantedCapabilities = state.capability
-      ? [state.capability]
-      : connector.capabilities.map((c) => c.id);
-
-    await upsertConnection(userId, connector.id, {
-      accessToken,
-      refreshToken,
-      expiresAt: expiryDate(expiresIn),
-    }, { scopes, accountLabel, githubLogin, grantedCapabilities });
-
-    logger.info(
-      { userId, connector: connector.id, capability: state.capability ?? null, hasTask: Boolean(state.taskId), granted: grantedCapabilities },
-      "connector-oauth: connected (token stored encrypted; value never logged)",
-    );
-
-    // Task resume: when the OAuth round-trip originated from an
-    // agent-initiated request_connector call, wake the blocked sidecar
-    // tool so the paused task continues with the grant. Ownership is
-    // verified inside (state.userId is the HMAC-signed identity this
-    // backend minted at authorize time; the project row must match it).
-    if (state.taskId || state.requestId || state.projectId) {
-      await notifySidecarConnector(userId, state.projectId, {
-        request_id: state.requestId,
-        granted: true,
-        capability: state.capability,
-      });
-    }
-
-    res.redirect(302, `${landing(state)}?connected=${connector.id}&status=ok`);
-  } catch (err) {
-    logger.error({ err: err instanceof Error ? err.message : "unknown" }, "connector-oauth: callback error");
-    await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
-    res.redirect(302, `${landing(state)}?connected=${connector.id}&status=error&message=internal`);
-  }
+  const redirectUrl = await completeConnectorOAuth(code, stateRaw);
+  res.redirect(302, redirectUrl);
 });
 
 // Authenticated routes below this line — every connector operation is
@@ -485,8 +164,7 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
     capability = body.capability;
   }
 
-  const state = mintState({
-    purpose: "connector",
+  const state = mintConnectorState({
     connector: connector.id,
     userId,
     userEmail: req.userEmail ?? null,
@@ -505,22 +183,19 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
 
   await markConnectionStatus(userId, connector.id, "connecting").catch(() => undefined);
 
-  let authorizeUrl: string;
-  if (connector.authMethod === "oauth_supabase") {
-    // Supabase OAuth: scopes are configured on the OAuth app itself
-    // (the scope query param is deprecated per current docs).
-    authorizeUrl =
-      `https://api.supabase.com/v1/oauth/authorize?client_id=${encodeURIComponent(creds.clientId)}` +
-      `&redirect_uri=${encodeURIComponent(connectorCallbackUrl())}` +
-      `&response_type=code&state=${encodeURIComponent(state)}`;
-  } else {
-    // GitHub App (user-to-server OAuth). Permissions are baked into the
-    // app configuration; no scope parameter.
-    authorizeUrl =
-      `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(creds.clientId)}` +
-      `&redirect_uri=${encodeURIComponent(connectorCallbackUrl())}` +
-      `&state=${encodeURIComponent(state)}`;
+  const authorizeUrl = buildAuthorizeUrl(connector, creds, state);
+
+  // SUPABASE PRE-FLIGHT (user fix 2026-09-12): Supabase rejects
+  // unregistered redirect URIs with a raw 422 JSON page — a dead end.
+  // One cheap GET before the browser navigates turns that into an
+  // actionable error the connectors page renders as a toast.
+  const preflightError = await preflightAuthorize(connector, authorizeUrl);
+  if (preflightError) {
+    await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
+    res.status(502).json({ error: preflightError, redirect_uri_hint: true });
+    return;
   }
+
   res.json({ authorize_url: authorizeUrl });
 });
 

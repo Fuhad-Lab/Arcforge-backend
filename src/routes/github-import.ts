@@ -2,20 +2,21 @@
  * GitHub repository importing — GROUP 3.
  *
  * Frontend → Supabase Edge Function (connector-ops) → THIS backend →
- * GitHub App (Forge-AI App Builder). The browser never talks to
- * api.github.com and never sees a token.
+ * GitHub. The browser never talks to api.github.com and never sees a
+ * token.
  *
- * Credentials: the GitHub App's client id/secret live ONLY in backend env
- * (GITHUB_APP_CLIENT_ID / GITHUB_APP_CLIENT_SECRET — Render env vars).
- * They are COMPLETELY SEPARATE from the GitHub Sign-In OAuth app
- * (GITHUB_SIGNIN_CLIENT_ID / GITHUB_SIGNIN_CLIENT_SECRET) — never mixed,
- * never shared, never in source.
+ * Credentials: resolved through the connector registry — since the
+ * 2026-09-12 fix the github connector runs on the VERIFIED sign-in OAuth
+ * App pair (GITHUB_SIGNIN_CLIENT_ID / GITHUB_SIGNIN_CLIENT_SECRET, with
+ * explicit repo scopes granted at connector consent), because the
+ * GitHub App client secret stored in env was found invalid against
+ * GitHub. See connector-registry.ts and services/connector-oauth.ts.
  *
  * Identity: the caller is the authenticated Supabase user (requireAuth).
- * Their GitHub App user-to-server token is resolved from the encrypted
- * connector vault (connector "github"). Users can only see / import the
- * repositories their own GitHub authorization (installation) actually
- * permits — GitHub enforces this server-side on every call.
+ * Their GitHub token is resolved from the encrypted connector vault
+ * (connector "github"). Users can only see / import the repositories
+ * their own GitHub authorization actually permits — GitHub enforces
+ * this server-side on every call.
  *
  * Routes (mounted under /api in routes/index.ts):
  *   GET  /api/github/repos     → repos the caller's token may access
@@ -23,10 +24,13 @@
  *                                pull the repo tarball, write text files
  *                                into the workspace.
  *
- * Token lifecycle: GitHub App user-to-server tokens expire (~8h default).
- * On expiry the stored refresh token is exchanged (grant_type=
- * refresh_token) and rotated in the vault. When that fails the connection
- * is honestly reported as expired → the frontend re-authorizes.
+ * Token lifecycle: classic OAuth App tokens do NOT expire (vault rows
+ * store a null expiresAt — treated as always-valid). GitHub App
+ * user-to-server tokens (should the App flow ever return) expire ~8h;
+ * on expiry the stored refresh token is exchanged (grant_type=
+ * refresh_token) and rotated in the vault. When that fails the
+ * connection is honestly reported as expired → the frontend
+ * re-authorizes.
  */
 import { gunzipSync } from "node:zlib";
 import { Router, type IRouter, type Request, type Response, type NextFunction } from "express";
@@ -169,8 +173,12 @@ async function resolveGithubToken(userId: string): Promise<GithubTokenState | Gi
       message: "GitHub is not connected — authorize the Forge-AI App Builder app to list and import repositories.",
     };
   }
+  // GitHub classic OAuth App tokens (the connector's 2026-09-12 flow) do
+  // NOT expire — expiresAt is null/absent in the vault for those. Only
+  // expiring credentials (GitHub App user-to-server tokens, which carry
+  // expires_in + a refresh_token) need the refresh-rotation path below.
   const expiresMs = tokens.expiresAt ? new Date(tokens.expiresAt).getTime() : 0;
-  if (expiresMs && expiresMs > Date.now() + 60_000) {
+  if (!expiresMs || expiresMs > Date.now() + 60_000) {
     return { ok: true, accessToken: tokens.accessToken };
   }
   // Expired (or expiring within a minute) → attempt the refresh rotation.

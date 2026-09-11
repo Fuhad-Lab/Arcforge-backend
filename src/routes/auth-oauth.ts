@@ -33,6 +33,7 @@ import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
 import { getServiceSupabase, isSupabaseConfigured } from "../lib/supabase-db";
 import { mintState, verifyState, stashSession, takeSession } from "../services/connector-vault";
+import { completeConnectorOAuth } from "../services/connector-oauth";
 
 const router: IRouter = Router();
 
@@ -111,7 +112,15 @@ router.post("/auth/github/start", async (req: Request, res: Response) => {
   res.json({ authorize_url: authorizeUrl });
 });
 
-/** ── 2. CALLBACK (GitHub → edge → here) ───────────────────────────── */
+/** ── 2. CALLBACK (GitHub → edge → here) ─────────────────────────────
+ * Dual-purpose by STATE PURPOSE (the edge function forwards every GitHub
+ * redirect here — it cannot read the HMAC state, but the backend can):
+ *   • purpose "signin"    → the sign-in flow below (session minting).
+ *   • purpose "connector" → the GitHub CONNECTOR round-trip (user fix
+ *     2026-09-12: the connector's registered callback edge function is
+ *     auth-oauth — the sign-in OAuth App pair is the VERIFIED credential
+ *     set, so both flows share it) — dispatched into the same completion
+ *     engine the /connectors/callback route uses. */
 router.get("/auth/github/callback", async (req: Request, res: Response) => {
   const clientId = process.env.GITHUB_SIGNIN_CLIENT_ID || "";
   const clientSecret = process.env.GITHUB_SIGNIN_CLIENT_SECRET || "";
@@ -122,7 +131,20 @@ router.get("/auth/github/callback", async (req: Request, res: Response) => {
   const code = typeof req.query.code === "string" ? req.query.code : "";
   const stateRaw = typeof req.query.state === "string" ? req.query.state : "";
   const state = verifyState(stateRaw);
-  if (!code || !state || state.purpose !== "signin") {
+  if (!code || !state) {
+    res.redirect(302, `${FRONTEND_FALLBACK_ORIGIN}/auth?auth=github&status=error&message=invalid_state`);
+    return;
+  }
+  // GitHub connector callbacks land on THIS route (auth-oauth is the
+  // registered redirect for the connector's OAuth app) — hand them to
+  // the shared connector completion engine, which exchanges, stores the
+  // vault token, resumes tasks, and returns the /connectors landing.
+  if (state.purpose === "connector") {
+    const redirectUrl = await completeConnectorOAuth(code, stateRaw);
+    res.redirect(302, redirectUrl);
+    return;
+  }
+  if (state.purpose !== "signin") {
     res.redirect(302, `${FRONTEND_FALLBACK_ORIGIN}/auth?auth=github&status=error&message=invalid_state`);
     return;
   }
