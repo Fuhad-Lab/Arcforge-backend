@@ -189,7 +189,7 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
   // unregistered redirect URIs with a raw 422 JSON page — a dead end.
   // One cheap GET before the browser navigates turns that into an
   // actionable error the connectors page renders as a toast.
-  const preflightError = await preflightAuthorize(connector, authorizeUrl);
+  const preflightError = await preflightAuthorize(connector, creds, authorizeUrl);
   if (preflightError) {
     await markConnectionStatus(userId, connector.id, "error").catch(() => undefined);
     res.status(502).json({ error: preflightError, redirect_uri_hint: true });

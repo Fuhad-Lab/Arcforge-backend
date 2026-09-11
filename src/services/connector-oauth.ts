@@ -179,9 +179,22 @@ export function buildAuthorizeUrl(
  *  state is never consumed) detects this BEFORE the browser navigates:
  *  2xx/3xx = the URI is registered, 4xx = actionable error. Returns null
  *  when the flight passes, or a user-facing error message when it
- *  doesn't. */
+ *  doesn't.
+ *
+ *  2026-09-11 (follow-up): the provider's 422 body has TWO distinct
+ *  shapes — "Unrecognized client_id" (the app was deleted / the env
+ *  points at a ghost) and "redirect_uri not allowed" (the app exists
+ *  but its registered Redirect URLs don't include ours). Both are
+ *  dashboard-side registration problems the backend cannot heal, so the
+ *  message now says EXACTLY where to click (organization → OAuth Apps —
+ *  there is no "Account → Developer settings" page in the current
+ *  dashboard) and fingerprints the app by the first 8 chars of its
+ *  client ID so the right app is edited (an edit on a different app
+ *  silently does nothing). The client ID is a public identifier, never
+ *  a secret. */
 export async function preflightAuthorize(
   connector: ConnectorDefinition,
+  creds: { clientId: string; clientSecret: string },
   authorizeUrl: string,
 ): Promise<string | null> {
   if (connector.authMethod !== "oauth_supabase") return null;
@@ -198,11 +211,23 @@ export async function preflightAuthorize(
         { connector: connector.id, status: res.status, detail: body.slice(0, 200) },
         "connector-oauth: authorize pre-flight rejected the redirect_uri",
       );
+      const redirectUri = connectorRedirectUri(connector);
+      const idHint = creds.clientId.slice(0, 8);
+      if (body.includes("Unrecognized client_id")) {
+        return (
+          `Supabase does not recognize this connector's OAuth app (Client ID starts with ` +
+          `"${idHint}") — it may have been deleted. In the Supabase dashboard open your ` +
+          `organization → OAuth Apps, recreate the app with this Redirect URL, then put its ` +
+          `new client ID and secret in the SUPABASE_OAUTH_CLIENT_ID / ` +
+          `SUPABASE_OAUTH_CLIENT_SECRET environment variables: ${redirectUri}`
+        );
+      }
       return (
-        `${connector.name} rejected this OAuth app's redirect URI (the provider returned ` +
-        `status ${res.status}). Open the Supabase dashboard → Account → Developer settings → ` +
-        `OAuth apps, edit the app for this connector, and make sure its Redirect URI is exactly: ` +
-        `${connectorRedirectUri(connector)}`
+        `Supabase rejected this OAuth app's redirect URI (the provider returned status ` +
+        `${res.status}). In the Supabase dashboard open your organization → OAuth Apps, ` +
+        `open the app whose Client ID starts with "${idHint}" (verify it — editing a ` +
+        `different app has no effect), add this exact Redirect URL to its list, then click ` +
+        `Update: ${redirectUri}`
       );
     }
   } catch (err) {
