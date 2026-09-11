@@ -160,11 +160,11 @@ class EnterpriseOrchestrationEngine:
                     "api_key=... to EnterpriseOrchestrationEngine.__init__.",
                 )
             try:
-                from daytona_sdk import Daytona, DaytonaConfig  # type: ignore[import-untyped]
+                from daytona import Daytona, DaytonaConfig  # type: ignore[import-untyped]
             except Exception as exc:  # pragma: no cover -- only happens if SDK is uninstalled
                 raise RuntimeError(
-                    f"daytona_sdk import failed: {exc}. Install with: "
-                    "pip install daytona-sdk",
+                    f"daytona import failed: {exc}. Install with: "
+                    "pip install daytona",
                 ) from exc
             self.daytona = Daytona(DaytonaConfig(api_key=self.api_key))
         return self.daytona

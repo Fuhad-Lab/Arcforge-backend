@@ -9,7 +9,7 @@ Daytona SDK v0.205.1 secrets surface (verified live):
   - ``SecretApi(get_daytona()._api_client)`` — the raw REST client the
     Daytona instance wraps in its ``.secret`` service. ``SecretApi`` /
     ``CreateSecret`` live in the generated ``daytona_api_client`` package
-    (daytona_sdk itself only re-exports ``CreateSecretParams``/``Secret``)
+    (the daytona package itself only re-exports ``CreateSecretParams``/``Secret``)
     — the Daytona instance's ``_api_client`` IS a
     ``daytona_api_client.ApiClient`` carrying the auth headers.
   - ``SecretApi.create_secret(CreateSecret{name, value, description, hosts})``

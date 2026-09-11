@@ -1,6 +1,6 @@
 """Singleton Daytona SDK client wrapper.
 
-Wraps the `daytona_sdk.Daytona` client so that every service module shares
+Wraps the `daytona.Daytona` client so that every service module shares
 one connection pool.  The client is lazily initialised on first use.
 
 Daytona SDK v0.205.1 — verified API:
@@ -25,7 +25,7 @@ import logging
 from threading import Lock
 from typing import TYPE_CHECKING
 
-from daytona_sdk import (  # type: ignore[import-untyped]
+from daytona import (  # type: ignore[import-untyped]
     CreateSandboxFromImageParams,
     CreateSandboxFromSnapshotParams,
     Daytona,
@@ -37,7 +37,7 @@ from daytona_sdk import (  # type: ignore[import-untyped]
 from app.config import settings
 
 if TYPE_CHECKING:
-    from daytona_sdk import Sandbox as SdkSandbox
+    from daytona import Sandbox as SdkSandbox
 
 logger = logging.getLogger(__name__)
 

@@ -64,7 +64,7 @@ async def upload_files_bulk(
     Args:
         files: list of {"path": str, "content": str|bytes}
     """
-    from daytona_sdk import FileUpload as SdkFileUpload
+    from daytona import FileUpload as SdkFileUpload
 
     sandbox = await _get_sandbox(sandbox_id)
     uploads = [

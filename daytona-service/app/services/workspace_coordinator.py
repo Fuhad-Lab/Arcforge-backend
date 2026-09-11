@@ -612,7 +612,7 @@ class DaytonaWorkspaceManager:
         Args:
             files: list of {"path": str, "content": str}
         """
-        from daytona_sdk import FileUpload as SdkFileUpload
+        from daytona import FileUpload as SdkFileUpload
 
         sandbox = await self._resolve_sandbox(sandbox_id)
 

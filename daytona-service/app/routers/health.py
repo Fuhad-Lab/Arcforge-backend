@@ -63,7 +63,7 @@ async def readiness_check() -> HealthResponse:
     """
     import asyncio
 
-    from daytona_sdk import ListSandboxesQuery
+    from daytona import ListSandboxesQuery
 
     daytona_connected = False
 
