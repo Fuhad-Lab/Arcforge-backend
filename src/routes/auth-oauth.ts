@@ -49,19 +49,41 @@ const edgeCallbackUrl = (): string => {
   return "https://arcforge-edge.invalid/functions/v1/auth-oauth";
 };
 
-const FRONTEND_FALLBACK_ORIGIN = process.env.FRONTEND_URL || "https://arcforge-web.onrender.com";
+const FRONTEND_FALLBACK_ORIGIN = process.env.FRONTEND_URL || "https://forgeyn.com.ng";
+
+/** ORIGIN-AWARE GITHUB SIGN-IN (user fix 2026-09-11): forgeyn.com.ng is
+ *  the canonical public domain — the sign-in start sends the caller's
+ *  window.location.origin, and the callback must return THERE (landing
+ *  elsewhere drops the per-origin session cookie). Extra origins can be
+ *  allow listed without a redeploy via FRONTEND_ORIGINS (comma-separated
+ *  absolute origins). */
+const CANONICAL_FRONTEND_ORIGINS = [
+  "https://forgeyn.com.ng",
+  "https://www.forgeyn.com.ng",
+  ...(process.env.FRONTEND_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+];
 
 function allowedOrigin(raw: string | undefined | null): string {
   if (!raw) return FRONTEND_FALLBACK_ORIGIN;
   try {
     const url = new URL(raw);
+    const origin = url.origin;
+    if (
+      (url.protocol === "https:" && CANONICAL_FRONTEND_ORIGINS.includes(origin)) ||
+      (url.protocol === "https:" && origin === new URL(FRONTEND_FALLBACK_ORIGIN).origin)
+    ) {
+      return origin;
+    }
     const host = url.hostname;
     if (
       (url.protocol === "https:" &&
         (host.endsWith(".onrender.com") || host.endsWith(".arcforge.app") || host.endsWith(".vercel.app"))) ||
       (url.protocol === "http:" && (host === "localhost" || host === "127.0.0.1"))
     ) {
-      return url.origin;
+      return origin;
     }
   } catch {
     /* malformed — fall through */

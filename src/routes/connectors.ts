@@ -61,7 +61,51 @@ function connectorCallbackUrl(): string {
   return "https://arcforge-edge.invalid/functions/v1/connector-ops";
 }
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://arcforge-web.onrender.com";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://forgeyn.com.ng";
+
+/** ORIGIN-AWARE LANDING (user fix 2026-09-11): the OAuth round-trip must
+ *  return users to the origin they started from. forgeyn.com.ng is the
+ *  canonical public domain (the frontend hardcodes nothing — it sends
+ *  window.location.origin on authorize); extra origins can be allow
+ *  listed without a redeploy via the FRONTEND_ORIGINS env var
+ *  (comma-separated absolute origins, no trailing slash). */
+const CANONICAL_FRONTEND_ORIGINS = [
+  "https://forgeyn.com.ng",
+  "https://www.forgeyn.com.ng",
+  ...(process.env.FRONTEND_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+];
+
+/** Validate a caller-supplied origin for post-OAuth landing. Accepted:
+ *  the canonical public domain(s), the configured FRONTEND_URL, any
+ *  FRONTEND_ORIGINS entry, and the platform/dev suffix hosts. Anything
+ *  else falls back to FRONTEND_URL — never an open redirect. */
+function allowedLandingBase(raw: string | undefined | null): string {
+  if (!raw) return FRONTEND_URL;
+  try {
+    const url = new URL(raw);
+    const origin = url.origin;
+    if (
+      (url.protocol === "https:" && CANONICAL_FRONTEND_ORIGINS.includes(origin)) ||
+      (url.protocol === "https:" && origin === new URL(FRONTEND_URL).origin)
+    ) {
+      return origin;
+    }
+    const host = url.hostname;
+    if (
+      (url.protocol === "https:" &&
+        (host.endsWith(".onrender.com") || host.endsWith(".arcforge.app") || host.endsWith(".vercel.app"))) ||
+      (url.protocol === "http:" && (host === "localhost" || host === "127.0.0.1"))
+    ) {
+      return origin;
+    }
+  } catch {
+    /* malformed — fall through */
+  }
+  return FRONTEND_URL;
+}
 
 /** In-VM sidecar delivery timeout (local HTTP inside the VM via the
  *  preview URL — same budget as workspace.ts's secrets route). */
@@ -193,10 +237,12 @@ function safeReturnPath(raw: unknown): string | undefined {
   }
 }
 
-/** Post-connect landing base: the state's validated returnPath (e.g. the
- *  import modal origin) or the Connectors page. Always same-origin. */
-function landing(state: { returnPath?: string }): string {
-  return `${FRONTEND_URL}${safeReturnPath(state.returnPath) || "/connectors"}`;
+/** Post-connect landing base: the state's validated landingBase (the
+ *  origin the user started the connect from — see allowedLandingBase),
+ *  falling back to FRONTEND_URL. The path stays same-origin. */
+function landing(state: { landingBase?: string; returnPath?: string }): string {
+  const base = state.landingBase || FRONTEND_URL;
+  return `${base}${safeReturnPath(state.returnPath) || "/connectors"}`;
 }
 
 /** ── OAUTH CALLBACK (provider → edge → here) ────────────────────────
@@ -426,6 +472,7 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
     task_id?: string;
     project_id?: string;
     return_path?: string;
+    origin?: string;
   };
   // Validate the requested capability belongs to this connector.
   let capability: string | undefined;
@@ -448,6 +495,12 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
     taskId: body.task_id,
     projectId: body.project_id,
     returnPath: safeReturnPath(body.return_path),
+    // ORIGIN-AWARE LANDING (user fix 2026-09-11): validated at mint time
+    // and carried in the HMAC state — the callback returns the user to
+    // the origin they started from instead of a hardcoded Render URL
+    // (landing elsewhere drops the session cookie and the connect reads
+    // as broken on forgeyn.com.ng).
+    landingBase: allowedLandingBase(body.origin),
   });
 
   await markConnectionStatus(userId, connector.id, "connecting").catch(() => undefined);

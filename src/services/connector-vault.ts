@@ -78,6 +78,13 @@ export interface OAuthState {
   projectId?: string;
   sandboxId?: string;
   origin?: string;
+  /** Post-OAuth absolute landing ORIGIN (connector flow — user fix
+   *  2026-09-11): the validated origin the user started the connect
+   *  from, so the callback redirects back to THAT site instead of a
+   *  hardcoded frontend URL (per-origin session cookies). Validated
+   *  server-side at mint time via allowedLandingBase — never an open
+   *  redirect. */
+  landingBase?: string;
   /** Post-connect relative landing path on the frontend (GROUP 3): lets
    *  flows like the GitHub import modal resume where they started instead
    * of always landing on /connectors. Server-validated to be a safe
