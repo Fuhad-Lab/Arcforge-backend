@@ -404,8 +404,10 @@ router.post("/projects", async (req: Request, res: Response, next: NextFunction)
     const sessionId = typeof body.sessionId === "string" && body.sessionId ? body.sessionId : null;
     const description = typeof body.description === "string" ? body.description : null;
     // GROUP 3: imported repositories create the project with mode "import"
-    // (GitHub App flow); everything else stays "single".
-    const mode = body.mode === "import" ? "import" : "single";
+    // (GitHub App flow); Forgvi 3.0 builds record "forgvi3" — the
+    // manifest-workspace lane (no Daytona VM; the browser WebContainer
+    // executes). Everything else stays "single".
+    const mode = body.mode === "import" ? "import" : body.mode === "forgvi3" ? "forgvi3" : "single";
 
     // FK SAFETY NET — fixes "projects_user_id_fkey" violation for brand-new
     // auth users who have never visited /settings (no public.users row yet).
