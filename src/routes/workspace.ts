@@ -481,21 +481,27 @@ router.get("/project/:projectId/file-tree", async (req: Request, res: Response, 
 });
 
 // ─── GET /api/workspace/project/:projectId/grant ─────────────────────────
-// Mint a Forgvi 2.0 workspace grant — the short-lived HMAC token that binds
-// one engine run to THIS project's sandbox. The engine verifies the
-// signature (shared WORKSPACE_GRANT_SECRET) and then executes the run's
-// bash/edit tools directly against the sandbox, making the VM and the
-// engine one shared workspace (same filesystem Forgvi 1.0's in-VM swarm
-// uses). One grant = one project's sandbox. Guarded by isAccessibleBy
-// (Task 50): the owner mints grants for their project, and ANY user may
-// mint a grant for a PUBLIC (template) project — the sandbox belongs to the
-// project, so a non-owner grant still binds {userId: caller, projectId,
-// sandboxId: the project's shared sandbox} sanely; private foreign projects
-// get the 403 and never hand the engine anything.
+// Mint a Forgvi engine workspace grant — the short-lived HMAC token that
+// binds one engine run to THIS project's workspace. Two kinds (2026-09,
+// the Forgvi 3.0 Daytona removal):
+//
+//   ?workspace=manifest  → a MANIFEST grant {workspace:"manifest"} for the
+//     Forgvi 3.0 engine: binds the run to the project's cloud file manifest
+//     (executed in the user's browser via WebContainers). No sandbox needed
+//     — 3.0 projects never touch Daytona.
+//   (default)            → a SANDBOX grant {sandboxId} for the Forgvi 2.0
+//     engine: binds the run's bash/edit tools to the project's sandbox —
+//     the VM and the engine become one shared workspace (same filesystem
+//     Forgvi 1.0's in-VM swarm uses).
+//
+// One grant = one project's workspace. Guarded by isAccessibleBy (Task 50):
+// the owner mints grants for their project, and ANY user may mint a grant
+// for a PUBLIC (template) project; private foreign projects get the 403 and
+// never hand the engine anything.
 
 const WORKSPACE_GRANT_TTL_MS = 20 * 60_000; // 20 minutes — engine wake + run start
 
-function mintGrant(row: ProjectRow, userId: string): string {
+function mintGrant(row: ProjectRow, userId: string, workspace: "sandbox" | "manifest"): string {
   const secret = process.env.WORKSPACE_GRANT_SECRET;
   if (!secret) {
     throw new Error("WORKSPACE_GRANT_SECRET is not configured on the backend");
@@ -503,7 +509,8 @@ function mintGrant(row: ProjectRow, userId: string): string {
   const payload = JSON.stringify({
     v: 1,
     projectId: row.id,
-    sandboxId: row.sandbox_id,
+    workspace,
+    sandboxId: row.sandbox_id ?? "",
     userId,
     iat: Date.now(),
     exp: Date.now() + WORKSPACE_GRANT_TTL_MS,
@@ -519,12 +526,23 @@ router.get("/project/:projectId/grant", async (req: Request, res: Response, next
     const row = await getProjectRow(String(req.params.projectId));
     if (!isAccessibleBy(res, row, req.userId)) return;
 
+    const wantsManifest = String(req.query.workspace ?? "") === "manifest";
+
+    if (wantsManifest) {
+      // The Forgvi 3.0 lane: bind to the file manifest — no sandbox, no
+      // Daytona, no provisioning. The engine verifies the claim and mounts
+      // the user's browser workspace.
+      const grant = mintGrant(row, req.userId!, "manifest");
+      res.json({ grant, workspace: "manifest", expires_in_ms: WORKSPACE_GRANT_TTL_MS });
+      return;
+    }
+
     if (!row.sandbox_id) {
       res.status(404).json({ error: "No sandbox for this project yet — the VM is still booting" });
       return;
     }
 
-    const grant = mintGrant(row, req.userId!);
+    const grant = mintGrant(row, req.userId!, "sandbox");
     // The grant is opaque to the browser (it never carries the secret), and
     // expires in minutes. It is handed to the engine with the next run.
     res.json({ grant, sandbox_id: row.sandbox_id, expires_in_ms: WORKSPACE_GRANT_TTL_MS });
