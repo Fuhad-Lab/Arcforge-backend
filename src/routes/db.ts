@@ -755,7 +755,7 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
     // slug + published_at ride along so the studio Publish button can show
     // its LIVE state without an extra round-trip.
     const SESSION_COLUMNS =
-      "id,user_id,name,logo_url,platforms,session_id,sandbox_id,visibility,slug,published_at";
+      "id,user_id,name,logo_url,platforms,session_id,sandbox_id,visibility,slug,published_at,mode";
     type SessionProject = {
       id: string;
       user_id: string;
@@ -767,6 +767,7 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
       visibility: string;
       slug: string | null;
       published_at: string | null;
+      mode: string | null;
     };
 
     // ── 1. OWNER PATH (unchanged shape): the caller's own project by
@@ -830,6 +831,7 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
             logoUrl: owned.logo_url,
             platforms: toPlatformsArray(owned.platforms),
             sandboxId: owned.sandbox_id,
+            mode: owned.mode ?? null,
             visibility: owned.visibility,
             slug: owned.slug,
             publishedAt: owned.published_at,
@@ -897,6 +899,7 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
           logoUrl: shared.logo_url,
           platforms: toPlatformsArray(shared.platforms),
           sandboxId: shared.sandbox_id,
+          mode: shared.mode ?? null,
           visibility: shared.visibility,
           slug: shared.slug,
           publishedAt: shared.published_at,
