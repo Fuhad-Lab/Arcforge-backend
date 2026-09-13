@@ -1577,6 +1577,68 @@ def _supabase_mcp_call(tool: str, args: Any) -> Dict[str, Any]:
     return {"ok": True, "tool": tool, "result": text or "(empty result)"}
 
 
+def _forgeyn_base_call(op: str, args: Any) -> Dict[str, Any]:
+    """THE FORGEYN BASE (the platform's own database), bridged through the
+    reverse tunnel to the backend's forge-ops relay (/mcp/forgeyn — the
+    same transport as the supabase tool). op=create_database provisions
+    and connects the USER's account (organization + project = a private,
+    isolated Postgres) through the platform's master key; the other ops
+    (run_sql, list_tables, list_projects, create_app, list_apps, whoami)
+    operate the connected database. The vaulted credentials NEVER enter
+    the VM — the backend resolves sandbox→project→user server-side and
+    returns sanitized results only."""
+    op = str(op or "").strip()
+    if not op:
+        return {"ok": False, "error": 'op required — create_database '
+                '(with organization + project), run_sql, list_tables, '
+                'list_projects, create_app, list_apps, whoami'}
+    if isinstance(args, str):
+        # the chief dispatcher stringifies nested dicts — parse leniently
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    payload: Dict[str, Any] = {"op": op, "args": args}
+    if op == "create_database":
+        payload["organization"] = str(args.get("organization") or "")
+        payload["project"] = str(args.get("project") or "")
+        if args.get("password"):
+            payload["password"] = str(args.get("password"))
+    try:
+        status, body = _tunnel_request("/mcp/forgeyn", payload)
+    except Exception as exc:  # noqa: BLE001 — transport failure, honest result
+        return {"ok": False, "error": f"forgeyn_base transport failed: "
+                f"{type(exc).__name__}: {str(exc)[:200]}"}
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": f"forgeyn_base: HTTP {status}: {body[:300]}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "forgeyn_base: unexpected response shape"}
+    if data.get("needs_credentials"):
+        return {"ok": False, "needs_credentials": True,
+                "error": str(data.get("error") or
+                             "a Forgeyn Base account already exists for this "
+                             "email"),
+                "hint": ("ask the user for their Forgeyn Base "
+                         "(db.forgeyn.com.ng) password with ask_user, then "
+                         "call forgeyn_base create_database again with "
+                         "args.password set to it")}
+    if not data.get("ok"):
+        return {"ok": False, "error": str(data.get("error") or f"HTTP {status}")}
+    # Trim heavy fields so the chief's context stays bounded.
+    out = {k: v for k, v in data.items() if k != "usage"}
+    text = json.dumps(out)
+    if len(text) > 6000:
+        out = {"ok": True, "note": "result truncated",
+               "detail": text[:6000] + "…[truncated]"}
+    if op == "create_database" and data.get("usage"):
+        out["usage"] = str(data["usage"])[:600]
+    return out
+
+
 async def _rt_send_and_await(req_id: str, frame: Dict[str, Any]) -> _InflightRT:
     entry = rt_mux.register(req_id)
     try:
@@ -2437,6 +2499,7 @@ TOOL_LABELS = {
     "mcp_use_skill": "Applying a skill",
     "request_connector": "Requesting a connector from you",
     "supabase_mcp": "Using your Supabase project",
+    "forgeyn_base": "Creating your Forgeyn Base database",
     "done": "Wrapping up",
 }
 
@@ -2982,9 +3045,43 @@ def _interaction_toolset(ctx: AgentContext
                      else f"error: {str(res.get('error', ''))[:140]}")
         return res
 
+    def forgeyn_base(a: Dict[str, Any]) -> Dict[str, Any]:
+        """THE PLATFORM DATABASE: create_database {organization, project}
+        provisions + connects the USER's Forgeyn Base account; the other
+        ops (run_sql, list_tables, list_projects, create_app, list_apps,
+        whoami) operate the connected database."""
+        op = str(a.get("op") or a.get("tool") or "").strip()
+        if not op:
+            return {"ok": False, "error": "op required — create_database "
+                    "(with organization + project), run_sql, list_tables, "
+                    "list_projects, create_app, list_apps, whoami"}
+        args = a.get("args")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
+            # allow top-level params for create_database (organization,
+            # project, password) without the nested args envelope
+            args = {k: a[k] for k in ("organization", "project", "password",
+                                      "query", "projectId", "name") if a.get(k)}
+        label = ("Creating your Forgeyn Base database"
+                 if op == "create_database" else
+                 f"Using your Forgeyn Base database ({op})")
+        ctx.activity(label, "active",
+                     str(a.get("organization") or a.get("project")
+                         or op)[:120])
+        res = _forgeyn_base_call(op, args)
+        ctx.activity(label, "done",
+                     "ok" if res.get("ok")
+                     else f"error: {str(res.get('error', ''))[:140]}")
+        return res
+
     return {"ask_user": ask_user, "request_secret": request_secret,
             "request_connector": request_connector,
-            "supabase_mcp": supabase_mcp}
+            "supabase_mcp": supabase_mcp,
+            "forgeyn_base": forgeyn_base}
 
 
 def _mailbox_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
@@ -3597,7 +3694,7 @@ A NUMBERED list of EVERY API endpoint the backend must expose (method, path, pur
 Numbered, concrete, testable statements the Debugger will click through on the live app (e.g. "1. Typing text and pressing Add creates a new item in the list").
 Rules: specific enough to build from; no code; keep it under ~90 lines; every Frontend/Backend Requirements item must map to at least one Acceptance Criterion; if there is no backend, the Backend Requirements section must say so in exactly that one line.
 RUNTIME CONSTRAINTS (hard): the app runs inside a single Linux VM — a backend, if needed, must be Python Flask or Node Express. The frontend is Next.js 14 App Router + TypeScript, always.
-AUTH PERSISTENCE LAW (injected system prompt): if the app needs authentication, it should NEVER use sqlite or local storage. Only a real database is allowed — ASK THE USER which database they want to use (request_connector connects their Supabase; other choices are honored) — and cookies. Put this decision in the plan's Backend Requirements, naming the user's chosen database and the cookie-based session design. For apps that need NO authentication, in-VM storage (in-memory) is acceptable — say which one the plan uses."""
+AUTH PERSISTENCE LAW (injected system prompt): if the app needs authentication, it should NEVER use sqlite or local storage. Only a real database is allowed — the platform's Forgeyn Base is the DEFAULT (forgeyn_base create_database provisions + connects the user's own private Postgres; the chief dispatches it — no user round-trip needed). Only ask the user when they explicitly want a different provider (request_connector connects their Supabase; other choices are honored) — and cookies. Put this decision in the plan's Backend Requirements, naming the Forgeyn Base (or the user's chosen database) and the cookie-based session design. For apps that need NO authentication, in-VM storage (in-memory) is acceptable — say which one the plan uses."""
 
 CHIEF_REFINE_SYSTEM = """You are ArcForge — the user's build agent. The user read your proposed plan and REJECTED it with change requests. Apply their changes and produce the FULL revised plan (same structure: Overview / Frontend Requirements / Backend Requirements / Acceptance Criteria). Keep everything they did NOT ask to change intact. The revised plan goes back to the user for approval."""
 
@@ -3622,12 +3719,13 @@ Your tools:
 - ask_user: pause and ask the user a clarifying question with options — {"tool":"ask_user","args":{"question":"<precise question>","options":["..."],"context":"<why you're asking>"}}.
 - request_secret: securely obtain an API key/credential from the user (never hardcode, never see the value) — {"tool":"request_secret","args":{"name":"ENV_VAR_NAME","purpose":"<why the app needs it>","hint":"<where to find it>"}}.
 - request_connector: ask the user to connect an external service account (Supabase, GitHub) via OAuth consent — {"tool":"request_connector","args":{"connector":"supabase","capability":"supabase.database.write","reason":"<why — shown to the user>"}}. NEVER invent connection strings or fake a database.
+- forgeyn_base: THE PLATFORM'S OWN DATABASE (Forgeyn Base — db.forgeyn.com.ng). When the app needs a real database, call it FIRST — no connection round-trip: {"tool":"forgeyn_base","args":{"op":"create_database","organization":"<org name>","project":"<app name>"}} provisions and connects the USER's own account (organization + project = a private, isolated Postgres) and returns the connection. Then operate it: {"tool":"forgeyn_base","args":{"op":"run_sql","args":{"query":"<SQL>"}}} | list_tables | list_projects | create_app (mints the pk_/sk_ gateway credentials the APP uses at runtime) | list_apps | whoami. If it returns needs_credentials, ask the user for their db.forgeyn.com.ng password (ask_user) and retry with args.password. This is the DEFAULT database choice — only use Supabase when the user explicitly asks for it.
 - supabase_mcp: real operations on the user's CONNECTED Supabase account (apply_migration, execute_sql, list_tables, list_projects…) — {"tool":"supabase_mcp","args":{"tool":"<mcp tool>","args":{<mcp arguments>}}}. Requires request_connector first.
 - github: GitHub operations via the user's connected account — {"tool":"github","args":{"action":"rest","method":"GET","path":"/user/repos"}} or {"tool":"github","args":{"action":"sync_workspace","repo":"auto-create:<name>","message":"<commit msg>"}}.
 - finish: everything the plan requires is done — no more tool calls.
 BRIEF QUALITY LAW (the platform enforces it): each call's "task" is the sub-agent's ONLY instructions — quote the concrete plan items it must deliver (endpoints with paths and shapes, pages with elements, file names). "Build it" / "do the rest" / "build so-so" briefs get bounced.
 Reply ONLY JSON:
-{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|terminal|vision|use_skill|ask_user|request_secret|request_connector|supabase_mcp|github|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","args":{"<tool-specific arguments as shown above>"},"reason":"<one line, internal>"} (omit "task" for tools that take only args; omit both for finish)."""
+{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|terminal|vision|use_skill|ask_user|request_secret|request_connector|forgeyn_base|supabase_mcp|github|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","args":{"<tool-specific arguments as shown above>"},"reason":"<one line, internal>"} (omit "task" for tools that take only args; omit both for finish)."""
 
 CHIEF_FOLLOWUP_SYSTEM = """You are ArcForge — the user's build agent. An approved plan.md ALREADY exists and the app is built; the user sent a FOLLOW-UP request. INTERROGATE YOURSELF before answering: does this request need a NEW PLAN, or is it a contained change you can build directly under the existing contract — and WHICH of your tools owns it?
 - "direct": contained work — tweaks, fixes, restyling, copy, adding a small component, adjusting behaviour, small additions. No new plan needed: you already know the codebase and the contract. You will be handed the change verbatim and build it immediately.
@@ -4749,6 +4847,7 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
                  "request_secret": "Requesting a secret from you",
                  "request_connector": "Requesting a connector from you",
                  "supabase_mcp": "Using your Supabase project",
+                 "forgeyn_base": "Using your Forgeyn Base database",
                  "github": "Working with GitHub"}.get(tool, tool)
         emit_activity(task_id, label, "active",
                       (str(d_args.get("command") or d_args.get("question")

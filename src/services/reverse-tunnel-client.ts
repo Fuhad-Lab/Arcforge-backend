@@ -72,6 +72,7 @@ import WebSocket from "ws";
 import { forwardToNvidia, type ForwardParams } from "./nvidia-forwarder";
 import { handleGithubTunnel } from "./github-proxy";
 import { handleMcpTunnel } from "./supabase-mcp";
+import { handleForgeynTunnel } from "./forgeyn-bridge";
 import { logger } from "../lib/logger";
 
 // ─── Configuration ──────────────────────────────────────────────────────
@@ -284,10 +285,47 @@ async function handleReqFrame(
     return;
   }
 
-  // MCP routing (GROUP 2 session 2): /mcp/<connector> → the vault-backed
-  // MCP executor. This connection is per-sandbox, so the user identity
-  // resolves directly from conn.sandboxId. Any inbound Authorization
-  // header is ignored — the OAuth token is injected server-side only.
+  // MCP routing (GROUP 2 session 2 + the Forgeyn Base bridge):
+  //   /mcp/supabase → the vault-backed Supabase MCP executor
+  //   /mcp/forgeyn  → the Forgeyn Base bridge (the platform's own database:
+  //                   create_database provisioning + forge ops, relayed to
+  //                   the forge-ops edge function with the vaulted
+  //                   per-user connection). This connection is per-sandbox,
+  //   so the user identity resolves directly from conn.sandboxId. Any
+  //   inbound Authorization header is ignored — tokens are injected
+  //   server-side only.
+  if (path.startsWith("/mcp/forgeyn")) {
+    try {
+      let sentHead = false;
+      for await (const event of handleForgeynTunnel(conn, frame)) {
+        if (event.kind === "head") {
+          sentHead = true;
+          send(conn, {
+            t: "res",
+            id,
+            status: event.status,
+            headers: event.headers,
+          });
+        } else {
+          if (!sentHead) {
+            send(conn, { t: "res", id, status: 200, headers: {} });
+            sentHead = true;
+          }
+          send(conn, { t: "chunk", id, body: event.body });
+        }
+      }
+      send(conn, { t: "done", id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "forgeyn tunnel forward failed";
+      logger.warn(
+        { sandboxId: conn.sandboxId, id, err: message },
+        "reverse-tunnel: forgeyn request failed",
+      );
+      send(conn, { t: "error", id, message });
+    }
+    return;
+  }
+
   if (path.startsWith("/mcp/")) {
     try {
       let sentHead = false;

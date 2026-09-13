@@ -78,6 +78,7 @@ import { logger } from "../lib/logger";
 import { forwardToNvidia } from "../services/nvidia-forwarder";
 import { handleGithubTunnel } from "../services/github-proxy";
 import { handleMcpTunnel } from "../services/supabase-mcp";
+import { handleForgeynTunnel } from "../services/forgeyn-bridge";
 
 // ─── Tunnel path ────────────────────────────────────────────────────────
 const TUNNEL_PATH = "/api/tunnel";
@@ -232,10 +233,58 @@ async function handleReqFrame(
       id,
       body: JSON.stringify({
         ok: false,
-        error: `unknown tunnel path "${path}" — supported: /tunnel/github, /mcp/supabase`,
+        error: `unknown tunnel path "${path}" — supported: /tunnel/github, /mcp/supabase, /mcp/forgeyn`,
       }),
     });
     send(ws, { t: "done", id });
+    return;
+  }
+
+  // FORGEYN BASE BRIDGE (the platform's own database): /mcp/forgeyn →
+  // the forge-ops edge function (create_database provisioning + forge
+  // ops on the user's vaulted connection). Same identity resolution as
+  // the supabase executor: sandbox → project → user, server-side only.
+  if (path.startsWith("/mcp/forgeyn")) {
+    const sandboxId =
+      (typeof frame.sandboxId === "string" && frame.sandboxId) || connSandbox.sandboxId;
+    if (!sandboxId) {
+      send(ws, {
+        t: "res",
+        id,
+        status: 403,
+        headers: { "content-type": "application/json" },
+      });
+      send(ws, {
+        t: "chunk",
+        id,
+        body: JSON.stringify({
+          ok: false,
+          error: "no project owner for this sandbox — include a sandboxId field in the req frame",
+        }),
+      });
+      send(ws, { t: "done", id });
+      return;
+    }
+    try {
+      let sentHead = false;
+      for await (const event of handleForgeynTunnel({ sandboxId }, frame)) {
+        if (event.kind === "head") {
+          sentHead = true;
+          send(ws, { t: "res", id, status: event.status, headers: event.headers });
+        } else {
+          if (!sentHead) {
+            send(ws, { t: "res", id, status: 200, headers: {} });
+            sentHead = true;
+          }
+          send(ws, { t: "chunk", id, body: event.body });
+        }
+      }
+      send(ws, { t: "done", id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "forgeyn tunnel forward failed";
+      logger.warn({ id, sandboxId, err: message }, "tunnel: forgeyn request failed");
+      send(ws, { t: "error", id, message });
+    }
     return;
   }
 
