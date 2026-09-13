@@ -225,8 +225,15 @@ LLM_MODEL = os.environ.get("ORCH_LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"
 AGENT_MODEL = os.environ.get("ORCH_AGENT_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 CHIEF_FALLBACK_MODEL = os.environ.get(
     "ORCH_CHIEF_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+# 2026-09-13 (live 410 Gone, observed on forgeyn.com.ng): minimax-m3 reached
+# end-of-life upstream ("has reached its end of life on 2026-09-09") and is
+# no longer served — the old FRONTEND primary killed whole verifier turns
+# at step 1. nemotron-3-super (its proven fallback) takes the primary slot;
+# minimax stays reachable via ORCH_FRONTEND_MODEL for accounts where a
+# successor model id is minted. The 410 demotion below guards any future
+# EOL the same way.
 FRONTEND_MODEL = os.environ.get(
-    "ORCH_FRONTEND_MODEL", "minimaxai/minimax-m3")
+    "ORCH_FRONTEND_MODEL", "nvidia/nemotron-3-super-120b-a12b")
 BACKEND_MODEL = os.environ.get(
     "ORCH_BACKEND_MODEL", "deepseek-ai/deepseek-v4-pro-0813")
 DEBUGGER_MODEL = os.environ.get(
@@ -1803,7 +1810,9 @@ def llm_chat(messages: List[Dict[str, str]], json_mode: bool = False,
             # reverse-tunnel-relayed ("reverse-tunnel: LLM upstream HTTP
             # 429: …" — live: this shape BYPASSED the old substring check
             # and 429s killed whole agent loops instead of failing over).
-            demotable = bool(re.search(r"HTTP (429|404|503)\b", msg)) \
+            # 410 Gone = the model reached END OF LIFE upstream (live:
+            # minimax-m3, 2026-09-09) — permanently unusable, demote.
+            demotable = bool(re.search(r"HTTP (429|404|410|503)\b", msg)) \
                 or "empty message" in msg
             if demotable and i < len(active) - 1:
                 _MODEL_DEMOTED[m] = time.time() + _MODEL_DEMOTE_S
