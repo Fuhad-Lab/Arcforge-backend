@@ -955,6 +955,61 @@ def recent_chat(limit: int = 200) -> List[Dict[str, Any]]:
     ][::-1]
 
 
+# ---------------------------------------------------------------------------
+# THE PROMPT-CACHING LAW (user mandate) — the canonical message array every
+# chat-facing LLM call must use:
+#
+#   [ the system prompt — pinned at the top, NEVER changes ]
+#   [ the ENTIRE chat history — the user's message first, the AI's reply
+#     next, in strict chronological order; new turns are ONLY EVER APPENDED
+#     at the bottom, never reordered, never rewritten ]
+#   [ the user's new prompt — the very last message ]
+#
+# The prefix above the newest turn is byte-stable across requests, so the
+# provider's prompt cache can reuse everything already processed and the
+# model only reads the newly appended part. NEVER embed history into a
+# single user blob, never truncate from the middle, never drop and re-add.
+# ---------------------------------------------------------------------------
+
+_CHAT_HISTORY_BUDGET_CHARS = 60000
+
+
+def _chat_messages(system: str, prompt: str) -> List[Dict[str, str]]:
+    """Build the canonical prompt-caching message array (see the law above).
+    The entire chat history rides as real messages — user messages first,
+    AI replies next, append-only. A generous char budget guards runaway
+    sessions: when forced, the OLDEST exchanges drop first (the prefix
+    changes only then, as the last resort — never silently per call).
+
+    DEDUP: enqueue_task records the incoming prompt in chat_history the
+    instant it arrives, so the newest user row IS this turn's prompt —
+    skip it there (it rides as the final message instead, exactly once)."""
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system}]
+    history = recent_chat(200)
+    # The newest row is this turn's prompt (enqueue_task wrote it) — drop
+    # it from the history slice so the final message is the only copy.
+    if history and history[-1].get("role") == "user" and \
+            str(history[-1].get("content") or "") == prompt:
+        history = history[:-1]
+    # Enforce the char budget from the BOTTOM up (newest always kept).
+    kept: List[Dict[str, Any]] = []
+    budget = _CHAT_HISTORY_BUDGET_CHARS
+    for row in reversed(history):
+        content = str(row.get("content") or "")
+        if not content.strip() or row.get("role") not in ("user", "assistant"):
+            continue
+        if len(content) <= budget:
+            kept.append(row)
+            budget -= len(content)
+        else:
+            break
+    kept.reverse()
+    for row in kept:
+        messages.append({"role": row["role"], "content": str(row["content"])})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
 def recent_logs(limit: int = LOG_TAIL_FOR_SYNC, task_id: Optional[str] = None) -> List[Dict[str, Any]]:
     with _db_lock, db() as conn:
         if task_id:
@@ -3605,14 +3660,14 @@ class ChiefAgent:
 
     # -- step 1: classify -------------------------------------------------
     def classify(self, prompt: str) -> Dict[str, Any]:
-        history = recent_chat(12)
-        convo = "\n".join(f"{m['role']}: {m['content'][:300]}" for m in history[-6:])
-        user = f"Recent conversation:\n{convo}\n\nNEW USER MESSAGE:\n{prompt}"
+        # THE PROMPT-CACHING LAW: [system pinned] + [the ENTIRE chat history
+        # as real messages — user first, AI reply next, append-only] + [the
+        # new user prompt]. The prefix never changes between turns, so the
+        # provider's prompt cache reuses everything already processed.
         try:
             pace_for_tpm()
             data = _extract_json(llm_chat(
-                [{"role": "system", "content": CHIEF_CLASSIFY_SYSTEM},
-                 {"role": "user", "content": user}],
+                _chat_messages(CHIEF_CLASSIFY_SYSTEM, prompt),
                 json_mode=True, max_tokens=1100, model=CHIEF_MODELS))
             if data.get("kind") == "answer" and str(data.get("reply", "")).strip():
                 return {"kind": "answer", "reply": str(data["reply"])}
@@ -3635,18 +3690,20 @@ class ChiefAgent:
     # -- step 2: plan -------------------------------------------------------
     def draft_plan(self, prompt: str) -> str:
         follow_up = workspace_has_source()
-        history = recent_chat(12)
-        convo = "\n".join(f"{m['role']}: {m['content'][:250]}" for m in history[-6:])
-        user = f"Conversation so far:\n{convo}\n\nUSER REQUEST:\n{prompt}\n"
+        # PROMPT-CACHING LAW (see _chat_messages): the ENTIRE chat history
+        # rides as real messages — user first, AI reply next, append-only —
+        # and the new prompt lands last. Phase-specific context (the existing
+        # codebase skeleton on follow-ups) rides the FINAL user message.
         if follow_up:
             repo_map = generate_repo_map()
-            user += (f"\nEXISTING CODEBASE SKELETON (this is a follow-up — the "
-                     f"plan must preserve and extend it):\n"
-                     f"{repo_map or workspace_tree_text()}\n")
+            tail = (f"\n\nEXISTING CODEBASE SKELETON (this is a follow-up — the "
+                    f"plan must preserve and extend it):\n"
+                    f"{repo_map or workspace_tree_text()}\n")
+        else:
+            tail = ""
         pace_for_tpm()
         return llm_chat(
-            [{"role": "system", "content": CHIEF_PLAN_SYSTEM},
-             {"role": "user", "content": user}],
+            _chat_messages(CHIEF_PLAN_SYSTEM, prompt + tail),
             json_mode=False, max_tokens=3600, model=CHIEF_MODELS).strip()
 
     def refine_plan(self, plan: str, feedback: str) -> str:
@@ -3666,20 +3723,20 @@ class ChiefAgent:
     # directly. No plan.md ⟹ planning is NECESSARY (the step-2 flow above).
     def assess_followup(self, prompt: str, plan_md: str) -> Dict[str, Any]:
         """The self-questioning gate: 'Is planning necessary for THIS request,
-        given the contract already exists?' — the Replit follow-up feel."""
+        given the contract already exists?' — the Replit follow-up feel.
+        The full chat history rides as messages (the prompt-caching law);
+        the contract + skeleton land in the final user message."""
         repo_map = generate_repo_map()
-        user = (
-            f"EXISTING CONTRACT (plan.md — the app is BUILT and verified "
+        tail = (
+            f"\n\nEXISTING CONTRACT (plan.md — the app is BUILT and verified "
             f"against it):\n{plan_md[:2200]}\n\n"
             f"CURRENT CODEBASE SKELETON:\n{(repo_map or workspace_tree_text())[:1800]}\n\n"
-            f"FOLLOW-UP REQUEST:\n{prompt[:1200]}\n\n"
             "Decide: direct build or new plan."
         )
         try:
             pace_for_tpm()
             data = _extract_json(llm_chat(
-                [{"role": "system", "content": CHIEF_FOLLOWUP_SYSTEM},
-                 {"role": "user", "content": user}],
+                _chat_messages(CHIEF_FOLLOWUP_SYSTEM, prompt[:1200] + tail),
                 json_mode=True, max_tokens=900, model=CHIEF_MODELS))
             plan_kind = str(data.get("plan", "")).strip().lower()
             agent = str(data.get("agent", "frontend")).strip().lower()
