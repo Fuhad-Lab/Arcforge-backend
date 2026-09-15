@@ -79,6 +79,7 @@ import { forwardToNvidia } from "../services/nvidia-forwarder";
 import { handleGithubTunnel } from "../services/github-proxy";
 import { handleMcpTunnel } from "../services/supabase-mcp";
 import { handleForgeynTunnel } from "../services/forgeyn-bridge";
+import { handleUserMcpTunnel } from "../services/mcp-proxy";
 
 // ─── Tunnel path ────────────────────────────────────────────────────────
 const TUNNEL_PATH = "/api/tunnel";
@@ -233,7 +234,7 @@ async function handleReqFrame(
       id,
       body: JSON.stringify({
         ok: false,
-        error: `unknown tunnel path "${path}" — supported: /tunnel/github, /mcp/supabase, /mcp/forgeyn`,
+        error: `unknown tunnel path "${path}" — supported: /tunnel/github, /mcp/supabase, /mcp/forgeyn, /mcp/servers, /mcp/server/<id>`,
       }),
     });
     send(ws, { t: "done", id });
@@ -292,6 +293,9 @@ async function handleReqFrame(
   // MCP executor. The inbound Authorization header (already stripped by
   // the VM-side client) is irrelevant here — the user's OAuth token is
   // injected server-side ONLY, inside callSupabaseMcpTool.
+  // /mcp/server/<id> + /mcp/servers (user-added external MCP servers —
+  // the Connectors page's MCP Servers tab) route to the mcp-proxy
+  // executor instead: same vault-token injection, per-user servers.
   if (path.startsWith("/mcp/")) {
     const sandboxId =
       (typeof frame.sandboxId === "string" && frame.sandboxId) || connSandbox.sandboxId;
@@ -314,8 +318,12 @@ async function handleReqFrame(
       return;
     }
     try {
+      const handler =
+        path.startsWith("/mcp/server/") || path === "/mcp/servers"
+          ? handleUserMcpTunnel
+          : handleMcpTunnel;
       let sentHead = false;
-      for await (const event of handleMcpTunnel({ sandboxId }, frame)) {
+      for await (const event of handler({ sandboxId }, frame)) {
         if (event.kind === "head") {
           sentHead = true;
           send(ws, { t: "res", id, status: event.status, headers: event.headers });

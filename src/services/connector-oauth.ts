@@ -40,6 +40,7 @@ import {
   upsertConnection,
   verifyState,
 } from "./connector-vault";
+import { completeMcpOAuth } from "./mcp-proxy";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const EDGE_BASE = process.env.EDGE_FUNCTION_BASE_URL || "";
@@ -333,6 +334,12 @@ export async function completeConnectorOAuth(code: string, stateRaw: string): Pr
   const state = verifyState(stateRaw);
   if (!code || !state || state.purpose !== "connector" || !state.connector || !state.userId) {
     return `${FRONTEND_URL}/connectors?connected=unknown&status=error`;
+  }
+  // User-added MCP servers (connector = "mcp:<uuid>"): the PKCE-bound
+  // exchange + vault storage + tool-catalog snapshot live in mcp-proxy —
+  // the same completion contract, different token mechanics.
+  if (state.connector.startsWith("mcp:")) {
+    return completeMcpOAuth(code, state, landing);
   }
   const connector = getConnector(state.connector);
   if (!connector) {

@@ -10,6 +10,7 @@ import tunnelWakeRouter from "./tunnel-wake";
 import authOauthRouter from "./auth-oauth";
 import authSessionRouter from "./auth-session";
 import connectorsRouter from "./connectors";
+import mcpConnectorsRouter from "./mcp-connectors";
 import githubImportRouter from "./github-import";
 
 const router: IRouter = Router();
@@ -37,6 +38,15 @@ router.use(authSessionRouter);
 // callback inside is public-by-design (signed state); everything else
 // requires a JWT via requireAuth inside the router.
 router.use(connectorsRouter);
+
+// /api/connectors/mcp/* — user-added external MCP servers (the MCP
+// Servers tab): discovery, dynamic client registration, PKCE authorize,
+// list/disconnect/tools. No path overlaps with the fixed-connector
+// router (its :id routes all end in /authorize|/disconnect|/decline|
+// /status literals); the shared OAuth callback (state.connector =
+// "mcp:<uuid>") funnels through connectors.ts → completeConnectorOAuth
+// → completeMcpOAuth.
+router.use(mcpConnectorsRouter);
 
 // /api/github/* — GitHub App repository importing (GROUP 3): repo listing
 // + tarball import on the caller's own GitHub App authorization (JWT

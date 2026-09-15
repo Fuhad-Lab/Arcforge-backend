@@ -1646,6 +1646,93 @@ def _forgeyn_base_call(op: str, args: Any) -> Dict[str, Any]:
     return out
 
 
+def _mcp_servers_call() -> Dict[str, Any]:
+    """User-added external MCP servers (Connectors → MCP Servers tab):
+    list the user's CONNECTED servers + their tool catalogs through the
+    reverse tunnel (/mcp/servers). The backend resolves sandbox→project→
+    user; tokens never enter the VM."""
+    try:
+        status, body = _tunnel_request("/mcp/servers", {})
+    except Exception as exc:  # noqa: BLE001 — transport failure, honest result
+        return {"ok": False,
+                "error": f"mcp_servers transport failed: "
+                         f"{type(exc).__name__}: {str(exc)[:200]}"}
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": f"mcp_servers: HTTP {status}: {body[:300]}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "mcp_servers: unexpected response shape"}
+    if not data.get("ok"):
+        return {"ok": False, "error": str(data.get("error") or f"HTTP {status}")}
+    servers = data.get("servers") if isinstance(data.get("servers"), list) else []
+    if not servers:
+        return {"ok": True, "servers": [],
+                "result": "no external MCP servers are connected — the user "
+                          "can add one on the Connectors page → MCP Servers tab"}
+    lines = []
+    for s in servers:
+        if not isinstance(s, dict):
+            continue
+        tools = ", ".join(str(t) for t in (s.get("tools") or [])[:40])
+        name = str(s.get("label") or s.get("server_url") or "")
+        server_name = str(s.get("server_name") or "")
+        suffix = f" — {server_name}" if server_name else ""
+        lines.append(f"- {name} (id: {s.get('id')}){suffix}: {tools}")
+    catalog = "\n".join(lines)
+    return {"ok": True, "servers": servers,
+            "result": f"connected MCP servers (call their tools with "
+                      f"mcp_call {{server:'<id>', tool:'<name>', args:{{…}}}}):\n"
+                      f"{catalog}"}
+
+
+def _mcp_server_call(server: str, tool: str, args: Any) -> Dict[str, Any]:
+    """One tool call on a user-added external MCP server through the
+    reverse tunnel (/mcp/server/<id> — the backend injects the user's
+    OAuth token server-side, same model as /mcp/supabase)."""
+    server = str(server or "").strip().strip("/")
+    tool = str(tool or "").strip()
+    if not server or not tool:
+        return {"ok": False,
+                "error": "mcp_call needs {server:'<id from mcp_servers>', "
+                         "tool:'<tool name>', args:{…}}"}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        status, body = _tunnel_request(
+            f"/mcp/server/{server}", {"tool": tool, "args": args})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False,
+                "error": f"mcp_call transport failed: "
+                         f"{type(exc).__name__}: {str(exc)[:200]}"}
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "error": f"mcp_call: HTTP {status}: {body[:300]}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "mcp_call: unexpected response shape"}
+    if data.get("needs_connector"):
+        return {"ok": False,
+                "error": str(data.get("error") or "the MCP server is not "
+                         "connected"),
+                "hint": "the user must reconnect this server on the "
+                        "Connectors page → MCP Servers tab"}
+    if not data.get("ok"):
+        return {"ok": False, "error": str(data.get("error") or f"HTTP {status}")}
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    blocks = result.get("content") if isinstance(result.get("content"), list) else []
+    text = "\n".join(str(b.get("text") or "")
+                      for b in blocks if isinstance(b, dict)).strip()
+    if len(text) > 6000:
+        text = text[:6000] + "…[truncated]"
+    return {"ok": True, "tool": tool, "result": text or "(empty result)"}
+
+
 async def _rt_send_and_await(req_id: str, frame: Dict[str, Any]) -> _InflightRT:
     entry = rt_mux.register(req_id)
     try:
@@ -2509,6 +2596,8 @@ TOOL_LABELS = {
     "request_connector": "Requesting a connector from you",
     "supabase_mcp": "Using your Supabase project",
     "forgeyn_base": "Creating your Forgeyn Base database",
+    "mcp_servers": "Listing your MCP servers",
+    "mcp_call": "Using your MCP server",
     "done": "Wrapping up",
 }
 
@@ -3087,10 +3176,36 @@ def _interaction_toolset(ctx: AgentContext
                      else f"error: {str(res.get('error', ''))[:140]}")
         return res
 
+    def mcp_servers_tool(a: Dict[str, Any]) -> Dict[str, Any]:
+        """User-added external MCP servers: the catalog (subagent surface —
+        same bridge the chief's mcp_servers node uses)."""
+        ctx.activity("Listing your MCP servers", "active", "")
+        res = _mcp_servers_call()
+        ctx.activity("Listing your MCP servers", "done",
+                     "ok" if res.get("ok")
+                     else f"error: {str(res.get('error', ''))[:140]}")
+        return res
+
+    def mcp_call(a: Dict[str, Any]) -> Dict[str, Any]:
+        """One tool call on a user-added external MCP server (subagent
+        surface): {server: <id>, tool: <name>, args: {...}}."""
+        server = str(a.get("server") or a.get("server_id") or "").strip()
+        tool = str(a.get("tool") or "").strip()
+        if not tool:
+            return {"ok": False, "error": "tool required (from mcp_servers)"}
+        ctx.activity("Using your MCP server", "active", tool)
+        res = _mcp_server_call(server, tool, a.get("args"))
+        ctx.activity("Using your MCP server", "done",
+                     "ok" if res.get("ok")
+                     else f"error: {str(res.get('error', ''))[:140]}")
+        return res
+
     return {"ask_user": ask_user, "request_secret": request_secret,
             "request_connector": request_connector,
             "supabase_mcp": supabase_mcp,
-            "forgeyn_base": forgeyn_base}
+            "forgeyn_base": forgeyn_base,
+            "mcp_servers": mcp_servers_tool,
+            "mcp_call": mcp_call}
 
 
 def _mailbox_toolset(ctx: AgentContext) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
@@ -3730,11 +3845,13 @@ Your tools:
 - request_connector: ask the user to connect an external service account (Supabase, GitHub) via OAuth consent — {"tool":"request_connector","args":{"connector":"supabase","capability":"supabase.database.write","reason":"<why — shown to the user>"}}. NEVER invent connection strings or fake a database.
 - forgeyn_base: THE PLATFORM'S OWN DATABASE (Forgeyn Base — db.forgeyn.com.ng). When the app needs a real database, call it FIRST — no connection round-trip: {"tool":"forgeyn_base","args":{"op":"create_database","organization":"<org name>","project":"<app name>"}} provisions and connects the USER's own account (organization + project = a private, isolated Postgres) and returns the connection. Then operate it: {"tool":"forgeyn_base","args":{"op":"run_sql","args":{"query":"<SQL>"}}} | list_tables | list_projects | create_app (mints the pk_/sk_ gateway credentials the APP uses at runtime) | list_apps | whoami. If it returns needs_credentials, ask the user for their db.forgeyn.com.ng password (ask_user) and retry with args.password. This is the DEFAULT database choice — only use Supabase when the user explicitly asks for it.
 - supabase_mcp: real operations on the user's CONNECTED Supabase account (apply_migration, execute_sql, list_tables, list_projects…) — {"tool":"supabase_mcp","args":{"tool":"<mcp tool>","args":{<mcp arguments>}}}. Requires request_connector first.
+- mcp_servers: list the user's CONNECTED external MCP servers and their tools (added on the Connectors page → MCP Servers tab) — {"tool":"mcp_servers","args":{}}. Call this FIRST whenever the plan needs an external integration that might be an MCP server.
+- mcp_call: call a tool on a user-connected external MCP server — {"tool":"mcp_call","args":{"server":"<server id from mcp_servers>","tool":"<tool name>","args":{<arguments>}}}.
 - github: GitHub operations via the user's connected account — {"tool":"github","args":{"action":"rest","method":"GET","path":"/user/repos"}} or {"tool":"github","args":{"action":"sync_workspace","repo":"auto-create:<name>","message":"<commit msg>"}}.
 - finish: everything the plan requires is done — no more tool calls.
 BRIEF QUALITY LAW (the platform enforces it): each call's "task" is the sub-agent's ONLY instructions — quote the concrete plan items it must deliver (endpoints with paths and shapes, pages with elements, file names). "Build it" / "do the rest" / "build so-so" briefs get bounced.
 Reply ONLY JSON:
-{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|terminal|vision|use_skill|ask_user|request_secret|request_connector|forgeyn_base|supabase_mcp|github|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","args":{"<tool-specific arguments as shown above>"},"reason":"<one line, internal>"} (omit "task" for tools that take only args; omit both for finish)."""
+{"tool":"<backend_agent|frontend_agent|integration_check|qa_verification|terminal|vision|use_skill|ask_user|request_secret|request_connector|forgeyn_base|supabase_mcp|mcp_servers|mcp_call|github|finish>","task":"<precise brief for that tool: what to build/fix, referencing concrete plan details — endpoints with paths, pages with elements, file names>","args":{"<tool-specific arguments as shown above>"},"reason":"<one line, internal>"} (omit "task" for tools that take only args; omit both for finish)."""
 
 CHIEF_FOLLOWUP_SYSTEM = """You are ArcForge — the user's build agent. An approved plan.md ALREADY exists and the app is built; the user sent a FOLLOW-UP request. INTERROGATE YOURSELF before answering: does this request need a NEW PLAN, or is it a contained change you can build directly under the existing contract — and WHICH of your tools owns it?
 - "direct": contained work — tweaks, fixes, restyling, copy, adding a small component, adjusting behaviour, small additions. No new plan needed: you already know the codebase and the contract. You will be handed the change verbatim and build it immediately.
@@ -4501,6 +4618,10 @@ _TOOL_ALIASES = {
     "connector": "request_connector", "connect": "request_connector",
     "supabase_mcp": "supabase_mcp", "supabase": "supabase_mcp",
     "mcp_supabase": "supabase_mcp", "supabase_mcp_tool": "supabase_mcp",
+    # User-added external MCP servers (Connectors → MCP Servers tab).
+    "mcp_servers": "mcp_servers", "list_mcp_servers": "mcp_servers",
+    "mcp_call": "mcp_call", "mcp_server": "mcp_call", "call_mcp": "mcp_call",
+    "mcp_tool": "mcp_call",
     "github": "github", "repo": "github", "git": "github",
     "finish": "end", "end": "end", "": "end",
 }
@@ -4509,6 +4630,7 @@ _TOOL_ALIASES = {
 # dispatch budget (R1); a separate utility cap (R6) is their loop valve.
 _UTILITY_TOOLS = {"terminal", "vision", "use_skill", "ask_user",
                   "request_secret", "request_connector", "supabase_mcp",
+                  "mcp_servers", "mcp_call",
                   "github"}
 
 
@@ -4857,12 +4979,15 @@ def chief_node(state: Dict[str, Any]) -> Dict[str, Any]:
                  "request_connector": "Requesting a connector from you",
                  "supabase_mcp": "Using your Supabase project",
                  "forgeyn_base": "Using your Forgeyn Base database",
+                 "mcp_servers": "Listing your MCP servers",
+                 "mcp_call": "Using your MCP server",
                  "github": "Working with GitHub"}.get(tool, tool)
         emit_activity(task_id, label, "active",
                       (str(d_args.get("command") or d_args.get("question")
                            or d_args.get("skill") or d_args.get("name")
                            or d_args.get("connector") or d_args.get("tool")
-                           or d_args.get("action") or task) or "")[:120])
+                           or d_args.get("server") or d_args.get("action")
+                           or task) or "")[:120])
         return {"next_agent": tool, "dispatch_task": task,
                 "dispatch_args": d_args, "utility_calls": utility_calls,
                 "utility_stalls": stalls}
@@ -5153,6 +5278,46 @@ def supabase_mcp_node(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"reports": reports}
 
 
+def mcp_servers_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """User-added external MCP servers: list the user's CONNECTED servers
+    and their tool catalogs (Connectors → MCP Servers tab) through the
+    reverse tunnel — the backend injects credentials server-side only."""
+    reports = dict(state.get("reports") or {})
+    res = _mcp_servers_call()
+    if res.get("ok"):
+        reports["mcp_servers"] = {"report": str(res.get("result"))[:3000]}
+    else:
+        reports["mcp_servers"] = {
+            "report": f"mcp_servers failed: {res.get('error')}"}
+    return {"reports": reports}
+
+
+def mcp_call_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """One tool call on a user-added external MCP server (the id comes
+    from mcp_servers) — bridged through the reverse tunnel with the
+    user's vault token injected server-side."""
+    reports = dict(state.get("reports") or {})
+    args = _parse_dispatch_args(state)
+    server = str(args.get("server") or args.get("server_id") or "").strip()
+    tool = str(args.get("tool") or "").strip()
+    if not server or not tool:
+        reports["mcp_call"] = {
+            "report": "mcp_call: needs {server: <id from mcp_servers>, "
+                      "tool: <tool name>, args: {...}} — call mcp_servers "
+                      "first to get the ids"}
+        return {"reports": reports}
+    res = _mcp_server_call(server, tool, args.get("args"))
+    if res.get("ok"):
+        reports[f"mcp_call:{tool}"] = {
+            "report": f"{tool}: {str(res.get('result'))[:2000]}"}
+    else:
+        hint = f" — {res['hint']}" if res.get("hint") else ""
+        reports[f"mcp_call:{tool}"] = {
+            "report": f"mcp_call ({tool}) failed: "
+                      f"{res.get('error')}{hint}"}
+    return {"reports": reports}
+
+
 def frontend_node(state: Dict[str, Any]) -> Dict[str, Any]:
     task_id = str(state.get("task_id", ""))
     reports = dict(state.get("reports") or {})
@@ -5278,6 +5443,9 @@ def build_swarm_graph():
     # GROUP 2 session 2: the chief's connector interaction + MCP tools.
     g.add_node("request_connector", request_connector_node)
     g.add_node("supabase_mcp", supabase_mcp_node)
+    # User-added external MCP servers (the MCP Servers tab surface).
+    g.add_node("mcp_servers", mcp_servers_node)
+    g.add_node("mcp_call", mcp_call_node)
     g.add_edge(START, "chief")
     g.add_conditional_edges(
         "chief", _route_from_chief,
@@ -5286,12 +5454,14 @@ def build_swarm_graph():
          "terminal": "terminal", "vision": "vision", "use_skill": "use_skill",
          "ask_user": "ask_user", "request_secret": "request_secret",
          "request_connector": "request_connector", "supabase_mcp": "supabase_mcp",
+         "mcp_servers": "mcp_servers", "mcp_call": "mcp_call",
          "github": "github", "end": END})
     g.add_edge("backend", "chief")
     g.add_edge("frontend", "chief")
     g.add_edge("fit_check", "chief")
     for util in ("terminal", "vision", "use_skill", "ask_user",
                  "request_secret", "request_connector", "supabase_mcp",
+                 "mcp_servers", "mcp_call",
                  "github"):
         g.add_edge(util, "chief")
     # debugger FAIL → chief (triage/fix loop); PASS → END (the user's spec).

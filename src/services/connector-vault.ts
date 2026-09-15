@@ -90,6 +90,11 @@ export interface OAuthState {
    * of always landing on /connectors. Server-validated to be a safe
    * same-origin path — never a full URL (no open-redirect). */
   returnPath?: string;
+  /** PKCE code verifier for user-added MCP servers (connector = "mcp:<uuid>").
+   *  Carried through the provider redirect inside this HMAC-signed blob —
+   *  the verifier is single-use with the authorization code and only this
+   *  backend can complete the exchange. */
+  codeVerifier?: string;
   nonce: string;
   exp: number;
 }
