@@ -571,7 +571,14 @@ router.post("/project/:projectId/engine-run", async (req: Request, res: Response
       res.status(400).json({ error: "runId is required" });
       return;
     }
-    const engineOrigin = req.body?.engineOrigin === "vm" ? "vm" : "render";
+    // THE THREE ORIGINS (2026-09-15 root-cause fix, live-observed on the
+    // Pomodoro run): this used to collapse everything but "vm" into
+    // "render" — a Forgvi 3.0 run's row said "render", so a re-opened
+    // studio's restoreForgviRun dialed the 2.0 engine, got a 404, and
+    // honestly settled the run as a ghost while the real 3.0 run kept
+    // iterating server-side with the browser reported "offline".
+    const rawOrigin = typeof req.body?.engineOrigin === "string" ? req.body.engineOrigin.trim() : "";
+    const engineOrigin = rawOrigin === "vm" ? "vm" : rawOrigin === "forgvi3" ? "forgvi3" : "render";
     const status = typeof req.body?.status === "string" && req.body.status ? req.body.status : "running";
     const objective = typeof req.body?.objective === "string" ? req.body.objective : null;
 
