@@ -753,9 +753,14 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
     if (!supabase) return;
 
     // slug + published_at ride along so the studio Publish button can show
-    // its LIVE state without an extra round-trip.
+    // its LIVE state without an extra round-trip. The engine_run_* columns
+    // ride along so a re-opened studio can RE-ATTACH to an in-flight Forgvi
+    // 2.0/3.0 run (restoreForgviRun consumes project.engineRun — without it
+    // a fresh browser/tab shows the run as "offline" forever and the
+    // engine defers every build verification; live-observed 2026-09-15 on
+    // the Pomodoro run).
     const SESSION_COLUMNS =
-      "id,user_id,name,logo_url,platforms,session_id,sandbox_id,visibility,slug,published_at,mode";
+      "id,user_id,name,logo_url,platforms,session_id,sandbox_id,visibility,slug,published_at,mode,engine_run_id,engine_run_origin,engine_run_status,engine_run_objective";
     type SessionProject = {
       id: string;
       user_id: string;
@@ -768,6 +773,10 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
       slug: string | null;
       published_at: string | null;
       mode: string | null;
+      engine_run_id?: string | null;
+      engine_run_origin?: string | null;
+      engine_run_status?: string | null;
+      engine_run_objective?: string | null;
     };
 
     // ── 1. OWNER PATH (unchanged shape): the caller's own project by
@@ -835,6 +844,22 @@ router.get("/sessions/:sessionId", async (req: Request, res: Response, next: Nex
             visibility: owned.visibility,
             slug: owned.slug,
             publishedAt: owned.published_at,
+            // The in-flight engine run (if any) — the re-opened studio's
+            // restoreForgviRun re-attaches the journal stream from it.
+            engineRun:
+              owned.engine_run_id && owned.engine_run_status === "running"
+                ? {
+                    runId: owned.engine_run_id,
+                    origin:
+                      owned.engine_run_origin === "vm"
+                        ? "vm"
+                        : owned.engine_run_origin === "forgvi3"
+                          ? "forgvi3"
+                          : "render",
+                    status: owned.engine_run_status,
+                    objective: owned.engine_run_objective ?? null,
+                  }
+                : null,
           },
           messages,
         },
