@@ -3,10 +3,16 @@
  * page (frontend → connector-ops edge → here).
  *
  *   POST /api/connectors/mcp/add          → discover + register + authorize URL
+ *                                           (…?api_key=… connects with a
+ *                                           pasted bearer key instead — the
+ *                                           Render fallback while their
+ *                                           client approval is pending)
  *   GET  /api/connectors/mcp/list         → sanitized servers + status
  *   POST /api/connectors/mcp/:id/disconnect → drop row + vault tokens
  *   GET  /api/connectors/mcp/:id/tools    → live tools/list (updates cache)
  *   POST /api/connectors/mcp/:id/reconnect→ re-run discovery + authorize
+ *   POST /api/connectors/mcp/:id/connect-key → connect an existing row with
+ *                                           a user-pasted API key
  *
  * The OAuth callback itself lands on the SHARED /api/connectors/callback
  * (state.connector = "mcp:<uuid>") — see completeConnectorOAuth's
@@ -23,6 +29,7 @@ import { deleteConnection } from "../services/connector-vault";
 import { allowedLandingBase } from "../services/connector-oauth";
 import {
   addMcpServer,
+  connectMcpWithKey,
   deleteServerRow,
   getServerRow,
   listMcpTools,
@@ -49,18 +56,19 @@ function fail(res: Response, err: unknown): void {
   res.status(500).json({ error: "An unexpected error interrupted the MCP server operation." });
 }
 
-/** ── ADD (discover + register + authorize) ─────────────────────────── */
+/** ── ADD (discover + register + authorize; or API-key connect) ────── */
 router.post("/connectors/mcp/add", async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const body = (req.body || {}) as { url?: string; origin?: string };
+  const body = (req.body || {}) as { url?: string; origin?: string; api_key?: string };
   const url = typeof body.url === "string" ? body.url : "";
   if (!url.trim()) {
     res.status(400).json({ error: "The MCP server URL is required." });
     return;
   }
+  const apiKey = typeof body.api_key === "string" ? body.api_key : undefined;
   try {
     const landingBase = allowedLandingBase(body.origin);
-    const outcome = await addMcpServer(userId, url, landingBase);
+    const outcome = await addMcpServer(userId, url, landingBase, apiKey);
     res.json({
       server_id: outcome.serverId,
       label: outcome.label,
@@ -133,6 +141,35 @@ router.post("/connectors/mcp/:id/reconnect", async (req: Request, res: Response)
       label: outcome.label,
       ...(outcome.authorizeUrl ? { authorize_url: outcome.authorizeUrl } : {}),
       ...(outcome.connected ? { connected: true, tool_count: outcome.toolCount ?? 0 } : {}),
+    });
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+/** ── CONNECT-KEY (user fix 2026-09-16 — the Render fallback) ────────
+ *  Secondary connection option for an EXISTING server row: the user
+ *  pastes a standard API key / bearer token, the backend validates it
+ *  with a live MCP initialize, stores it encrypted in the vault, and
+ *  injects `Authorization: Bearer <key>` into every outgoing MCP agent
+ *  request server-side. For providers whose OAuth client registration is
+ *  still pending approval (Render), this is THE connection path. */
+router.post("/connectors/mcp/:id/connect-key", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const id = String(req.params.id);
+  const body = (req.body || {}) as { api_key?: string };
+  const apiKey = typeof body.api_key === "string" ? body.api_key.trim() : "";
+  if (!apiKey) {
+    res.status(400).json({ error: "The API key is required.", code: "key_rejected" });
+    return;
+  }
+  try {
+    const outcome = await connectMcpWithKey(userId, id, apiKey);
+    res.json({
+      server_id: outcome.serverId,
+      label: outcome.label,
+      connected: true,
+      tool_count: outcome.toolCount ?? 0,
     });
   } catch (err) {
     fail(res, err);

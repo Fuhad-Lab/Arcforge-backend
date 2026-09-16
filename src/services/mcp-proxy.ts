@@ -73,6 +73,8 @@ export type McpErrorCode =
   | "auth_discovery_failed"
   | "registration_failed"
   | "registration_unsupported"
+  | "authorize_rejected"
+  | "key_rejected"
   | "exchange_failed"
   | "no_token"
   | "internal";
@@ -113,12 +115,10 @@ export async function normalizeServerUrl(raw: string): Promise<URL> {
   if (url.username || url.password) {
     throw new McpError("invalid_url", "URLs with embedded credentials are not supported.");
   }
-  if (url.pathname === "/" || url.pathname === "") {
-    throw new McpError(
-      "invalid_url",
-      "Include the full MCP endpoint path (e.g. https://host.example.com/mcp).",
-    );
-  }
+  // NOTE (user fix 2026-09-16): the root path IS a valid MCP endpoint —
+  // Vercel's hosted MCP server lives at https://mcp.vercel.com/ exactly.
+  // The old "include the full endpoint path" rejection made Vercel
+  // un-addable; only genuinely malformed URLs are rejected now.
   const host = url.hostname.toLowerCase().replace(/\.$/, "");
   if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal") || host.endsWith(".local")) {
     throw new McpError("invalid_url", "Local and internal hostnames cannot be added.");
@@ -160,6 +160,10 @@ export interface McpServerRow {
   label: string | null;
   status: string;
   auth_required: boolean;
+  /** How the stored credential was obtained: "oauth" (PKCE round-trip),
+   *  "api_key" (user-pasted bearer key — never expires, never refreshes),
+   *  NULL for open servers (user fix 2026-09-16: the Render fallback). */
+  auth_mode: string | null;
   authorization_endpoint: string | null;
   token_endpoint: string | null;
   registration_endpoint: string | null;
@@ -369,6 +373,62 @@ async function authorizationServer(issuer: string): Promise<Record<string, unkno
   return null;
 }
 
+/** Build the normalized auth metadata from a raw AS document. */
+function asMetadata(issuer: string, as: Record<string, unknown>): McpAuthMetadata {
+  const scopes = Array.isArray(as.scopes_supported)
+    ? (as.scopes_supported as unknown[]).filter((s): s is string => typeof s === "string").join(" ")
+    : null;
+  return {
+    authRequired: true,
+    issuer,
+    authorizationEndpoint: as.authorization_endpoint as string,
+    tokenEndpoint: as.token_endpoint as string,
+    registrationEndpoint: typeof as.registration_endpoint === "string" ? as.registration_endpoint : null,
+    revocationEndpoint: typeof as.revocation_endpoint === "string" ? as.revocation_endpoint : null,
+    scopesSupported: scopes && scopes.length > 0 ? scopes.slice(0, 400) : null,
+  };
+}
+
+/** Does this AS document accept PUBLIC clients (token_endpoint_auth_method
+ *  "none")? Allowlisted MCP providers (Vercel, Render) publish a separate
+ *  MCP-facing authorization-server document that supports public clients +
+ *  PKCE, while their general web-integration metadata only lists
+ *  client_secret_* methods — the MCP one is the one this proxy must use. */
+function supportsPublicClients(as: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(as.token_endpoint_auth_methods_supported) &&
+    (as.token_endpoint_auth_methods_supported as unknown[]).includes("none")
+  );
+}
+
+/** AS metadata published on the MCP server's own origin (both the root
+ *  well-known form and the path-inserted form) — Vercel's MCP-facing
+ *  document lives here. Returns [] when the origin publishes none. */
+async function serverOriginAuthServers(server: URL): Promise<Array<{ issuer: string; as: Record<string, unknown> }>> {
+  const origin = server.origin;
+  const path = server.pathname.replace(/\/+$/, "");
+  const candidates =
+    path && path !== "/"
+      ? [
+          `${origin}/.well-known/oauth-authorization-server${path}`,
+          `${origin}/.well-known/oauth-authorization-server`,
+        ]
+      : [`${origin}/.well-known/oauth-authorization-server`];
+  const found: Array<{ issuer: string; as: Record<string, unknown> }> = [];
+  for (const candidate of candidates) {
+    const meta = await fetchWellKnown(candidate);
+    if (
+      meta &&
+      typeof meta.authorization_endpoint === "string" &&
+      typeof meta.token_endpoint === "string" &&
+      !found.some((f) => f.as.authorization_endpoint === meta.authorization_endpoint)
+    ) {
+      found.push({ issuer: origin, as: meta });
+    }
+  }
+  return found;
+}
+
 /**
  * Discover whether an MCP server needs OAuth and, if so, its complete
  * authorization-server metadata.
@@ -445,29 +505,109 @@ export async function discoverMcpAuth(server: URL): Promise<McpAuthMetadata | { 
     );
   }
 
+  const candidates: Array<{ issuer: string; as: Record<string, unknown> }> = [];
   for (const issuer of issuers.slice(0, 3)) {
     const as = await authorizationServer(issuer);
-    if (!as) continue;
-    const scopes = Array.isArray(as.scopes_supported)
-      ? (as.scopes_supported as unknown[]).filter((s): s is string => typeof s === "string").join(" ")
-      : null;
-    return {
-      authRequired: true,
-      issuer,
-      authorizationEndpoint: as.authorization_endpoint as string,
-      tokenEndpoint: as.token_endpoint as string,
-      registrationEndpoint: typeof as.registration_endpoint === "string" ? as.registration_endpoint : null,
-      revocationEndpoint: typeof as.revocation_endpoint === "string" ? as.revocation_endpoint : null,
-      scopesSupported: scopes && scopes.length > 0 ? scopes.slice(0, 400) : null,
-    };
+    if (as) candidates.push({ issuer, as });
   }
-  throw new McpError(
-    "auth_discovery_failed",
-    "The server's authorization server metadata could not be read (RFC 8414).",
-  );
+  // USER FIX (2026-09-16, the Vercel invalid_client incident): some
+  // providers (Vercel) publish their MCP-facing AS metadata on the MCP
+  // server's own origin (mcp.vercel.com/.well-known/oauth-authorization-
+  // server) while the RFC 9728 authorization_servers entry (vercel.com)
+  // serves the web-integration document — confidential clients only, a
+  // different token endpoint, no registration. Also probe the server's
+  // own origin and PREFER any document that accepts public clients.
+  for (const candidate of await serverOriginAuthServers(server)) {
+    if (!candidates.some((c) => c.as.authorization_endpoint === candidate.as.authorization_endpoint && c.as.token_endpoint === candidate.as.token_endpoint)) {
+      candidates.push(candidate);
+    }
+  }
+  if (candidates.length === 0) {
+    throw new McpError(
+      "auth_discovery_failed",
+      "The server's authorization server metadata could not be read (RFC 8414).",
+    );
+  }
+  const preferred = candidates.find((c) => supportsPublicClients(c.as)) ?? candidates[0];
+  if (preferred !== candidates[0]) {
+    logger.info(
+      { server: server.hostname, issuer: preferred.issuer },
+      "mcp-proxy: chose the public-client authorization-server document",
+    );
+  }
+  return asMetadata(preferred.issuer, preferred.as);
 }
 
-// ─── Dynamic client registration (RFC 7591) ─────────────────────────────
+// ─── Pre-registered client directory (allowlisted providers) ───────────
+
+/** USER FIX (2026-09-16, the invalid_client incident): major cloud
+ *  providers (Vercel, Render) protect their hosted MCP routes with OAuth
+ *  CLIENT ALLOWLISTS — unrecognized client ids are rejected with
+ *  {"error":"invalid_client"} no matter how correct the PKCE handshake is.
+ *  Forgeyn therefore registers itself with the provider's partner dashboard
+ *  beforehand and the resulting client id is resolved HERE, before any
+ *  RFC 7591 dynamic registration or platform-URL fallback runs.
+ *
+ *  Resolution order per server host:
+ *   1. Environment overrides — the services that need them carry the ids
+ *      as env vars (VERCEL_CLIENT_ID, RENDER_MCP_CLIENT_ID) so nothing is
+ *      hardcoded in the repo.
+ *   2. The platform-owned `public.mcp_client_registry` table (RLS on, zero
+ *      policies — service-role only): server_host → client_id (+ optional
+ *      encrypted secret for future confidential clients). Editable without
+ *      a redeploy; this is where the provisioned production client keys
+ *      live (Vercel's cl_… today, Render's when their approval lands).
+ */
+const ENV_CLIENT_BY_HOST: Array<{ host: string; envVar: string }> = [
+  { host: "mcp.vercel.com", envVar: "VERCEL_CLIENT_ID" },
+  { host: "mcp.render.com", envVar: "RENDER_MCP_CLIENT_ID" },
+];
+
+interface DirectoryClientRow {
+  server_host: string;
+  client_id: string;
+  client_secret_enc: string | null;
+}
+
+async function lookupRegisteredClient(serverUrl: string): Promise<RegisteredClient | null> {
+  let host = "";
+  try {
+    host = new URL(serverUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+  // 1. Env override (the service that runs this proxy).
+  const envEntry = ENV_CLIENT_BY_HOST.find((e) => e.host === host);
+  if (envEntry) {
+    const clientId = process.env[envEntry.envVar] || "";
+    if (clientId) {
+      logger.info({ host, envVar: envEntry.envVar }, "mcp-proxy: using the pre-registered OAuth client (env)");
+      return { clientId, clientSecret: null };
+    }
+  }
+  // 2. Platform client registry (DB).
+  if (isSupabaseConfigured()) {
+    try {
+      const { data, error } = await getServiceSupabase()
+        .from("mcp_client_registry")
+        .select("server_host,client_id,client_secret_enc")
+        .eq("server_host", host)
+        .maybeSingle();
+      if (!error && data) {
+        const row = data as DirectoryClientRow;
+        const secret = row.client_secret_enc ? decryptToken(row.client_secret_enc) : null;
+        logger.info({ host }, "mcp-proxy: using the pre-registered OAuth client (registry)");
+        return { clientId: row.client_id, clientSecret: secret };
+      }
+    } catch (err) {
+      logger.warn(
+        { host, err: err instanceof Error ? err.message : "unknown" },
+        "mcp-proxy: client registry lookup failed — continuing to dynamic registration",
+      );
+    }
+  }
+  return null;
+}
 
 /** The platform's registered OAuth callback — the SAME edge function the
  *  fixed connectors use (connector-ops relays ?code&state to the backend). */
@@ -487,12 +627,22 @@ export interface RegisteredClient {
 }
 
 /** Register this platform as an OAuth client with the target authorization
- *  server. Falls back to the public-client identity (client_id = the
- *  platform URL, per the MCP OAuth guide) when no registration endpoint
- *  exists. */
+ *  server. Pre-registered (allowlisted) clients win FIRST — Vercel/Render
+ *  reject unknown clients with invalid_client outright, so the directory
+ *  entry (env → mcp_client_registry) is checked before anything else.
+ *  Falls back to RFC 7591 dynamic registration when the AS offers it, and
+ *  finally to the public-client identity (client_id = the platform URL)
+ *  for servers that accept any public client + PKCE. */
 export async function registerMcpClient(
   meta: McpAuthMetadata,
+  serverUrl: string,
 ): Promise<RegisteredClient> {
+  // 1. Pre-registered directory client (env → DB registry). No
+  //  registration call — the provider's allowlist already knows this
+  //  client, and a self-registered one would be rejected anyway.
+  const registered = await lookupRegisteredClient(serverUrl);
+  if (registered) return registered;
+
   if (!meta.registrationEndpoint) {
     // Per modern MCP OAuth 2.1 practice the client id can be the platform
     // URL — works with servers that accept any public client + PKCE.
@@ -573,6 +723,72 @@ export function buildMcpAuthorizeUrl(
   });
   if (row.scopes) params.set("scope", row.scopes);
   return `${row.authorization_endpoint}?${params.toString()}`;
+}
+
+/** ── AUTHORIZE PRE-FLIGHT (user fix 2026-09-16, the invalid_client
+ *  incident): allowlisted providers reject unknown clients / unregistered
+ *  redirect URIs at the AUTHORIZE step with a raw JSON error page — the
+ *  exact dead end the user hit on Vercel and Render. One cheap GET of the
+ *  authorize URL (no code is issued, the state is never consumed) BEFORE
+ *  the browser navigates turns that into an actionable error: the exact
+ *  callback URL to register, and the API-key alternative when the provider
+ *  simply does not know our client. 2xx/3xx = the flight passes.
+ *
+ *  Network hiccups do NOT block the flow (same contract as the Supabase
+ *  pre-flight on the fixed connectors). */
+export async function preflightMcpAuthorize(authorizeUrl: string, serverUrl: string): Promise<void> {
+  let host = "";
+  try {
+    host = new URL(serverUrl).hostname.toLowerCase();
+  } catch {
+    /* keep the generic message */
+  }
+  try {
+    const res = await fetch(authorizeUrl, {
+      method: "GET",
+      redirect: "manual",
+      headers: { "User-Agent": "arcforge-mcp-proxy", Accept: "application/json" },
+      signal: AbortSignal.timeout(REGISTRATION_TIMEOUT_MS),
+    });
+    if (res.status < 400) return;
+    const body = await res.text().catch(() => "");
+    let providerError = "";
+    let providerDescription = "";
+    try {
+      const parsed = JSON.parse(body) as { error?: string; error_description?: string };
+      providerError = typeof parsed.error === "string" ? parsed.error : "";
+      providerDescription = typeof parsed.error_description === "string" ? parsed.error_description : "";
+    } catch {
+      /* HTML error page — the status code is all we have */
+    }
+    logger.warn(
+      { host, status: res.status, error: providerError, detail: body.slice(0, 200) },
+      "mcp-proxy: authorize pre-flight rejected the request",
+    );
+    const redirectUri = mcpRedirectUri();
+    const idHint = host ? ` for ${host}` : "";
+    if (providerError === "invalid_client" || res.status === 401) {
+      throw new McpError(
+        "authorize_rejected",
+        `The provider rejected this platform's OAuth client${idHint} ("unknown or inactive client") — its MCP routes are protected by a client allowlist. ` +
+          `If you have an API key for this service, connect with "Use API key" instead; otherwise the platform's client must be registered with the provider first. ` +
+          `The callback URL to register is: ${redirectUri}`,
+        `HTTP ${res.status}${providerDescription ? `: ${providerDescription}` : ""}`,
+      );
+    }
+    throw new McpError(
+      "authorize_rejected",
+      `The provider rejected the authorization request before login (HTTP ${res.status}${providerError ? `, ${providerError}` : ""}) — ` +
+        `this usually means the OAuth client's registered redirect URI does not match. The exact callback URL to register is: ${redirectUri}`,
+      body.slice(0, 200) || undefined,
+    );
+  } catch (err) {
+    if (err instanceof McpError) throw err;
+    logger.warn(
+      { host, err: err instanceof Error ? err.message : "unknown" },
+      "mcp-proxy: authorize pre-flight unreachable (continuing — the browser will show the provider's own error)",
+    );
+  }
 }
 
 // ─── Token exchange + refresh ───────────────────────────────────────────
@@ -787,15 +1003,28 @@ export interface AddMcpOutcome {
  * immediately (open server) or mint the OAuth authorize URL (PKCE S256).
  * `landingBase` is the validated origin the OAuth round-trip must return
  * the user to (allowedLandingBase at the route).
+ *
+ * API-KEY MODE (user fix 2026-09-16, the Render fallback): when `apiKey`
+ * is supplied, OAuth is skipped entirely — the key is validated with a live
+ * MCP initialize, stored encrypted in the vault as the server's bearer
+ * credential, and every outgoing MCP request gets `Authorization: Bearer
+ * <key>` injected server-side (the proxy's interception point). Providers
+ * whose OAuth registration is pending (Render) or any bearer-token MCP
+ * server connect this way.
  */
 export async function addMcpServer(
   userId: string,
   rawUrl: string,
   landingBase: string,
+  apiKey?: string,
 ): Promise<AddMcpOutcome> {
   const server = await normalizeServerUrl(rawUrl);
   const serverUrl = server.toString();
   const label = hostLabel(serverUrl);
+
+  if (apiKey && apiKey.trim()) {
+    return connectServerWithKey(userId, serverUrl, label, apiKey.trim());
+  }
 
   const discovery = await discoverMcpAuth(server);
 
@@ -807,6 +1036,7 @@ export async function addMcpServer(
       label,
       status: "connecting",
       auth_required: false,
+      auth_mode: null,
     });
     const row = await getServerRowByUrl(userId, serverUrl);
     if (!row) throw new McpError("internal", "Could not save the MCP server.");
@@ -826,13 +1056,14 @@ export async function addMcpServer(
   }
 
   // OAuth server: register the platform, then mint the authorize URL.
-  const client = await registerMcpClient(discovery);
+  const client = await registerMcpClient(discovery, serverUrl);
   await upsertServerRow({
     user_id: userId,
     server_url: serverUrl,
     label,
     status: "connecting",
     auth_required: true,
+    auth_mode: "oauth",
     authorization_endpoint: discovery.authorizationEndpoint,
     token_endpoint: discovery.tokenEndpoint,
     registration_endpoint: discovery.registrationEndpoint,
@@ -856,7 +1087,128 @@ export async function addMcpServer(
     15 * 60 * 1000,
   );
   const authorizeUrl = buildMcpAuthorizeUrl(row, client, state, challenge);
+  // Turn the provider's raw invalid_client / redirect-mismatch error page
+  // into an actionable message BEFORE the browser navigates.
+  await preflightMcpAuthorize(authorizeUrl, serverUrl);
   return { serverId: row.id, authorizeUrl, label };
+}
+
+/** Shared API-key connection engine (add-time and the /connect-key
+ * route): validate the key with a live initialize, store it encrypted,
+ * snapshot the tool catalog. The key never appears in logs, tool results,
+ * or the browser — only the vault and the injected Authorization header. */
+async function connectServerWithKey(
+  userId: string,
+  serverUrl: string,
+  label: string,
+  apiKey: string,
+): Promise<AddMcpOutcome> {
+  if (apiKey.length < 8 || apiKey.length > 512) {
+    throw new McpError("key_rejected", "That API key does not look valid (length).", `len=${apiKey.length}`);
+  }
+  await upsertServerRow({
+    user_id: userId,
+    server_url: serverUrl,
+    label,
+    status: "connecting",
+    auth_required: true,
+    auth_mode: "api_key",
+  });
+  const row = await getServerRowByUrl(userId, serverUrl);
+  if (!row) throw new McpError("internal", "Could not save the MCP server.");
+
+  // Validate: a bare initialize with the key as the Bearer token.
+  let probe: Awaited<ReturnType<typeof rpcPost>>;
+  try {
+    probe = await rpcPost(
+      serverUrl,
+      apiKey,
+      {
+        jsonrpc: "2.0",
+        id: ++rpcId,
+        method: "initialize",
+        params: {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: "arcforge-mcp-proxy", version: "1.0" },
+        },
+      },
+      undefined,
+      MCP_INIT_TIMEOUT_MS,
+    );
+  } catch (err) {
+    await upsertServerRow({ user_id: userId, server_url: serverUrl, status: "error" }).catch(() => undefined);
+    throw new McpError(
+      "unreachable",
+      "The MCP server did not respond.",
+      err instanceof Error ? err.message : undefined,
+    );
+  }
+  if (probe.status === 401 || probe.status === 403) {
+    await upsertServerRow({ user_id: userId, server_url: serverUrl, status: "error" }).catch(() => undefined);
+    throw new McpError(
+      "key_rejected",
+      "The server rejected this API key (HTTP " + probe.status + ") — check that the key is valid, active, and has the right scopes.",
+    );
+  }
+  if (probe.status !== 200) {
+    await upsertServerRow({ user_id: userId, server_url: serverUrl, status: "error" }).catch(() => undefined);
+    throw new McpError(
+      "unreachable",
+      `The server answered HTTP ${probe.status} to the key-authenticated initialize — it does not behave like a bearer-token MCP server.`,
+    );
+  }
+
+  // Store the key as the server's bearer credential (AES-256-GCM in the
+  // vault; no refresh, no expiry — keys are revoked by deleting them).
+  await upsertConnection(userId, `mcp:${row.id}`, {
+    accessToken: apiKey,
+    refreshToken: null,
+    expiresAt: null,
+  }, {
+    accountLabel: label,
+    grantedCapabilities: null,
+  });
+  sessions.delete(sessionKey(userId, row.id));
+
+  try {
+    const tools = await listMcpTools(row);
+    await upsertServerRow({
+      user_id: userId,
+      server_url: serverUrl,
+      status: "connected",
+      connected_at: new Date().toISOString(),
+    });
+    logger.info({ userId, serverId: row.id, toolCount: tools.length }, "mcp-proxy: connected with API key (stored encrypted; value never logged)");
+    return { serverId: row.id, connected: true, toolCount: tools.length, label };
+  } catch (err) {
+    // The key WORKS (initialize passed) — the connection stands even if
+    // the catalog snapshot hiccups.
+    await upsertServerRow({
+      user_id: userId,
+      server_url: serverUrl,
+      status: "connected",
+      connected_at: new Date().toISOString(),
+    }).catch(() => undefined);
+    logger.warn(
+      { userId, serverId: row.id, err: err instanceof Error ? err.message : "unknown" },
+      "mcp-proxy: API-key connect stood, but the tool snapshot failed",
+    );
+    return { serverId: row.id, connected: true, toolCount: 0, label };
+  }
+}
+
+/** Connect an EXISTING server row with a user-pasted API key (the
+ * "secondary connection fallback" for stuck OAuth rows — e.g. Render
+ * while their client approval is pending). */
+export async function connectMcpWithKey(
+  userId: string,
+  serverId: string,
+  apiKey: string,
+): Promise<AddMcpOutcome> {
+  const row = await getServerRow(userId, serverId);
+  if (!row) throw new McpError("internal", "Unknown MCP server.");
+  return connectServerWithKey(userId, row.server_url, row.label || hostLabel(row.server_url), apiKey);
 }
 
 /** Complete the OAuth round-trip for a user-added server (called from
@@ -1026,6 +1378,9 @@ export interface SanitizedMcpServer {
   label: string;
   status: "pending" | "connecting" | "connected" | "error" | "expired";
   auth_required: boolean;
+  /** "oauth" | "api_key" | null (open) — drives the UI's auth-model chip
+   *  and the "Use API key" affordance. */
+  auth_mode: string | null;
   server_name: string | null;
   server_version: string | null;
   tool_count: number | null;
@@ -1054,6 +1409,7 @@ export function sanitizeServer(row: McpServerRow): SanitizedMcpServer {
     label: row.label || hostLabel(row.server_url),
     status,
     auth_required: row.auth_required,
+    auth_mode: row.auth_mode ?? (row.auth_required ? "oauth" : null),
     server_name: row.server_name,
     server_version: row.server_version,
     tool_count: row.tool_count,
@@ -1094,9 +1450,14 @@ export async function listUserServers(userId: string): Promise<SanitizedMcpServe
   }
   return rows.map((row) => {
     const sanitized = sanitizeServer(row);
-    if (sanitized.status === "connected" && row.auth_required) {
+    // Expiry is an OAUTH concept — an API-key credential has no expiry and
+    // no refresh; it stays "connected" until the server 401s a call (the
+    // executor then asks for a reconnect honestly). USER FIX 2026-09-16:
+    // the old "no expiry info ⇒ expired" rule mislabeled every key-based
+    // connection as expired the moment it was created.
+    if (sanitized.status === "connected" && row.auth_required && sanitized.auth_mode !== "api_key") {
       const expiresAt = expiryById.get(row.id);
-      if (!expiresAt || (expiryById.has(row.id) && new Date(expiresAt).getTime() < Date.now())) {
+      if (expiresAt && new Date(expiresAt).getTime() < Date.now()) {
         sanitized.status = "expired";
       }
     }
