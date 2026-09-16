@@ -179,12 +179,18 @@ router.post("/connectors/mcp/:id/connect-key", async (req: Request, res: Respons
 /** ── STATUS (single server) ───────────────────────────────────────── */
 router.get("/connectors/mcp/:id/status", async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const row = await getServerRow(userId, String(req.params.id));
+  const id = String(req.params.id);
+  const row = await getServerRow(userId, id);
   if (!row) {
     res.status(404).json({ error: "Unknown MCP server." });
     return;
   }
-  res.json(sanitizeServer(row));
+  // SELF-HEALING (user fix 2026-09-16): derive through the SAME list
+  // engine (refresh-on-read + expiry verdict) so the single-server
+  // status can never disagree with the list the page renders.
+  const servers = await listUserServers(userId);
+  const server = servers.find((s) => s.id === id);
+  res.json(server ?? sanitizeServer(row));
 });
 
 export default router;

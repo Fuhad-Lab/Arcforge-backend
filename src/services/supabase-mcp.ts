@@ -31,12 +31,11 @@
  */
 import { logger } from "../lib/logger";
 import { getProjectRowBySandbox } from "../lib/project-lookup";
-import { connectorCredentials, getConnector } from "./connector-registry";
+import { refreshConnectionIfNeeded } from "./connector-oauth";
 import {
   getConnection,
   getTokens,
   parseGrantedCapabilities,
-  rotateTokens,
 } from "./connector-vault";
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -51,8 +50,6 @@ const MCP_CALL_TIMEOUT_MS = 120_000;
 const MCP_INIT_TIMEOUT_MS = 30_000;
 /** Session cache TTL — re-initialize before the server expires us. */
 const SESSION_TTL_MS = 50 * 60 * 1000;
-/** Refresh the access token when it expires within this window. */
-const REFRESH_WINDOW_MS = 5 * 60 * 1000;
 /** Max characters of a single text content block returned to the VM. */
 const MAX_CONTENT_CHARS = 6000;
 
@@ -148,77 +145,23 @@ function cachedSession(userId: string): string | null {
 
 // ─── Token handling ─────────────────────────────────────────────────────
 
-/** Refresh-on-use: swap a near-expiry access token for a fresh pair via
- *  the Supabase OAuth token endpoint (Basic auth, like the code exchange).
- *  Returns the (possibly rotated) access token, or null when no usable
- *  credential exists. NEVER logs token material. */
+/** Refresh-on-use: the SHARED connector-refresh engine (connector-oauth.ts,
+ *  user fix 2026-09-16) renews near-expiry tokens via the provider's
+ *  refresh grant and rotates the pair back into the vault; this wrapper
+ *  keeps the MCP session-cache invalidation the executor needs. Returns
+ *  the current access token, or null when no usable credential exists.
+ *  NEVER logs token material. */
 async function freshAccessToken(userId: string): Promise<string | null> {
-  const tokens = await getTokens(userId, "supabase");
-  if (!tokens) return null;
-
-  const expiresAtMs = tokens.expiresAt ? new Date(tokens.expiresAt).getTime() : 0;
-  const stale = !expiresAtMs || expiresAtMs - Date.now() <= REFRESH_WINDOW_MS;
-  if (!stale) return tokens.accessToken;
-
-  if (!tokens.refreshToken) {
-    // No refresh token — the stored access token is the best we have.
-    return tokens.accessToken;
-  }
-
-  const connector = getConnector("supabase");
-  const creds = connector ? connectorCredentials(connector) : null;
-  if (!creds) {
-    logger.warn("supabase-mcp: connector OAuth client not configured — using the stored token as-is");
-    return tokens.accessToken;
-  }
-
-  try {
-    const res = await fetch("https://api.supabase.com/v1/oauth/token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-        Authorization: `Basic ${Buffer.from(`${creds.clientId}:${creds.clientSecret}`).toString("base64")}`,
-      },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: tokens.refreshToken,
-      }),
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      logger.warn(
-        { status: res.status, detail: detail.slice(0, 160) },
-        "supabase-mcp: token refresh failed — trying the stored access token",
-      );
-      return tokens.accessToken;
-    }
-    const json = (await res.json()) as {
-      access_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    };
-    if (!json.access_token) return tokens.accessToken;
-    await rotateTokens(userId, "supabase", {
-      accessToken: json.access_token,
-      refreshToken: json.refresh_token || null,
-      expiresAt: json.expires_in
-        ? new Date(Date.now() + json.expires_in * 1000).toISOString()
-        : null,
-    }).catch(() => undefined);
-    // A rotated token invalidates any cached MCP session binding? No —
-    // sessions are keyed by user, but the server binds them to the token;
-    // drop the cached session so the next call re-initializes cleanly.
+  const outcome = await refreshConnectionIfNeeded(userId, "supabase").catch(
+    () => ({ kind: "skipped" }) as const,
+  );
+  if (outcome.kind === "rotated") {
+    // The server binds sessions to the token — drop the cached session
+    // so the next call re-initializes with the fresh credential.
     sessions.delete(userId);
-    return json.access_token;
-  } catch (err: unknown) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : "unknown" },
-      "supabase-mcp: token refresh threw — trying the stored access token",
-    );
-    return tokens.accessToken;
   }
+  const tokens = await getTokens(userId, "supabase");
+  return tokens?.accessToken ?? null;
 }
 
 // ─── JSON-RPC plumbing ──────────────────────────────────────────────────

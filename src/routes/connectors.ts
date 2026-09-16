@@ -55,6 +55,7 @@ import {
   mintConnectorState,
   notifySidecarConnector,
   preflightAuthorize,
+  refreshConnectionIfNeeded,
   safeReturnPath,
 } from "../services/connector-oauth";
 
@@ -63,7 +64,18 @@ const router: IRouter = Router();
 const FRONTEND_URL = process.env.FRONTEND_URL || "https://forgeyn.com.ng";
 
 /** Status derivation: DB row + token freshness. Sanitized — no token
- *  material, no env names. */
+ *  material, no env names.
+ *
+ *  SELF-HEALING (user fix 2026-09-16): callers run
+ *  refreshConnectionIfNeeded BEFORE deriving status, so an "expired"
+ *  verdict below means the renewal was genuinely impossible (no refresh
+ *  token / provider rejected it) — not merely "time passed".
+ *
+ *  REAUTHORIZE RESCUE: starting a new authorize on an ALREADY-connected
+ *  row downgrades it to "connecting" before the browser navigates; if
+ *  the user abandons the round-trip, the still-valid token remains and
+ *  the card must NOT read "Not connected". A "connecting" row with an
+ *  unexpired token IS connected. */
 function sanitizedStatus(
   row: Awaited<ReturnType<typeof getConnection>>,
 ): {
@@ -74,7 +86,21 @@ function sanitizedStatus(
 } {
   if (!row) return { status: "not_connected" };
   if (row.status === "error") return { status: "error", account_label: row.account_label ?? undefined };
-  if (row.status !== "connected") return { status: "not_connected" };
+  if (row.status !== "connected") {
+    if (
+      row.status === "connecting" &&
+      row.token_expires_at &&
+      new Date(row.token_expires_at).getTime() > Date.now()
+    ) {
+      return {
+        status: "connected",
+        connected_at: row.connected_at ?? undefined,
+        account_label: row.account_label ?? undefined,
+        scopes: row.scopes ?? undefined,
+      };
+    }
+    return { status: "not_connected" };
+  }
   if (row.token_expires_at && new Date(row.token_expires_at).getTime() < Date.now()) {
     return { status: "expired", connected_at: row.connected_at ?? undefined, account_label: row.account_label ?? undefined };
   }
@@ -115,11 +141,32 @@ router.get("/connectors", async (req: Request, res: Response) => {
   try {
     const connectors = await Promise.all(
       CONNECTORS.map(async (connector) => {
-        const row = await getConnection(userId, connector.id);
+        // SELF-HEALING STATUS (user fix 2026-09-16 — the disconnect cure):
+        // GitHub tokens live 8h and Supabase's 24h; renew stale tokens
+        // with the provider BEFORE deriving status so a valid refresh
+        // token in the vault keeps the card "connected" instead of
+        // flipping to "Reconnect required". Best-effort — a failed
+        // renewal degrades to the honest stored state (the engine marks
+        // the row "error" when the provider definitively rejects it).
+        const existing = await getConnection(userId, connector.id);
+        if (existing?.status === "connected") {
+          const outcome = await refreshConnectionIfNeeded(userId, connector.id).catch(
+            () => ({ kind: "skipped" }) as const,
+          );
+          if (outcome.kind === "rotated" || outcome.kind === "dead") {
+            const row = await getConnection(userId, connector.id);
+            const creds = connectorCredentials(connector);
+            return {
+              ...connectorMetadata(connector),
+              ...sanitizedStatus(row),
+              configured: Boolean(creds),
+            };
+          }
+        }
         const creds = connectorCredentials(connector);
         return {
           ...connectorMetadata(connector),
-          ...sanitizedStatus(row),
+          ...sanitizedStatus(existing),
           configured: Boolean(creds),
         };
       }),
@@ -244,7 +291,17 @@ router.get("/connectors/:id/status", async (req: Request, res: Response) => {
     res.status(404).json({ error: "Unknown connector" });
     return;
   }
-  const row = await getConnection(userId, connector.id);
+  // SELF-HEALING (user fix 2026-09-16): renew stale tokens before the
+  // verdict — same engine as the list route (see there).
+  let row = await getConnection(userId, connector.id);
+  if (row?.status === "connected") {
+    const outcome = await refreshConnectionIfNeeded(userId, connector.id).catch(
+      () => ({ kind: "skipped" }) as const,
+    );
+    if (outcome.kind === "rotated" || outcome.kind === "dead") {
+      row = await getConnection(userId, connector.id);
+    }
+  }
   const tokens = row ? await getTokens(userId, connector.id) : null;
   res.json({
     ...connectorMetadata(connector),

@@ -869,34 +869,82 @@ function cachedSession(userId: string, serverId: string): string | null {
   return s.sessionId;
 }
 
-/** Refresh-on-use for a user-added server (the proxy's transparent token
- *  refresh). Returns null when no stored credential exists — the server
- *  may legitimately be auth-free. */
-async function freshMcpToken(row: McpServerRow): Promise<string | null> {
+/** Core refresh round-trip for a user-added server (no staleness check —
+ *  the caller decides when). Outcome mirrors the shared connector engine
+ *  (connector-oauth.ts): "rotated" (vault updated), "dead" (the provider
+ *  definitively rejected the refresh token), "skipped" (transient/no
+ *  credential). Never throws, never logs token material. */
+async function doRefreshServerTokens(
+  row: McpServerRow,
+): Promise<"rotated" | "dead" | "skipped"> {
   const connectorId = `mcp:${row.id}`;
   const tokens = await getTokens(row.user_id, connectorId);
-  if (!tokens) return null;
-
-  const expiresAtMs = tokens.expiresAt ? new Date(tokens.expiresAt).getTime() : 0;
-  const stale = Boolean(tokens.expiresAt) && expiresAtMs - Date.now() <= REFRESH_WINDOW_MS;
-  if (!stale) return tokens.accessToken;
-  if (!tokens.refreshToken || !row.token_endpoint) return tokens.accessToken;
-
+  if (!tokens?.refreshToken || !row.token_endpoint) return "skipped";
   try {
     const fresh = await tokenRequest(row, decryptClient(row), {
       grant_type: "refresh_token",
       refresh_token: tokens.refreshToken,
     });
-    await rotateTokens(row.user_id, connectorId, fresh).catch(() => undefined);
+    await rotateTokens(row.user_id, connectorId, fresh);
     sessions.delete(sessionKey(row.user_id, row.id));
-    return fresh.accessToken;
+    return "rotated";
   } catch (err) {
+    // tokenRequest throws McpError("exchange_failed") with the HTTP status
+    // embedded in detail — 4xx = the provider rejected the refresh token
+    // (dead: reconnect is the only honest path); 5xx/timeouts = transient
+    // (skipped: keep the stored pair, the access token may still work).
+    let dead = false;
+    if (err instanceof McpError) {
+      const status = /HTTP (\d{3})/.exec(err.detail ?? "")?.[1];
+      dead = !status || Number(status) < 500;
+    }
     logger.warn(
-      { serverId: row.id, err: err instanceof Error ? err.message : "unknown" },
-      "mcp-proxy: token refresh failed — trying the stored access token",
+      { serverId: row.id, dead, err: err instanceof Error ? err.message : "unknown" },
+      dead
+        ? "mcp-proxy: provider rejected the refresh token — reconnect required"
+        : "mcp-proxy: token refresh failed (transient)",
     );
-    return tokens.accessToken;
+    return dead ? "dead" : "skipped";
   }
+}
+
+/** In-flight refresh dedup: many OAuth providers issue SINGLE-USE refresh
+ *  tokens — the list route, the status route, and a concurrent tool call
+ *  must share ONE provider round-trip or the loser burns the rotated
+ *  token and the server reads dead. Keyed by user+server. */
+const inflightServerRefreshes = new Map<string, Promise<"rotated" | "dead" | "skipped">>();
+
+function refreshServerTokens(
+  row: McpServerRow,
+): Promise<"rotated" | "dead" | "skipped"> {
+  const key = `${row.user_id}:${row.id}`;
+  const existing = inflightServerRefreshes.get(key);
+  if (existing) return existing;
+  const pending = doRefreshServerTokens(row).finally(() => {
+    inflightServerRefreshes.delete(key);
+  });
+  inflightServerRefreshes.set(key, pending);
+  return pending;
+}
+
+/** Refresh-on-use for a user-added server (the proxy's transparent token
+ *  refresh). Returns null when no stored credential exists — the server
+ *  may legitimately be auth-free. */
+async function freshMcpToken(row: McpServerRow): Promise<string | null> {
+  const connectorId = `mcp:${row.id}`;
+  let tokens = await getTokens(row.user_id, connectorId);
+  if (!tokens) return null;
+
+  const expiresAtMs = tokens.expiresAt ? new Date(tokens.expiresAt).getTime() : 0;
+  const stale = Boolean(tokens.expiresAt) && expiresAtMs - Date.now() <= REFRESH_WINDOW_MS;
+  if (!stale) return tokens.accessToken;
+
+  // Best-effort renewal (deduped) — then re-read: a rotation replaced
+  // the pair; a dead/skipped outcome leaves the stored access token,
+  // which either still works or the server 401s it honestly.
+  await refreshServerTokens(row);
+  tokens = await getTokens(row.user_id, connectorId);
+  return tokens?.accessToken ?? null;
 }
 
 async function ensureMcpSession(
@@ -1448,7 +1496,25 @@ export async function listUserServers(userId: string): Promise<SanitizedMcpServe
       );
     }
   }
-  return rows.map((row) => {
+  // SELF-HEALING STATUS (user fix 2026-09-16 — the disconnect cure, same
+  // engine as the fixed connectors): OAuth access tokens are short-lived
+  // (the live Expo row: connected 15:39, expired 16:39); renew stale ones
+  // with the provider BEFORE deriving status so a valid refresh token in
+  // the vault keeps the server "connected" instead of flipping to
+  // "Reconnect required". Best-effort and deduped; "dead" (provider
+  // rejected the refresh) degrades to the honest expired verdict below.
+  const refreshOutcomes = await Promise.all(
+    rows.map(async (row) => {
+      if (row.status !== "connected" || !row.auth_required || row.auth_mode === "api_key") {
+        return "fresh" as const;
+      }
+      const expiresAt = expiryById.get(row.id) ?? null;
+      if (!expiresAt) return "fresh" as const;
+      if (new Date(expiresAt).getTime() - Date.now() > REFRESH_WINDOW_MS) return "fresh" as const;
+      return refreshServerTokens(row);
+    }),
+  );
+  return rows.map((row, index) => {
     const sanitized = sanitizeServer(row);
     // Expiry is an OAUTH concept — an API-key credential has no expiry and
     // no refresh; it stays "connected" until the server 401s a call (the
@@ -1456,8 +1522,11 @@ export async function listUserServers(userId: string): Promise<SanitizedMcpServe
     // the old "no expiry info ⇒ expired" rule mislabeled every key-based
     // connection as expired the moment it was created.
     if (sanitized.status === "connected" && row.auth_required && sanitized.auth_mode !== "api_key") {
-      const expiresAt = expiryById.get(row.id);
-      if (expiresAt && new Date(expiresAt).getTime() < Date.now()) {
+      const expiresAt = expiryById.get(row.id) ?? null;
+      const stale = expiresAt !== null && new Date(expiresAt).getTime() < Date.now();
+      // "rotated" just renewed the token — the pre-refresh expiry map is
+      // stale by design and the server stays connected.
+      if (stale && refreshOutcomes[index] !== "rotated") {
         sanitized.status = "expired";
       }
     }

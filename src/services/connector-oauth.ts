@@ -35,8 +35,10 @@ import {
 import {
   type OAuthState,
   expiryDate,
+  getTokens,
   markConnectionStatus,
   mintState,
+  rotateTokens,
   upsertConnection,
   verifyState,
 } from "./connector-vault";
@@ -239,6 +241,206 @@ export async function preflightAuthorize(
     /* Network hiccup — do not block the flow on a failed check. */
   }
   return null;
+}
+
+/** ── TOKEN REFRESH ENGINE (user fix 2026-09-16 — the disconnect cure) ──
+ *  LIVE-DIAGNOSED ROOT CAUSE: GitHub connector tokens expire after 8h
+ *  (the sign-in OAuth App has "Expire user authorization tokens" ON —
+ *  verified in the vault: connected 17:37, token_expires_at 01:37) and
+ *  Supabase OAuth tokens after 24h, but NOTHING refreshed them on the
+ *  read path — the Connectors page derived status purely from the stale
+ *  token_expires_at and flipped healthy connections to "Reconnect
+ *  required" while a valid refresh token sat unused in the vault.
+ *
+ *  This engine renews a connection's tokens with the provider BEFORE
+ *  any status is derived (list, status, and every consumer), rotating
+ *  the fresh pair back into the vault. Outcomes:
+ *   • fresh    — token still valid (or has no expiry), nothing done;
+ *   • rotated  — provider issued a new pair, vault updated;
+ *   • dead     — provider DEFINITIVELY rejected the refresh token
+ *               (invalid_grant & friends) → the row is marked "error"
+ *               so the card honestly asks for a reconnect;
+ *   • skipped  — no refresh token / provider unreachable (transient)
+ *               → the caller derives status from what is stored.
+ *
+ *  GitHub refresh tokens are SINGLE-USE and rotate on every refresh —
+ *  the new one is persisted immediately with the new access token. */
+export type ConnectionRefreshOutcome =
+  | { kind: "fresh" }
+  | { kind: "rotated" }
+  | { kind: "dead" }
+  | { kind: "skipped" };
+
+/** Refresh window: renew when the access token expires within this. */
+const REFRESH_WINDOW_MS = 5 * 60 * 1000;
+
+/** In-flight refresh dedup: GitHub refresh tokens are SINGLE-USE — two
+ *  concurrent readers (the list route fans out per connector; list +
+ *  status can overlap) must share ONE provider round-trip or the loser
+ *  burns the rotated token and the connection reads dead. Keyed by
+ *  user+connector; the entry clears when the round-trip settles. */
+const inflightRefreshes = new Map<string, Promise<ConnectionRefreshOutcome>>();
+
+export function refreshConnectionIfNeeded(
+  userId: string,
+  connectorId: string,
+): Promise<ConnectionRefreshOutcome> {
+  const key = `${userId}:${connectorId}`;
+  const existing = inflightRefreshes.get(key);
+  if (existing) return existing;
+  const pending = doRefreshConnection(userId, connectorId).finally(() => {
+    inflightRefreshes.delete(key);
+  });
+  inflightRefreshes.set(key, pending);
+  return pending;
+}
+
+async function doRefreshConnection(
+  userId: string,
+  connectorId: string,
+): Promise<ConnectionRefreshOutcome> {
+  // Only the fixed connectors live here; user-added MCP servers
+  // (mcp:<uuid>) are refreshed by their own proxy (mcp-proxy.ts).
+  const connector = getConnector(connectorId);
+  if (!connector) return { kind: "skipped" };
+
+  const tokens = await getTokens(userId, connectorId);
+  if (!tokens) return { kind: "skipped" };
+
+  const expiresAtMs = tokens.expiresAt ? new Date(tokens.expiresAt).getTime() : 0;
+  if (!expiresAtMs || expiresAtMs - Date.now() > REFRESH_WINDOW_MS) {
+    return { kind: "fresh" };
+  }
+  if (!tokens.refreshToken) {
+    // Expired with no refresh token (classic non-rotating app): nothing
+    // to renew — the caller reports the honest reconnect-required state.
+    return { kind: "skipped" };
+  }
+  const creds = connectorCredentials(connector);
+  if (!creds) {
+    logger.warn(
+      { connector: connectorId },
+      "connector-refresh: connector OAuth client not configured — cannot renew",
+    );
+    return { kind: "skipped" };
+  }
+
+  try {
+    let next: { accessToken: string; refreshToken: string | null; expiresIn: number | null } | null = null;
+
+    if (connector.authMethod === "oauth_supabase") {
+      // Supabase: refresh grant over the same Basic-auth token endpoint
+      // as the code exchange (verified live against current docs).
+      const res = await fetch("https://api.supabase.com/v1/oauth/token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+          Authorization: `Basic ${Buffer.from(`${creds.clientId}:${creds.clientSecret}`).toString("base64")}`,
+        },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokens.refreshToken,
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        // 4xx = the refresh token itself was rejected (revoked/expired/
+        // already rotated) — a reconnect is the only honest path. 5xx =
+        // provider trouble, transient: keep the stored pair as-is.
+        const dead = res.status >= 400 && res.status < 500;
+        logger.warn(
+          { connector: connectorId, status: res.status, dead, detail: detail.slice(0, 160) },
+          dead
+            ? "connector-refresh: provider rejected the refresh token — marking error (reconnect required)"
+            : "connector-refresh: provider token endpoint errored (transient)",
+        );
+        if (dead) {
+          await markConnectionStatus(userId, connectorId, "error").catch(() => undefined);
+          return { kind: "dead" };
+        }
+        return { kind: "skipped" };
+      }
+      const json = (await res.json()) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+      };
+      if (json.access_token) {
+        next = {
+          accessToken: json.access_token,
+          refreshToken: json.refresh_token || null,
+          expiresIn: json.expires_in ?? null,
+        };
+      }
+    } else {
+      // GitHub (classic OAuth App and GitHub App user-to-server): the
+      // refresh grant is the same endpoint as the code exchange; GitHub
+      // answers 200 with an {error} body when the grant is rejected.
+      const res = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent": "arcforge",
+        },
+        body: JSON.stringify({
+          client_id: creds.clientId,
+          client_secret: creds.clientSecret,
+          grant_type: "refresh_token",
+          refresh_token: tokens.refreshToken,
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const json = (await res.json().catch(() => ({}))) as {
+        access_token?: string;
+        refresh_token?: string;
+        expires_in?: number;
+        error?: string;
+      };
+      if (!json.access_token || json.error) {
+        const dead = Boolean(json.error) || (res.status >= 400 && res.status < 500);
+        logger.warn(
+          { connector: connectorId, status: res.status, err: json.error ?? null, dead },
+          dead
+            ? "connector-refresh: github rejected the refresh token — marking error (reconnect required)"
+            : "connector-refresh: github token endpoint errored (transient)",
+        );
+        if (dead) {
+          await markConnectionStatus(userId, connectorId, "error").catch(() => undefined);
+          return { kind: "dead" };
+        }
+        return { kind: "skipped" };
+      }
+      next = {
+        accessToken: json.access_token,
+        refreshToken: json.refresh_token || null,
+        expiresIn: json.expires_in ?? null,
+      };
+    }
+
+    if (!next) return { kind: "skipped" };
+
+    await rotateTokens(userId, connectorId, {
+      accessToken: next.accessToken,
+      // GitHub rotates refresh tokens on every use (single-use); a
+      // provider that omits one keeps the stored token.
+      refreshToken: next.refreshToken || tokens.refreshToken,
+      expiresAt: expiryDate(next.expiresIn),
+    });
+    logger.info(
+      { userId, connector: connectorId },
+      "connector-refresh: tokens renewed (values never logged)",
+    );
+    return { kind: "rotated" };
+  } catch (err) {
+    logger.warn(
+      { connector: connectorId, err: err instanceof Error ? err.message : "unknown" },
+      "connector-refresh: renewal threw (transient) — keeping the stored pair",
+    );
+    return { kind: "skipped" };
+  }
 }
 
 /** ── VM NOTIFICATION (GROUP 2 session 2) ─────────────────────────────
