@@ -1116,6 +1116,20 @@ export async function addMcpServer(
     token_endpoint: discovery.tokenEndpoint,
     registration_endpoint: discovery.registrationEndpoint,
     revocation_endpoint: discovery.revocationEndpoint,
+    // SCOPE POLICY (verified live against mcp.vercel.com, 2026-09-17):
+    // request EVERY scope the server's AS advertises in
+    // scopes_supported. For Vercel that is exactly "openid email
+    // offline_access profile" — the identity set — and all of them were
+    // granted on the real consent round-trip. There is NO scope to add
+    // for project/deployment access: Vercel's AS filters out scopes not
+    // configured on the app ("integration:all" and friends are silently
+    // dropped), and API-permission scopes are in private beta. Account-
+    // level tool access comes from the RFC 8707 `resource` binding (the
+    // token is issued FOR mcp.vercel.com, which executes tools with the
+    // user's own account access — verified: the live tools/list returns
+    // the full authenticated catalog, deploy_to_vercel included). When
+    // Vercel opens API-permission scopes, they will appear here in
+    // scopes_supported and this line picks them up automatically.
     scopes: discovery.scopesSupported,
     client_id_enc: encryptToken(client.clientId),
     client_secret_enc: client.clientSecret ? encryptToken(client.clientSecret) : null,
@@ -1261,16 +1275,23 @@ export async function connectMcpWithKey(
 
 /** Complete the OAuth round-trip for a user-added server (called from
  *  completeConnectorOAuth when the state's connector is "mcp:<uuid>").
- *  Returns the final redirect URL — never tokens. */
+ *  Returns the final redirect URL — never tokens.
+ *
+ *  `landing` is connector-oauth.ts's FULL landing resolver: it already
+ *  appends the post-OAuth path (the state's returnPath, defaulting to
+ *  /connectors) to the validated origin. The query is appended directly
+ *  to that URL — an extra "/connectors" segment here landed users on
+ *  forgeyn.com.ng/connectors/connectors (an unknown SPA path the
+ *  frontend resolves to the homepage). USER FIX 2026-09-17. */
 export async function completeMcpOAuth(
   code: string,
   state: OAuthState,
-  landingBase: (s: OAuthState) => string,
+  landing: (s: OAuthState) => string,
 ): Promise<string> {
   const serverId = state.connector!.slice("mcp:".length);
-  const base = landingBase(state);
+  const landingUrl = landing(state);
   const fail = (message: string) =>
-    `${base}/connectors?connected=${encodeURIComponent(`mcp:${serverId}`)}&status=error&message=${message}`;
+    `${landingUrl}?connected=${encodeURIComponent(`mcp:${serverId}`)}&status=error&message=${message}`;
 
   const row = await getServerRow(state.userId!, serverId);
   if (!row) return fail("internal");
@@ -1304,7 +1325,7 @@ export async function completeMcpOAuth(
       { userId: state.userId, serverId, toolCount },
       "mcp-proxy: connected (token stored encrypted; value never logged)",
     );
-    return `${base}/connectors?connected=${encodeURIComponent(`mcp:${serverId}`)}&status=ok&label=${encodeURIComponent(row.label || serverId)}`;
+    return `${landingUrl}?connected=${encodeURIComponent(`mcp:${serverId}`)}&status=ok&label=${encodeURIComponent(row.label || serverId)}`;
   } catch (err) {
     await upsertServerRow({ user_id: state.userId!, server_url: row.server_url, status: "error" }).catch(
       () => undefined,
