@@ -1220,6 +1220,17 @@ router.put("/messages/:projectId", async (req: Request, res: Response, next: Nex
       rows.push({ role, content, meta });
     }
 
+    // THE ORDER LAW (user fix 2026-09-21): the conversation's ORDER is the
+    // array order the frontend sent — user first, assistant reply second,
+    // strict chronology. A batch insert lets every row share ONE created_at
+    // (the DB default stamps the same transaction timestamp), and the GET
+    // orders by created_at — identical timestamps are returned in
+    // nondeterministic physical order, which is how "user chat then AI
+    // message" silently became the REVERSE after a re-save. Each row now
+    // gets a DISTINCT increasing timestamp derived from now, so the sort
+    // is stable and byte-faithful to the array order forever.
+    const base = Date.now() - rows.length;
+
     // 1. Delete ONLY the caller's existing messages for this project.
     //    (Filters AND-compose: project_id = X AND (user_id = caller [OR
     //    user_id IS NULL for the owner's legacy rows]).)
@@ -1240,17 +1251,20 @@ router.put("/messages/:projectId", async (req: Request, res: Response, next: Nex
     const delRes = await del;
     if (delRes.error) throw new Error(`messages clear: ${delRes.error.message}`);
 
-    // 2. Insert the caller's new conversation with their user_id stamped.
+    // 2. Insert the caller's new conversation with their user_id stamped —
+    //    each row's created_at increases with its array index (THE ORDER
+    //    LAW: the GET's created_at sort then reproduces the exact order).
     if (rows.length > 0) {
       const ins = await supabase
         .from("chat_messages")
         .insert(
-          rows.map((r) => ({
+          rows.map((r, i) => ({
             project_id: projectId,
             user_id: req.userId,
             role: r.role,
             content: r.content,
             meta: r.meta,
+            created_at: new Date(base + i + 1).toISOString(),
           })),
         );
       if (ins.error) throw new Error(`messages write: ${ins.error.message}`);
