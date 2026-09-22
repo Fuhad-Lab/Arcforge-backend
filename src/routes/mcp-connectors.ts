@@ -193,4 +193,47 @@ router.get("/connectors/mcp/:id/status", async (req: Request, res: Response) => 
   res.json(server ?? sanitizeServer(row));
 });
 
+/** ── CALL (one tool on one of the caller's own servers) ────────────────
+ *
+ * POST /api/connectors/mcp/:id/call  { tool, args }
+ *
+ * The HTTP twin of the VM tunnel's /mcp/server/<id> frame — the SAME
+ * per-user trust boundary (callUserMcpServer scopes to the caller's own
+ * vault rows; the vault token never leaves this process) and the SAME
+ * executor. Born 2026-09-22 from the Render env-var work: the platform's
+ * own tooling (engine-ops "e2b-to-render") needs to drive the user's
+ * connected Render MCP from server-side, and the tunnel path only runs
+ * inside a live agent VM. Not advertised in the UI — an ops/debug surface.
+ */
+router.post("/connectors/mcp/:id/call", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const id = String(req.params.id);
+  const tool = typeof req.body?.tool === "string" ? req.body.tool.trim() : "";
+  const args =
+    req.body?.args && typeof req.body.args === "object" && !Array.isArray(req.body.args)
+      ? (req.body.args as Record<string, unknown>)
+      : {};
+  if (!tool) {
+    res.status(400).json({ error: "The mcp tool name is required ({ tool, args })." });
+    return;
+  }
+  try {
+    const { callUserMcpServer } = await import("../services/mcp-proxy");
+    const outcome = await callUserMcpServer(userId, id, tool, args);
+    if (outcome.ok) {
+      res.json({ ok: true, result: outcome.result });
+      return;
+    }
+    res.status(outcome.needs_connector ? 403 : 400).json({
+      ok: false,
+      error: outcome.error,
+      ...(outcome.needs_connector ? { needs_connector: true } : {}),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "mcp call failure";
+    logger.warn({ userId, id, tool, err: message }, "mcp-routes: call failed");
+    res.status(500).json({ error: `MCP call failure: ${message}` });
+  }
+});
+
 export default router;
