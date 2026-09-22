@@ -61,7 +61,7 @@ const REFRESH_WINDOW_MS = 5 * 60 * 1000;
 /** Session cache TTL — re-initialize before the server expires us. */
 const SESSION_TTL_MS = 50 * 60 * 1000;
 const MCP_PROTOCOL_VERSION = "2025-03-26";
-const MAX_CONTENT_CHARS = 6000;
+const MAX_CONTENT_CHARS = 60_000;
 const MAX_TOOLS_CACHED = 200;
 
 // ─── Errors ─────────────────────────────────────────────────────────────
