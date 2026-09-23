@@ -233,8 +233,13 @@ router.post("/auth/session/sign-up", async (req: Request, res: Response, _next: 
     }
     // When email confirmation is required there is no session yet — the
     // frontend shows "check your email" and the user signs in after
-    // confirming. Otherwise the session is included.
-    const session = sanitizeSession(json.session);
+    // confirming. Otherwise the session is included. NOTE: GoTrue's signup
+    // response carries the session at the TOP level (access_token /
+    // refresh_token / expires_at as SIBLINGS of `user`) — there is no nested
+    // `session` object (the token grant responses have the same flat shape).
+    // THE FLAT-SHAPE LAW: read the flat fields first, fall back to a nested
+    // object only if a future GoTrue ever introduces one.
+    const session = sanitizeSession(json.session ?? json);
     if (session) void ensureUserRow(user.id, user.email ?? email).catch(() => {});
     res.status(201).json({ user, session });
   } catch (err) {
