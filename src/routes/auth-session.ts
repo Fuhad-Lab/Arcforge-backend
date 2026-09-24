@@ -34,23 +34,35 @@ const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 
 // ─── tiny in-memory rate limiter (email + IP buckets) ─────────────────────
-// 10 attempts / 15 min per email and per source IP. Service-role GoTrue
-// calls bypass platform limits, so this layer keeps credential stuffing
-// expensive even when callers rotate emails. Memory-bounded: stale buckets
-// are swept on every check.
+// FAILED attempts only, 10 per 15 min per email and per source IP.
+// Service-role GoTrue calls bypass platform limits, so this layer keeps
+// credential stuffing expensive even when callers rotate emails.
+//
+// THE FAILURE-ONLY LAW (2026-09-24, the sign-in/sign-up lockout cure):
+// successful sign-ins/sign-ups/refreshes are NEVER recorded — counting
+// successes meant a user merely USING the site (every page load refreshes
+// the session token through this route) burned the 10-hit IP budget in
+// minutes and got 429-locked out of BOTH sign-in and sign-up. Now only
+// GoTrue-rejected attempts (wrong password, dead refresh token, rejected
+// sign-up) count. Memory-bounded: stale buckets are swept on every check.
 const RATE_WINDOW_MS = 15 * 60_000;
 const RATE_MAX = 10;
 const buckets = new Map<string, { hits: number[]; }>();
 
-function rateLimited(key: string): boolean {
+/** Peek at a bucket WITHOUT recording a hit — the pre-flight check. */
+function isLimited(key: string): boolean {
   const now = Date.now();
   const bucket = buckets.get(key);
   const hits = (bucket?.hits ?? []).filter((t) => now - t < RATE_WINDOW_MS);
-  if (hits.length >= RATE_MAX) {
-    buckets.set(key, { hits });
-    return true;
-  }
-  hits.push(now);
+  if (bucket) buckets.set(key, { hits });
+  return hits.length >= RATE_MAX;
+}
+
+/** Record a hit — called ONLY when the credential attempt was REJECTED. */
+function recordFailure(key: string): void {
+  const now = Date.now();
+  const bucket = buckets.get(key);
+  const hits = [...(bucket?.hits ?? []), now].filter((t) => now - t < RATE_WINDOW_MS);
   buckets.set(key, { hits });
   // Sweep: drop empty/expired buckets occasionally (every ~100 checks).
   if (buckets.size > 512) {
@@ -58,7 +70,6 @@ function rateLimited(key: string): boolean {
       if (v.hits.every((t) => now - t >= RATE_WINDOW_MS)) buckets.delete(k);
     }
   }
-  return false;
 }
 
 function clientIp(req: Request): string {
@@ -114,6 +125,18 @@ function authError(status: number, json: Record<string, unknown>): { status: num
   const code = typeof json.error_code === "string" ? json.error_code : "";
   const msg = typeof json.msg === "string" ? json.msg : typeof json.error === "string" ? json.error : "";
   switch (code) {
+    // THE DUPLICATE-EMAIL LAW (2026-09-24, the sign-up half of the lockout):
+    // GoTrue answers a duplicate signup with 422 user_already_exists — the
+    // old default branch folded that into a lying 502 "service unavailable",
+    // so users retried forever and rate-locked themselves out of BOTH flows.
+    // Now it maps to an honest, actionable 409 that the frontend turns into
+    // a one-tap switch to sign-in (email prefilled).
+    case "user_already_exists":
+    case "email_exists":
+      return {
+        status: 409,
+        message: "An account with this email already exists — sign in instead of creating a new one.",
+      };
     case "invalid_credentials":
     case "email_not_confirmed":
     case "over_request_rate_limit":
@@ -125,8 +148,15 @@ function authError(status: number, json: Record<string, unknown>): { status: num
     case "weak_password":
       return { status: 400, message: msg || "Please check your email and password." };
     default:
-      // Never leak internal details — the frontend shows a safe retry copy.
-      if (status === 400) return { status: 400, message: msg || "Invalid email or password." };
+      // THE HONEST-STATUS LAW: a 4xx from GoTrue is the AUTH LAYER speaking
+      // (rejected credentials/payload) — it is surfaced as 400 with GoTrue's
+      // own user-facing message when present. Only infrastructure failures
+      // (5xx / unreachable) may claim "service unavailable" — a 4xx must
+      // never masquerade as an outage (that lie caused infinite retries and
+      // the rate-limit lockout cascade).
+      if (status >= 400 && status < 500) {
+        return { status: 400, message: msg || "Please check your email and password." };
+      }
       if (status === 429) return { status: 429, message: "Too many attempts — please wait a few minutes and try again." };
       return { status: 502, message: "The sign-in service is unavailable right now. Please try again in a moment." };
   }
@@ -169,8 +199,8 @@ router.post("/auth/session/sign-in", async (req: Request, res: Response, _next: 
     return;
   }
   const ip = clientIp(req);
-  if (rateLimited(`email:${email}`) || rateLimited(`ip:${ip}`)) {
-    res.status(429).json({ error: "Too many attempts — please wait a few minutes and try again." });
+  if (isLimited(`email:${email}`) || isLimited(`ip:${ip}`)) {
+    res.status(429).json({ error: "Too many failed attempts — please wait a few minutes and try again." });
     return;
   }
   try {
@@ -178,6 +208,9 @@ router.post("/auth/session/sign-in", async (req: Request, res: Response, _next: 
       body: { email, password },
     });
     if (status !== 200) {
+      // Failure-only limiter: record ONLY rejected attempts (per email + IP).
+      recordFailure(`email:${email}`);
+      recordFailure(`ip:${ip}`);
       const mapped = authError(status, json);
       logger.warn({ status, code: json.error_code ?? "" }, "auth-session sign-in rejected");
       res.status(mapped.status).json({ error: mapped.message });
@@ -212,8 +245,8 @@ router.post("/auth/session/sign-up", async (req: Request, res: Response, _next: 
     return;
   }
   const ip = clientIp(req);
-  if (rateLimited(`email:${email}`) || rateLimited(`ip:${ip}`)) {
-    res.status(429).json({ error: "Too many attempts — please wait a few minutes and try again." });
+  if (isLimited(`email:${email}`) || isLimited(`ip:${ip}`)) {
+    res.status(429).json({ error: "Too many failed attempts — please wait a few minutes and try again." });
     return;
   }
   try {
@@ -221,6 +254,10 @@ router.post("/auth/session/sign-up", async (req: Request, res: Response, _next: 
       body: { email, password },
     });
     if (status !== 200 && status !== 201) {
+      // Failure-only limiter: a rejected sign-up (duplicate email, weak
+      // password…) counts; a SUCCESSFUL creation never does.
+      recordFailure(`email:${email}`);
+      recordFailure(`ip:${ip}`);
       const mapped = authError(status, json);
       logger.warn({ status, code: json.error_code ?? "" }, "auth-session sign-up rejected");
       res.status(mapped.status).json({ error: mapped.message });
@@ -261,8 +298,8 @@ router.post("/auth/session/refresh", async (req: Request, res: Response, _next: 
     return;
   }
   const ip = clientIp(req);
-  if (rateLimited(`ip:${ip}`)) {
-    res.status(429).json({ error: "Too many attempts — please wait a few minutes and try again." });
+  if (isLimited(`ip:${ip}`)) {
+    res.status(429).json({ error: "Too many failed attempts — please wait a few minutes and try again." });
     return;
   }
   try {
@@ -270,6 +307,10 @@ router.post("/auth/session/refresh", async (req: Request, res: Response, _next: 
       body: { refresh_token: refreshToken },
     });
     if (status !== 200) {
+      // Failure-only limiter: a dead/rejected refresh token counts; the
+      // every-page-load session refresh (the healthy path) never does —
+      // recording those was what locked active users out of sign-in.
+      recordFailure(`ip:${ip}`);
       const mapped = authError(status, json);
       res.status(mapped.status === 502 ? 401 : mapped.status).json({ error: mapped.message });
       return;
