@@ -46,7 +46,7 @@ import { completeMcpOAuth } from "./mcp-proxy";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const EDGE_BASE = process.env.EDGE_FUNCTION_BASE_URL || "";
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://forgeyn.com.ng";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://studio.forgeyn.com";
 
 /** In-VM sidecar delivery timeout (local HTTP inside the VM via the
  *  preview URL — same budget as workspace.ts's secrets route). */
@@ -67,12 +67,14 @@ export function connectorRedirectUri(connector: ConnectorDefinition): string {
 }
 
 /** ORIGIN-AWARE LANDING (user fix 2026-09-11): the OAuth round-trip must
- *  return users to the origin they started from. forgeyn.com.ng is the
- *  canonical public domain (the frontend hardcodes nothing — it sends
+ *  return users to the origin they started from. studio.forgeyn.com is
+ *  the canonical public domain (the frontend hardcodes nothing — it sends
  *  window.location.origin on authorize); extra origins can be allow
  *  listed without a redeploy via the FRONTEND_ORIGINS env var
  *  (comma-separated absolute origins, no trailing slash). */
 const CANONICAL_FRONTEND_ORIGINS = [
+  "https://studio.forgeyn.com",
+  // legacy origin — stays allowed during the 2026-09 domain migration
   "https://forgeyn.com.ng",
   "https://www.forgeyn.com.ng",
   ...(process.env.FRONTEND_ORIGINS || "")

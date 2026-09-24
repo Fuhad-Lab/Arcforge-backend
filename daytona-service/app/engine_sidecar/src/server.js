@@ -38,6 +38,8 @@ const PERSIST_DIR = process.env.ENGINE_PERSIST_DIR ?? null;
 const BUSY_FILE = process.env.ENGINE_BUSY_FILE ?? null;
 const ALLOWED_ORIGINS = new Set(
   [
+    "https://studio.forgeyn.com",
+    // legacy origin — stays allowed during the 2026-09 domain migration
     "https://forgeyn.com.ng",
     "https://www.forgeyn.com.ng",
     "http://localhost:3000",

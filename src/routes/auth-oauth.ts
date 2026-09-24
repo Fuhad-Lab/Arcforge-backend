@@ -50,15 +50,17 @@ const edgeCallbackUrl = (): string => {
   return "https://arcforge-edge.invalid/functions/v1/auth-oauth";
 };
 
-const FRONTEND_FALLBACK_ORIGIN = process.env.FRONTEND_URL || "https://forgeyn.com.ng";
+const FRONTEND_FALLBACK_ORIGIN = process.env.FRONTEND_URL || "https://studio.forgeyn.com";
 
-/** ORIGIN-AWARE GITHUB SIGN-IN (user fix 2026-09-11): forgeyn.com.ng is
- *  the canonical public domain — the sign-in start sends the caller's
+/** ORIGIN-AWARE GITHUB SIGN-IN (user fix 2026-09-11): studio.forgeyn.com
+ *  is the canonical public domain — the sign-in start sends the caller's
  *  window.location.origin, and the callback must return THERE (landing
  *  elsewhere drops the per-origin session cookie). Extra origins can be
  *  allow listed without a redeploy via FRONTEND_ORIGINS (comma-separated
  *  absolute origins). */
 const CANONICAL_FRONTEND_ORIGINS = [
+  "https://studio.forgeyn.com",
+  // legacy origin — stays allowed during the 2026-09 domain migration
   "https://forgeyn.com.ng",
   "https://www.forgeyn.com.ng",
   ...(process.env.FRONTEND_ORIGINS || "")

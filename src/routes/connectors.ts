@@ -61,7 +61,7 @@ import {
 
 const router: IRouter = Router();
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://forgeyn.com.ng";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://studio.forgeyn.com";
 
 /** Status derivation: DB row + token freshness. Sanitized — no token
  *  material, no env names.
@@ -224,7 +224,7 @@ router.post("/connectors/:id/authorize", async (req: Request, res: Response) => 
     // and carried in the HMAC state — the callback returns the user to
     // the origin they started from instead of a hardcoded Render URL
     // (landing elsewhere drops the session cookie and the connect reads
-    // as broken on forgeyn.com.ng).
+    // as broken on the site).
     landingBase: allowedLandingBase(body.origin),
   });
 

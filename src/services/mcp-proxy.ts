@@ -646,7 +646,7 @@ export async function registerMcpClient(
   if (!meta.registrationEndpoint) {
     // Per modern MCP OAuth 2.1 practice the client id can be the platform
     // URL — works with servers that accept any public client + PKCE.
-    return { clientId: "https://forgeyn.com.ng", clientSecret: null };
+    return { clientId: "https://studio.forgeyn.com", clientSecret: null };
   }
   try {
     const res = await fetch(meta.registrationEndpoint, {
@@ -1281,7 +1281,7 @@ export async function connectMcpWithKey(
  *  appends the post-OAuth path (the state's returnPath, defaulting to
  *  /connectors) to the validated origin. The query is appended directly
  *  to that URL — an extra "/connectors" segment here landed users on
- *  forgeyn.com.ng/connectors/connectors (an unknown SPA path the
+ *  studio.forgeyn.com/connectors/connectors (an unknown SPA path the
  *  frontend resolves to the homepage). USER FIX 2026-09-17. */
 export async function completeMcpOAuth(
   code: string,

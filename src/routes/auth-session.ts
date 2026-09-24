@@ -375,15 +375,15 @@ router.post("/auth/session/google-start", async (req: Request, res: Response, _n
   // Only allow OUR origins (the site's canonical domains + dev) — the
   // GoTrue site URL allowlist also enforces this server-side.
   try {
-    const u = new URL(redirectTo || "https://forgeyn.com.ng/");
+    const u = new URL(redirectTo || "https://studio.forgeyn.com/");
     const host = u.hostname;
     const ok =
       (u.protocol === "https:" &&
-        (host.endsWith(".onrender.com") || host === "forgeyn.com.ng" || host === "www.forgeyn.com.ng" || host.endsWith(".arcforge.app"))) ||
+        (host.endsWith(".onrender.com") || host === "studio.forgeyn.com" || host === "forgeyn.com.ng" || host === "www.forgeyn.com.ng" || host.endsWith(".arcforge.app"))) ||
       (u.protocol === "http:" && (host === "localhost" || host === "127.0.0.1"));
-    if (!ok) redirectTo = "https://forgeyn.com.ng/";
+    if (!ok) redirectTo = "https://studio.forgeyn.com/";
   } catch {
-    redirectTo = "https://forgeyn.com.ng/";
+    redirectTo = "https://studio.forgeyn.com/";
   }
   const authorizeUrl =
     `${SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectTo)}`;
@@ -414,15 +414,15 @@ router.post("/auth/session/reset-password", async (req: Request, res: Response, 
   // site-URL allowlist server-side.
   let redirectTo = typeof body.redirectTo === "string" ? body.redirectTo.trim() : "";
   try {
-    const u = new URL(redirectTo || "https://forgeyn.com.ng/");
+    const u = new URL(redirectTo || "https://studio.forgeyn.com/");
     const host = u.hostname;
     const ok =
       (u.protocol === "https:" &&
-        (host.endsWith(".onrender.com") || host === "forgeyn.com.ng" || host === "www.forgeyn.com.ng" || host.endsWith(".arcforge.app"))) ||
+        (host.endsWith(".onrender.com") || host === "studio.forgeyn.com" || host === "forgeyn.com.ng" || host === "www.forgeyn.com.ng" || host.endsWith(".arcforge.app"))) ||
       (u.protocol === "http:" && (host === "localhost" || host === "127.0.0.1"));
-    if (!ok) redirectTo = "https://forgeyn.com.ng/";
+    if (!ok) redirectTo = "https://studio.forgeyn.com/";
   } catch {
-    redirectTo = "https://forgeyn.com.ng/";
+    redirectTo = "https://studio.forgeyn.com/";
   }
   const ip = clientIp(req);
   // THE FAILURE-ONLY LAW: peek only — an email REQUEST is not a credential
