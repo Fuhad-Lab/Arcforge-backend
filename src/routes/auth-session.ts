@@ -425,7 +425,10 @@ router.post("/auth/session/reset-password", async (req: Request, res: Response, 
     redirectTo = "https://forgeyn.com.ng/";
   }
   const ip = clientIp(req);
-  if (rateLimited(`email:${email}`) || rateLimited(`ip:${ip}`)) {
+  // THE FAILURE-ONLY LAW: peek only — an email REQUEST is not a credential
+  // attempt; GoTrue's own send limits police this route, and a rejected
+  // GoTrue call records the failure below.
+  if (isLimited(`email:${email}`) || isLimited(`ip:${ip}`)) {
     res.status(429).json({ error: "Too many attempts — please wait a few minutes and try again." });
     return;
   }
@@ -436,6 +439,8 @@ router.post("/auth/session/reset-password", async (req: Request, res: Response, 
       body: { email, redirect_to: redirectTo },
     });
     if (status !== 200) {
+      recordFailure(`email:${email}`);
+      recordFailure(`ip:${ip}`);
       const mapped = authError(status, json);
       logger.warn({ status, code: json.error_code ?? "" }, "auth-session reset-password rejected");
       res.status(mapped.status).json({ error: mapped.message });
@@ -466,7 +471,9 @@ router.post("/auth/session/update-password", async (req: Request, res: Response,
     return;
   }
   const ip = clientIp(req);
-  if (rateLimited(`ip:${ip}`)) {
+  // THE FAILURE-ONLY LAW: peek only — the recovery token IS the credential;
+  // a rejected update records the failure below.
+  if (isLimited(`ip:${ip}`)) {
     res.status(429).json({ error: "Too many attempts — please wait a few minutes and try again." });
     return;
   }
@@ -477,6 +484,7 @@ router.post("/auth/session/update-password", async (req: Request, res: Response,
       body: { password },
     });
     if (status !== 200) {
+      recordFailure(`ip:${ip}`);
       const mapped = authError(status, json);
       logger.warn({ status, code: json.error_code ?? "" }, "auth-session update-password rejected");
       // A dead recovery token reads as "expired" to the user, not a 502.
