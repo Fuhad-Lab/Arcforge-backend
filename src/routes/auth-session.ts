@@ -12,6 +12,8 @@
  *   POST /api/auth/session/refresh   {refresh_token}   → {session, user}
  *   POST /api/auth/session/sign-out  {access_token, refresh_token} → {ok}
  *   POST /api/auth/session/google-start {redirectTo}  → {authorize_url}
+ *   POST /api/auth/session/reset-password {email, redirectTo?} → {ok}
+ *   POST /api/auth/session/update-password {access_token, password} → {user}
  *
  * Security:
  *  - The ANON key is used for token grants so GoTrue's own per-email /
@@ -386,6 +388,116 @@ router.post("/auth/session/google-start", async (req: Request, res: Response, _n
   const authorizeUrl =
     `${SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${encodeURIComponent(redirectTo)}`;
   res.json({ authorize_url: authorizeUrl });
+});
+
+// ─── POST /api/auth/session/reset-password ─────────────────────────────────
+// THE FORGOT-PASSWORD LAW (2026-09-24): request a recovery email. GoTrue's
+// /auth/v1/recover ALWAYS answers 200 (existing or not) so this route never
+// leaks account existence — the response is a flat {ok} either way, and
+// only transport/rate-limit failures surface as errors. The email's
+// ConfirmationURL lands the user back on the site with a recovery session
+// in the URL fragment, which the frontend detects and turns into the
+// "set a new password" screen.
+router.post("/auth/session/reset-password", async (req: Request, res: Response, _next: NextFunction) => {
+  if (!isSupabaseConfigured() || !SUPABASE_ANON_KEY) {
+    res.status(503).json({ error: "Authentication is not configured" });
+    return;
+  }
+  const body = (req.body || {}) as { email?: unknown; redirectTo?: unknown };
+  const email = normalizeEmail(body.email);
+  if (!email) {
+    res.status(400).json({ error: "Enter the email address you signed up with." });
+    return;
+  }
+  // redirectTo: only OUR origins (same rule as google-start); anything else
+  // falls back to the canonical site. GoTrue additionally enforces its own
+  // site-URL allowlist server-side.
+  let redirectTo = typeof body.redirectTo === "string" ? body.redirectTo.trim() : "";
+  try {
+    const u = new URL(redirectTo || "https://forgeyn.com.ng/");
+    const host = u.hostname;
+    const ok =
+      (u.protocol === "https:" &&
+        (host.endsWith(".onrender.com") || host === "forgeyn.com.ng" || host === "www.forgeyn.com.ng" || host.endsWith(".arcforge.app"))) ||
+      (u.protocol === "http:" && (host === "localhost" || host === "127.0.0.1"));
+    if (!ok) redirectTo = "https://forgeyn.com.ng/";
+  } catch {
+    redirectTo = "https://forgeyn.com.ng/";
+  }
+  const ip = clientIp(req);
+  if (rateLimited(`email:${email}`) || rateLimited(`ip:${ip}`)) {
+    res.status(429).json({ error: "Too many attempts — please wait a few minutes and try again." });
+    return;
+  }
+  try {
+    // Recover with the anon key: GoTrue's own email-send rate limits stay
+    // active (the free tier allows only a couple of emails per hour).
+    const { status, json } = await gotrue("/auth/v1/recover", {
+      body: { email, redirect_to: redirectTo },
+    });
+    if (status !== 200) {
+      const mapped = authError(status, json);
+      logger.warn({ status, code: json.error_code ?? "" }, "auth-session reset-password rejected");
+      res.status(mapped.status).json({ error: mapped.message });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : "unknown" }, "auth-session reset-password failed");
+    res.status(502).json({ error: "The sign-in service is unreachable. Please try again in a moment." });
+  }
+});
+
+// ─── POST /api/auth/session/update-password ────────────────────────────────
+// Complete the recovery: the caller holds the RECOVERY session's access
+// token (parsed from the landing fragment). GoTrue's PUT /auth/v1/user
+// with that bearer sets the new password; the session stays valid so the
+// user is signed in the moment the password changes.
+router.post("/auth/session/update-password", async (req: Request, res: Response, _next: NextFunction) => {
+  if (!isSupabaseConfigured() || !SUPABASE_ANON_KEY) {
+    res.status(503).json({ error: "Authentication is not configured" });
+    return;
+  }
+  const body = (req.body || {}) as { access_token?: unknown; password?: unknown };
+  const accessToken = typeof body.access_token === "string" ? body.access_token.trim() : "";
+  const password = normalizePassword(body.password);
+  if (!accessToken || accessToken.length > 4096 || !password) {
+    res.status(400).json({ error: "A recovery session and a new password of at least 8 characters are required." });
+    return;
+  }
+  const ip = clientIp(req);
+  if (rateLimited(`ip:${ip}`)) {
+    res.status(429).json({ error: "Too many attempts — please wait a few minutes and try again." });
+    return;
+  }
+  try {
+    const { status, json } = await gotrue("/auth/v1/user", {
+      method: "PUT",
+      bearer: accessToken,
+      body: { password },
+    });
+    if (status !== 200) {
+      const mapped = authError(status, json);
+      logger.warn({ status, code: json.error_code ?? "" }, "auth-session update-password rejected");
+      // A dead recovery token reads as "expired" to the user, not a 502.
+      res.status(mapped.status === 502 ? 401 : mapped.status).json({
+        error:
+          mapped.status === 401 || status === 401
+            ? "This reset link has expired — request a new one and try again."
+            : mapped.message,
+      });
+      return;
+    }
+    const user = sanitizeUser(json);
+    if (!user) {
+      res.status(502).json({ error: "The password service returned an incomplete response." });
+      return;
+    }
+    res.json({ user });
+  } catch (err) {
+    logger.error({ err: err instanceof Error ? err.message : "unknown" }, "auth-session update-password failed");
+    res.status(502).json({ error: "The password service is unreachable. Please try again in a moment." });
+  }
 });
 
 export default router;
