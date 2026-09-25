@@ -61,7 +61,7 @@ import {
 
 const router: IRouter = Router();
 
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://studio.forgeyn.com";
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://forgeyn.com";
 
 /** Status derivation: DB row + token freshness. Sanitized — no token
  *  material, no env names.
